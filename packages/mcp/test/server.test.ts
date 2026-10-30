@@ -5,7 +5,9 @@ import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import { describe, expect, it } from 'vitest';
 import { ReportStore, type ExhumeReport, type GraveyardReport, type Tombstone } from '@necromancer/core';
+import { ScriptedModel } from '@necromancer/llm';
 import { createServer, summarize, type ServerOptions } from '@necromancer/mcp';
+import { fixtureRepo, goodProposal } from '../../interview/test/fixtures.js';
 
 const storeDir = await mkdtemp(path.join(os.tmpdir(), 'necro-store-'));
 
@@ -21,11 +23,11 @@ const text = (result: Awaited<ReturnType<Client['callTool']>>) =>
   (result.content as Array<{ type: string; text: string }>)[0]!.text;
 
 describe('necromancer MCP server', () => {
-  it('lists read-only exhume and graveyard tools and the autopsy prompt', async () => {
+  it('lists the tools and the autopsy prompt', async () => {
     const client = await connect();
     const { tools } = await client.listTools();
-    expect(tools.map((t) => t.name)).toEqual(['exhume', 'graveyard']);
-    expect(tools.every((t) => t.annotations?.readOnlyHint)).toBe(true);
+    expect(tools.map((t) => t.name)).toEqual(['exhume', 'graveyard', 'interview', 'record_interview']);
+    expect(tools.slice(0, 2).every((t) => t.annotations?.readOnlyHint)).toBe(true);
     expect(Object.keys(tools[1]!.inputSchema.properties ?? {})).toEqual(['source', 'advisories', 'github', 'detail', 'save']);
     expect(Object.keys(tools[0]!.inputSchema.properties ?? {})).toEqual(['source', 'top', 'includeTests', 'detail', 'save']);
 
@@ -162,3 +164,57 @@ function fakeGraveyard(): GraveyardReport {
     warnings: [],
   };
 }
+
+describe('necromancer MCP interview', () => {
+  it('proposes with the model, then records the user\'s answer', async () => {
+    const root = await fixtureRepo();
+    const client = await connect({ model: new ScriptedModel(goodProposal) });
+    const proposed = await client.callTool({ name: 'interview', arguments: { source: root } });
+    expect(proposed.isError).toBeFalsy();
+    const body = JSON.parse(text(proposed));
+    expect(body.status).toBe('proposed');
+    expect(body.proposal.capabilities[0].evidence[0]).toMatchObject({ file: 'lib/builder.js', verified: true });
+    expect(body.savedTo).toBe(path.join(storeDir, path.basename(root), 'interview.json'));
+    expect(body.next).toContain('record_interview');
+
+    const recorded = await client.callTool({
+      name: 'record_interview',
+      arguments: { source: root, confirm: true, acceptGoals: [3], goals: ['Add a migration guide'] },
+    });
+    expect(JSON.parse(text(recorded))).toMatchObject({
+      status: 'confirmed',
+      intent: goodProposal.summary,
+      goals: [
+        { text: 'Publish ESM types', origin: 'suggested' },
+        { text: 'Add a migration guide', origin: 'user' },
+      ],
+    });
+    const saved = await new ReportStore(storeDir).load(path.basename(root));
+    expect(saved?.interview?.status).toBe('confirmed');
+  });
+
+  it('hands the evidence to the host agent without an API key, and checks the host\'s citations', async () => {
+    const root = await fixtureRepo();
+    const client = await connect();
+    const brief = JSON.parse(text(await client.callTool({ name: 'interview', arguments: { source: root, proposer: 'host' } })));
+    expect(brief.proposer).toBe('host');
+    expect(brief.evidence).toContain('<file path="lib/builder.js"');
+    expect(brief.instructions).toContain('cite');
+
+    const recorded = await client.callTool({
+      name: 'record_interview',
+      arguments: { source: root, correction: 'A query builder kept for one legacy app', proposal: goodProposal, host: 'claude-code' },
+    });
+    expect(recorded.isError).toBeFalsy();
+    const saved = (await new ReportStore(storeDir).load(path.basename(root)))?.interview;
+    expect(saved).toMatchObject({ status: 'corrected', proposedBy: { kind: 'host', name: 'claude-code' } });
+    expect(saved?.proposal.constraints[0]!.evidence[1]!.verified).toBe(false);
+  });
+
+  it('refuses to record an answer before there is a proposal', async () => {
+    const client = await connect();
+    const result = await client.callTool({ name: 'record_interview', arguments: { source: '/nowhere/at-all', confirm: true } });
+    expect(result.isError).toBe(true);
+    expect(text(result)).toContain('call interview first');
+  });
+});

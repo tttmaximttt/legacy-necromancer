@@ -10,6 +10,8 @@ export default defineConfig({
       '@necromancer/excavate': pkg('excavate'),
       '@necromancer/mcp': pkg('mcp'),
       '@necromancer/graveyard': pkg('graveyard'),
+      '@necromancer/llm': pkg('llm'),
+      '@necromancer/interview': pkg('interview'),
     },
   },
   test: {

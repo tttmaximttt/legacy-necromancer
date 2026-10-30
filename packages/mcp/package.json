@@ -24,6 +24,8 @@
     "@necromancer/core": "workspace:*",
     "@necromancer/excavate": "workspace:*",
     "zod": "^4.6.7",
-    "@necromancer/graveyard": "workspace:*"
+    "@necromancer/graveyard": "workspace:*",
+    "@necromancer/interview": "workspace:*",
+    "@necromancer/llm": "workspace:*"
   }
 }

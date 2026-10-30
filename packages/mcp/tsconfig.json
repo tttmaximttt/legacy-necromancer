@@ -17,6 +17,12 @@
     },
     {
       "path": "../graveyard"
+    },
+    {
+      "path": "../interview"
+    },
+    {
+      "path": "../llm"
     }
   ]
 }

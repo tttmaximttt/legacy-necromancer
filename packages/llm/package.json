@@ -2,7 +2,7 @@
   "name": "@necromancer/llm",
   "version": "0.0.0",
   "private": true,
-  "description": "Thin LLM client used by the agent phases (Resurrect, Operate).",
+  "description": "Structured-output Claude client shared by the stages that need a model.",
   "type": "module",
   "exports": {
     ".": {
@@ -17,6 +17,7 @@
     "build": "tsc -b"
   },
   "dependencies": {
-    "@necromancer/core": "workspace:*"
+    "@anthropic-ai/sdk": "^1.3.0",
+    "zod": "^4.6.7"
   }
 }

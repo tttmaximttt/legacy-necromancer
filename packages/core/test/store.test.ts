@@ -31,7 +31,7 @@ describe('ReportStore', () => {
       ['a__two', 'https://github.com/a/two', ['graveyard']],
       ['a__one', 'https://github.com/a/one', ['exhume']],
     ]);
-    expect(await store.load('a__one')).toEqual({ exhume: report('https://github.com/a/one'), graveyard: null });
+    expect(await store.load('a__one')).toEqual({ exhume: report('https://github.com/a/one'), graveyard: null, interview: null });
   });
 
   it('refuses slugs that could escape the store and ignores stray directories', async () => {

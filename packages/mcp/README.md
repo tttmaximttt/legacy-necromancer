@@ -12,6 +12,8 @@ The server uses stdio and runs on your machine. It needs `git` on `PATH`.
 | --- | --- |
 | `exhume` | Phase 1 report: clusters, load-bearing files, history span, external packages, install-script audit, case-mismatched imports. Read-only. |
 | `graveyard` | Phase 2 report: era estimate and a tombstone per dependency (dead / dying / ailing / alive, advisories, successor). Read-only; calls the npm registry, the advisory database and GitHub. |
+| `interview` | Phase 4, step 1: proposes what the repo is for, with checked file:line citations, suggested goals and open questions. |
+| `record_interview` | Phase 4, step 2: records the user's confirmation or correction and their goals, for later stages. |
 
 `graveyard` takes `source`, `advisories` (`npm`, `osv` or `none`), `github`
 (default true) and `detail`. In `summary` mode, healthy dependencies are
@@ -26,6 +28,15 @@ sends progress notifications while it works.
 
 Both tools save their full report (pass `save: false` to skip), so you can
 browse anything Claude dug up with `necromancer ui`.
+
+`interview` takes `source`, `proposer` and `effort`. With `proposer: "auto"`
+(the default) it calls Claude if `ANTHROPIC_API_KEY` is set in the server's
+`env`. Otherwise it returns the evidence and instructions, and the agent
+you're talking to writes the proposal itself (`proposer: "host"` forces
+this). Either way the agent is told to show you the proposal and ask before
+calling `record_interview`, which takes `confirm`, `correction`,
+`acceptGoals` (1-based numbers or `"all"`), `goals`, and, in host mode,
+the agent's `proposal`, whose citations are checked against the repo.
 
 There is also an `autopsy` prompt that asks Claude to exhume a repo and give
 a verdict. In Claude Code it appears as `/mcp__necromancer__autopsy`.

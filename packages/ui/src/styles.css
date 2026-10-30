@@ -102,6 +102,8 @@ main { padding: 16px; display: flex; flex-direction: column; gap: 14px; flex: 1;
 .summary { display: flex; flex-direction: column; gap: 12px; }
 .summary-title h2 { margin: 0; font-size: 20px; overflow-wrap: anywhere; }
 .summary-title p { margin: 2px 0 0; }
+.summary-title .intent { margin-top: 6px; max-width: 70ch; }
+.intent-label { font-size: 11.5px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.04em; color: var(--text-secondary); margin-right: 4px; }
 .tiles { display: grid; grid-template-columns: repeat(auto-fill, minmax(140px, 1fr)); gap: 10px; }
 .tile {
   background: var(--surface-1); border: 1px solid var(--border); border-radius: var(--radius);

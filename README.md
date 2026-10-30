@@ -21,16 +21,18 @@ pnpm necromancer autopsy https://github.com/tttmaximttt/node-orm2 --open
 
 ## Design
 
-A pipeline in which only two steps are agents. Everything else is
-deterministic, seeded, and testable without an LLM.
+A pipeline in which only two steps are agents and one is a single model
+call. Everything else is deterministic, seeded, and testable without an LLM;
+the model call is tested against a scripted model, so no API key is needed.
 
 | Phase | Package | Kind | Status |
 | --- | --- | --- | --- |
 | 1. Excavate | [`excavate`](packages/excavate) | deterministic | **working** |
 | 2. Date + Graveyard | [`graveyard`](packages/graveyard) | deterministic | **working** |
 | 3. Map | [`ui`](packages/ui) | UI | **working** |
-| 4. Resurrect | [`resurrect`](packages/resurrect) | agent (known-fix table first) | stub |
-| 5. Witness | [`witness`](packages/witness) | deterministic | stub |
+| 4. Interview | [`interview`](packages/interview) | one structured LLM call + the user | **working** |
+| 5. Resurrect | [`resurrect`](packages/resurrect) | agent (known-fix table first) | stub |
+| 6. Witness | [`witness`](packages/witness) | deterministic | stub |
 | Stretch: Operate | [`surgeon`](packages/surgeon) | agent | stub |
 
 ## Use it from Claude
@@ -44,7 +46,8 @@ Setup for Claude Desktop and other directories is in the
 [package README](packages/mcp/README.md).
 
 Shared code lives in [`core`](packages/core) (report types, seeded RNG) and
-[`llm`](packages/llm) (model client for the agent phases). The command line is
+[`llm`](packages/llm) (structured-output Claude client, plus a scripted
+model for tests). The command line is
 [`cli`](packages/cli), and the MCP server is [`mcp`](packages/mcp).
 
 Phases 1 to 3 are the first demo: no Docker, no LLM, just "here's what this
@@ -57,6 +60,7 @@ dead repo is and what's rotting in it".
 | `autopsy <repo> [--open]` | `exhume` + `graveyard`, saves both, optionally opens the UI |
 | `exhume <repo> [--save]` | Phase 1 architecture report (JSON) |
 | `graveyard <repo> [--save]` | Phase 2 era + dependency report (JSON) |
+| `interview <repo>` | Phase 4: Claude proposes what the repo is for, with file:line evidence; you confirm or correct it and pick goals |
 | `ui [--open]` | Serves the UI over saved reports on localhost |
 
 ## `necromancer exhume <git-url | path>`
@@ -115,9 +119,40 @@ alive. lodash 4.17.4 has 10 advisories (worst critical). Its summary
 reads "Lived 2012–2017; manifest written no earlier than 2017-08
 (sinon@3.2.1)".
 
+## `necromancer interview <git-url | path>`
+
+Before anything gets revived, someone has to say what the project is for.
+`interview` shows Claude the README, the manifest, the entry points, the
+load-bearing files from `exhume` and one file per cluster, with line
+numbers, and asks for a structured answer: a summary, what the project
+does, what a revival must keep working, suggested goals and open questions.
+Every claim cites `file:line` and quotes the lines. Necromancer then checks
+each quote against the repo: quotes on the wrong lines are moved, and
+quotes it can't find are marked "not found" and flagged.
+
+You then confirm the summary or replace it with your own words, pick
+suggested goals by number and add your own. Later stages read the result
+(`intent` and `goals` in `interview.json`).
+
+```sh
+export ANTHROPIC_API_KEY=…
+pnpm necromancer interview https://github.com/tttmaximttt/node-orm2              # asks interactively
+pnpm necromancer interview --reuse <repo> --yes --accept-goals 1,2 --goal "…"   # or answer with flags
+```
+
+It uses `claude-opus-5-5` at medium effort by default (`--model`,
+`--effort`). If the model declines, the API retries once on Anthropic's
+recommended fallback model (`--no-fallbacks` turns that off), and the
+report notes which model answered. Through MCP, the `interview` tool works
+without an API key too: the agent you're talking to gets the evidence and
+writes the proposal itself, and `record_interview` checks its citations the
+same way. Details are in the [package README](packages/interview/README.md).
+
 ## Safety
 
-Excavate only reads. It never installs dependencies or runs repo code. Later
+Excavate only reads. It never installs dependencies or runs repo code.
+Interview sends the files it picked (up to about 2,400 lines) to the
+Anthropic API; don't run it on code you can't share with it. Later
 phases that do (Resurrect, Witness, Operate) must run in a throwaway
 container, never on your machine, against shared environments, or in
 production.

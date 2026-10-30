@@ -2,9 +2,11 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import type { RequestHandlerExtra } from '@modelcontextprotocol/sdk/shared/protocol.js';
 import type { ServerNotification, ServerRequest } from '@modelcontextprotocol/sdk/types.js';
 import { z } from 'zod';
-import { ReportStore, type ExhumeReport, type GraveyardReport } from '@necromancer/core';
+import { ReportStore, slugFor, type ExhumeReport, type GraveyardReport, type InterviewReport } from '@necromancer/core';
 import { exhume as runExhume, type ExhumeOptions } from '@necromancer/excavate';
 import { graveyard as runGraveyard, type GraveyardOptions } from '@necromancer/graveyard';
+import { answerInterview, interviewBrief, proposeIntent, ProposalSchema, recordProposal } from '@necromancer/interview';
+import { ClaudeModel, hasCredentials, type StructuredModel } from '@necromancer/llm';
 
 export interface ServerOptions {
   /** Injected in tests; defaults to the real excavator. */
@@ -14,6 +16,8 @@ export interface ServerOptions {
   workdir?: string;
   /** Where reports are saved for `necromancer ui`. Defaults to ~/.necromancer/reports. */
   store?: ReportStore;
+  /** Model for the interview. Defaults to Claude when ANTHROPIC_API_KEY is set; otherwise the host agent proposes. */
+  model?: StructuredModel;
 }
 
 /** Per-cluster file lists and lockfile notes get long on big repos; summaries keep the agent's context small. */
@@ -24,7 +28,7 @@ export function createServer(options: ServerOptions = {}): McpServer {
   const exhume = options.exhume ?? runExhume;
   const graveyard = options.graveyard ?? runGraveyard;
   const store = options.store ?? new ReportStore();
-  const saveNote = async (kind: 'exhume' | 'graveyard', report: ExhumeReport | GraveyardReport) => {
+  const saveNote = async (kind: 'exhume' | 'graveyard' | 'interview', report: ExhumeReport | GraveyardReport | InterviewReport) => {
     try {
       return { savedTo: await store.save(kind, report), view: 'Run `necromancer ui` to browse it.' };
     } catch (err) {
@@ -103,6 +107,117 @@ export function createServer(options: ServerOptions = {}): McpServer {
     },
   );
 
+  server.registerTool(
+    'interview',
+    {
+      title: 'Propose what a repository is for',
+      description:
+        'Phase 4, step 1. Reads the README, manifest, entry points and load-bearing files of a JavaScript/TypeScript repo ' +
+        'and proposes what the project is for: a summary, capabilities and constraints, each citing file:line evidence ' +
+        'that is checked against the repo, plus suggested revival goals and open questions. With an Anthropic API key ' +
+        'Claude writes the proposal; without one (proposer "host") the tool returns the evidence and you write it. Either ' +
+        'way, show the proposal to the user, ask whether it is right and what their goals are, then call record_interview.',
+      inputSchema: {
+        source: z.string().min(1).describe('Git URL (https or ssh) or a local directory path'),
+        proposer: z
+          .enum(['auto', 'claude-api', 'host'])
+          .default('auto')
+          .describe('"claude-api" calls Claude; "host" returns the evidence for you to propose from; "auto" picks claude-api when a key is set'),
+        effort: z.enum(['low', 'medium', 'high', 'xhigh', 'max']).default('medium').describe('How hard Claude thinks (claude-api only)'),
+      },
+      annotations: { readOnlyHint: false, openWorldHint: true },
+    },
+    async ({ source, proposer, effort }, extra) => {
+      try {
+        const saved = await store.load(slugFor(source)).catch(() => null);
+        const common = { exhume: saved?.exhume, workdir: options.workdir, onProgress: progressReporter(extra) };
+        const useApi = proposer === 'claude-api' || (proposer === 'auto' && (options.model !== undefined || hasCredentials()));
+        if (!useApi) {
+          const brief = await interviewBrief(source, common);
+          if (brief.exhume !== saved?.exhume) await saveNote('exhume', brief.exhume);
+          return text({
+            proposer: 'host',
+            next:
+              'Read the evidence and write a proposal in the record_interview `proposal` shape, citing files and line ' +
+              'numbers from the numbered listings and quoting the lines verbatim. Show it to the user, ask whether it ' +
+              'describes the project and which goals they want, then call record_interview with the proposal and their answer.',
+            instructions: brief.instructions,
+            evidence: brief.evidence,
+          });
+        }
+        const model = options.model ?? new ClaudeModel();
+        const { interview, exhume: report } = await proposeIntent(source, { ...common, model, effort });
+        if (report !== saved?.exhume) await saveNote('exhume', report);
+        return text({
+          ...interview,
+          ...(await saveNote('interview', interview)),
+          next:
+            'Show the user the summary, the capabilities and constraints with their citations (flag any that are not ' +
+            'verified), the open questions and the numbered suggested goals. Ask whether the summary is right and which ' +
+            'goals they want, then call record_interview with their answer. Do not answer for them.',
+        });
+      } catch (err) {
+        return failure('interview', err);
+      }
+    },
+  );
+
+  server.registerTool(
+    'record_interview',
+    {
+      title: 'Record what the user said the repository is for',
+      description:
+        'Phase 4, step 2. Records the user\'s answer to the interview: confirm the proposed intent or correct it in their ' +
+        'own words, pick suggested goals by number, and add goals of their own. Later stages plan the revival from this. ' +
+        'Pass `proposal` only if you wrote it yourself (proposer "host"); its citations are checked against the repo. ' +
+        'Only call this with what the user actually said.',
+      inputSchema: {
+        source: z.string().min(1).describe('The same source given to interview'),
+        confirm: z.boolean().default(false).describe('The user agrees with the proposed summary'),
+        correction: z.string().optional().describe('What the user says the project is for, replacing the summary'),
+        acceptGoals: z
+          .union([z.array(z.number().int().min(1)), z.literal('all')])
+          .optional()
+          .describe('Suggested goals the user picked, by their 1-based number, or "all"'),
+        goals: z.array(z.string()).default([]).describe('Goals in the user\'s own words'),
+        proposal: ProposalSchema.optional().describe('Your own proposal, when interview returned evidence instead of one'),
+        host: z.string().default('mcp-host').describe('Who wrote `proposal`, for the record'),
+      },
+      annotations: { readOnlyHint: false, openWorldHint: true },
+    },
+    async ({ source, confirm, correction, acceptGoals, goals, proposal, host }, extra) => {
+      try {
+        let interview: InterviewReport;
+        if (proposal) {
+          const saved = await store.load(slugFor(source)).catch(() => null);
+          interview = (await recordProposal(source, proposal, host, { exhume: saved?.exhume, workdir: options.workdir, onProgress: progressReporter(extra) }))
+            .interview;
+        } else {
+          const saved = (await store.load(slugFor(source)))?.interview;
+          if (!saved) throw new Error(`no interview saved for ${source}; call interview first`);
+          interview = saved;
+        }
+        const answered = answerInterview(interview, {
+          confirm,
+          correction,
+          acceptSuggested: acceptGoals === 'all' ? 'all' : acceptGoals?.map((n) => n - 1),
+          goals,
+        });
+        const { savedTo, saveError } = await saveNote('interview', answered);
+        return text({
+          status: answered.status,
+          intent: answered.intent,
+          goals: answered.goals,
+          warnings: answered.warnings,
+          savedTo,
+          ...(saveError && { saveError }),
+        });
+      } catch (err) {
+        return failure('record_interview', err);
+      }
+    },
+  );
+
   server.registerPrompt(
     'autopsy',
     {
@@ -132,6 +247,10 @@ export function createServer(options: ServerOptions = {}): McpServer {
 }
 
 type ToolExtra = RequestHandlerExtra<ServerRequest, ServerNotification>;
+
+function text(body: unknown) {
+  return { content: [{ type: 'text' as const, text: JSON.stringify(body, null, 2) }] };
+}
 
 /** Forwards excavator progress as MCP progress notifications when the client asked for them. */
 function progressReporter(extra: ToolExtra): ((message: string) => void) | undefined {

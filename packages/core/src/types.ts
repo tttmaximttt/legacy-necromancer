@@ -221,3 +221,58 @@ export interface GraveyardReport {
   nonRegistry: Array<{ name: string; spec: string }>;
   warnings: string[];
 }
+
+/** A span of a repo file the model points at to back a claim. Line numbers are 1-based and inclusive. */
+export interface Citation {
+  file: string;
+  startLine: number;
+  endLine: number;
+  /** A short excerpt the model says is on those lines. */
+  quote: string;
+  /** Whether the quote really is on those lines of that file at the analysed commit. */
+  verified: boolean;
+}
+
+export interface IntentClaim {
+  claim: string;
+  evidence: Citation[];
+}
+
+/** What the project seems to be for, as proposed by the model (or the agent hosting the MCP server). */
+export interface IntentProposal {
+  /** One or two sentences: what it is and who it is for. */
+  summary: string;
+  /** What it does, each backed by citations. */
+  capabilities: IntentClaim[];
+  /** Constraints a revival must respect: public API, supported runtimes, file formats, protocols. */
+  constraints: IntentClaim[];
+  suggestedGoals: string[];
+  /** What the evidence couldn't settle; worth asking the user. */
+  openQuestions: string[];
+  confidence: 'high' | 'medium' | 'low';
+}
+
+export interface InterviewGoal {
+  text: string;
+  origin: 'suggested' | 'user';
+}
+
+/**
+ * Phase 4: the repo's intent, proposed from evidence and then confirmed or corrected by the user, plus the goals
+ * later stages work towards. `intent` is the version later stages should trust.
+ */
+export interface InterviewReport {
+  repo: { source: string; commit: string | null };
+  generatedAt: string;
+  proposedBy: { kind: 'claude-api'; model: string; fellBack: boolean } | { kind: 'host'; name: string };
+  /** Files shown to the model, and how much of each. */
+  evidence: Array<{ path: string; lines: number; truncated: boolean }>;
+  proposal: IntentProposal;
+  status: 'proposed' | 'confirmed' | 'corrected';
+  /** The user's correction when status is "corrected", otherwise the proposal's summary. */
+  intent: string;
+  corrections: string | null;
+  goals: InterviewGoal[];
+  answeredAt: string | null;
+  warnings: string[];
+}

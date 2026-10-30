@@ -64,6 +64,7 @@ export function App() {
 
   const exhume = reports?.exhume ?? null;
   const graveyard = reports?.graveyard ?? null;
+  const interview = reports?.interview ?? null;
   const source = exhume?.repo.source ?? graveyard?.repo.source ?? null;
 
   return (
@@ -111,6 +112,12 @@ export function App() {
             <div className="summary-title">
               <h2>{source?.replace(/^https?:\/\/(www\.)?/, '') ?? 'Unknown repository'}</h2>
               <p className="muted">{graveyard?.era.summary ?? eraFromHistory(exhume)}</p>
+              {interview && (
+                <p className="intent">
+                  <span className="intent-label">{interview.status === 'proposed' ? 'Proposed intent' : 'Intent'}</span> {interview.intent}
+                  {interview.goals.length > 0 && <span className="muted"> · {interview.goals.length} goals</span>}
+                </p>
+              )}
             </div>
             <div className="tiles">
               {exhume && (

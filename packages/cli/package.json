@@ -21,7 +21,9 @@
     "@necromancer/excavate": "workspace:*",
     "commander": "^15.0.0",
     "@necromancer/graveyard": "workspace:*",
-    "@necromancer/ui": "workspace:*"
+    "@necromancer/ui": "workspace:*",
+    "@necromancer/interview": "workspace:*",
+    "@necromancer/llm": "workspace:*"
   },
   "bin": {
     "necromancer": "./dist/bin.js"

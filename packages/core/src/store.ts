@@ -1,9 +1,17 @@
 import { mkdir, readdir, readFile, stat, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
-import type { ExhumeReport, GraveyardReport } from './types.js';
+import type { ExhumeReport, GraveyardReport, InterviewReport } from './types.js';
 
-export type ReportKind = 'exhume' | 'graveyard';
+export type ReportKind = 'exhume' | 'graveyard' | 'interview';
+
+export const REPORT_KINDS: readonly ReportKind[] = ['exhume', 'graveyard', 'interview'];
+
+export interface StoredReports {
+  exhume: ExhumeReport | null;
+  graveyard: GraveyardReport | null;
+  interview: InterviewReport | null;
+}
 
 export interface StoredRepo {
   slug: string;
@@ -24,11 +32,11 @@ export function slugFor(source: string): string {
   return raw.replace(/[^\w.-]/g, '_').replace(/^\.+/, '_').slice(0, 80) || 'repo';
 }
 
-/** One directory per repo with `exhume.json` and/or `graveyard.json`. Later runs overwrite earlier ones. */
+/** One directory per repo with `exhume.json`, `graveyard.json` and/or `interview.json`. Later runs overwrite earlier ones. */
 export class ReportStore {
   constructor(readonly dir: string = defaultReportsDir()) {}
 
-  async save(kind: ReportKind, report: ExhumeReport | GraveyardReport): Promise<string> {
+  async save(kind: ReportKind, report: ExhumeReport | GraveyardReport | InterviewReport): Promise<string> {
     const slug = slugFor(report.repo.source);
     const dir = path.join(this.dir, slug);
     await mkdir(dir, { recursive: true });
@@ -49,7 +57,7 @@ export class ReportStore {
       const kinds: ReportKind[] = [];
       let source = slug;
       let savedAt = '';
-      for (const kind of ['exhume', 'graveyard'] as const) {
+      for (const kind of REPORT_KINDS) {
         const file = path.join(this.dir, slug, `${kind}.json`);
         const info = await stat(file).catch(() => null);
         if (!info) continue;
@@ -62,14 +70,18 @@ export class ReportStore {
     return repos.sort((a, b) => b.savedAt.localeCompare(a.savedAt));
   }
 
-  async load(slug: string): Promise<{ exhume: ExhumeReport | null; graveyard: GraveyardReport | null } | null> {
+  async load(slug: string): Promise<StoredReports | null> {
     if (slug !== slugFor(slug) || slug.includes('..')) return null;
     const read = async <T>(kind: ReportKind) => {
       const text = await readFile(path.join(this.dir, slug, `${kind}.json`), 'utf8').catch(() => null);
       return text ? (JSON.parse(text) as T) : null;
     };
-    const [exhume, graveyard] = await Promise.all([read<ExhumeReport>('exhume'), read<GraveyardReport>('graveyard')]);
-    return exhume || graveyard ? { exhume, graveyard } : null;
+    const [exhume, graveyard, interview] = await Promise.all([
+      read<ExhumeReport>('exhume'),
+      read<GraveyardReport>('graveyard'),
+      read<InterviewReport>('interview'),
+    ]);
+    return exhume || graveyard || interview ? { exhume, graveyard, interview } : null;
   }
 
   private async readSource(file: string): Promise<string | null> {

@@ -2,7 +2,7 @@
   "name": "@necromancer/witness",
   "version": "0.0.0",
   "private": true,
-  "description": "Phase 5: record behavioural snapshots of the revived app so upgrades can be checked against them.",
+  "description": "Phase 6: record behavioural snapshots of the revived app so upgrades can be checked against them.",
   "type": "module",
   "exports": {
     ".": {

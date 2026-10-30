@@ -8,6 +8,8 @@ import { Command } from 'commander';
 import { ReportStore, type ReportKind } from '@necromancer/core';
 import { exhume } from '@necromancer/excavate';
 import { graveyard } from '@necromancer/graveyard';
+import { DEFAULT_MODEL, type Effort, type StructuredModel } from '@necromancer/llm';
+import { runInterview, terminalIo, type InterviewOptions } from './interview.js';
 import { createUiServer } from './server.js';
 
 interface OutputOptions {
@@ -17,7 +19,14 @@ interface OutputOptions {
   quiet?: boolean;
 }
 
-export function createProgram(): Command {
+export interface ProgramDeps {
+  /** Injected in tests; defaults to Claude via the Anthropic API. */
+  model?: StructuredModel;
+}
+
+const EFFORTS: readonly Effort[] = ['low', 'medium', 'high', 'xhigh', 'max'];
+
+export function createProgram(deps: ProgramDeps = {}): Command {
   const program = new Command('necromancer')
     .description('An AI archaeologist for abandoned JavaScript/TypeScript projects.')
     .version('0.0.0');
@@ -106,6 +115,34 @@ export function createProgram(): Command {
         if (opts.open) await serve({ port: opts.port, reports: opts.reports, open: true, slug: path.basename(path.dirname(saved)) });
       },
     );
+
+  program
+    .command('interview')
+    .description(
+      'Ask Claude what the project is for, with file:line evidence, then confirm or correct it and set goals for the revival. ' +
+        'Needs ANTHROPIC_API_KEY. Without answer flags it asks interactively.',
+    )
+    .argument('<source>', 'git URL or local path')
+    .option('-m, --model <id>', 'Claude model', DEFAULT_MODEL)
+    .option('-e, --effort <level>', `how hard the model thinks: ${EFFORTS.join(', ')}`, 'medium')
+    .option('--no-fallbacks', 'do not retry a declined request on the fallback model')
+    .option('-y, --yes', 'confirm the proposed intent')
+    .option('-c, --correct <text>', 'replace the proposed intent with your own description')
+    .option('-g, --accept-goals <list>', 'suggested goals to keep, by number (1,3) or "all"')
+    .option('--goal <text>', 'a goal in your own words (repeatable)', (v: string, all: string[] = []) => [...all, v])
+    .option('-r, --reuse', 'answer the saved proposal instead of asking the model again')
+    .option('--reports <dir>', 'report store directory')
+    .option('-w, --workdir <dir>', 'where to clone remote repos')
+    .option('-q, --quiet', 'no progress output on stderr')
+    .action(async (source: string, opts: InterviewOptions) => {
+      if (!EFFORTS.includes(opts.effort)) throw new Error(`unknown effort: ${opts.effort}`);
+      const io = { ...terminalIo(), model: deps.model };
+      try {
+        await runInterview(source, opts, io);
+      } finally {
+        io.close?.();
+      }
+    });
 
   program
     .command('ui')

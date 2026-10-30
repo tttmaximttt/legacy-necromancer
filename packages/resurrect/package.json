@@ -2,7 +2,7 @@
   "name": "@necromancer/resurrect",
   "version": "0.0.0",
   "private": true,
-  "description": "Phase 4: get the project installing and building in a sandbox, known-fix table first, LLM second.",
+  "description": "Phase 5: get the project installing and building in a sandbox, known-fix table first, LLM second.",
   "type": "module",
   "exports": {
     ".": {

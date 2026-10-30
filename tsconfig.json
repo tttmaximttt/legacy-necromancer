@@ -23,6 +23,9 @@
       "path": "packages/llm"
     },
     {
+      "path": "packages/interview"
+    },
+    {
       "path": "packages/cli"
     },
     {
