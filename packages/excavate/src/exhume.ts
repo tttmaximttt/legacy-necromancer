@@ -148,7 +148,7 @@ function countLines(text: string): number {
   return text.split('\n').filter((l) => l.trim()).length;
 }
 
-async function headCommit(root: string): Promise<string | null> {
+export async function headCommit(root: string): Promise<string | null> {
   try {
     return (await simpleGit(root).revparse(['HEAD'])).trim();
   } catch {

@@ -117,3 +117,85 @@ export interface ExhumeReport {
   manifests: DependencySummary[];
   installScripts: InstallScriptFinding[];
 }
+
+// ── Phase 2: Date & Graveyard ────────────────────────────────────────────
+
+export interface EraEstimate {
+  /** First commit, if there is history. */
+  born: string | null;
+  /** Last commit: when the project stopped moving. */
+  died: string | null;
+  /**
+   * Earliest date the manifest as written could exist: the newest publish
+   * date among the minimum versions its ranges allow.
+   */
+  dependencyFloor: { date: string; package: string; version: string } | null;
+  /** The Node release the `engines.node` range targets. */
+  node: { range: string; release: string; released: string } | null;
+  /** Best guess at the year–month the code is from. */
+  estimate: string | null;
+  confidence: 'high' | 'medium' | 'low' | 'none';
+  summary: string;
+}
+
+/** dead: deprecated, archived or gone. dying: unmaintained. ailing: works but vulnerable or far behind. */
+export type TombstoneStatus = 'dead' | 'dying' | 'ailing' | 'alive' | 'unknown';
+
+export type CauseKind = 'deprecated' | 'archived' | 'missing' | 'abandoned' | 'vulnerable' | 'outdated';
+
+export interface Cause {
+  kind: CauseKind;
+  detail: string;
+}
+
+export interface Advisory {
+  id: string;
+  title: string;
+  severity: 'critical' | 'high' | 'moderate' | 'low' | 'unknown';
+  url: string | null;
+  /** Affected range when the source provides one. */
+  vulnerableVersions: string | null;
+}
+
+export interface Replacement {
+  name: string;
+  reason: string;
+  /** Where the suggestion came from: our curated table, or the deprecation message itself. */
+  source: 'known' | 'deprecation-message';
+}
+
+export interface Tombstone {
+  name: string;
+  /** Range from package.json. */
+  declared: string;
+  dev: boolean;
+  /** Version the project actually used, best effort. */
+  resolved: string | null;
+  /** lockfile: pinned. era: newest matching version published before the last commit. latest: newest matching version today. */
+  resolvedFrom: 'lockfile' | 'era' | 'latest' | null;
+  latest: string | null;
+  /** Majors between resolved and latest. */
+  majorsBehind: number | null;
+  lastPublished: string | null;
+  repository: string | null;
+  status: TombstoneStatus;
+  causes: Cause[];
+  advisories: Advisory[];
+  replacement: Replacement | null;
+  /** One line, for the UI. */
+  epitaph: string;
+}
+
+export type SourceStatus = 'ok' | 'partial' | 'failed' | 'skipped';
+
+export interface GraveyardReport {
+  repo: { source: string; commit: string | null };
+  era: EraEstimate;
+  summary: Record<TombstoneStatus, number> & { total: number; vulnerable: number };
+  tombstones: Tombstone[];
+  /** Which lookups worked. A `failed` source means its causes are missing, not absent. */
+  sources: { registry: SourceStatus; advisories: SourceStatus; advisoryProvider: string; github: SourceStatus };
+  /** Dependencies that aren't on the registry (git, file:, tarball URLs). */
+  nonRegistry: Array<{ name: string; spec: string }>;
+  warnings: string[];
+}

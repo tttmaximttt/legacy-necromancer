@@ -9,6 +9,7 @@ export default defineConfig({
       '@necromancer/core': pkg('core'),
       '@necromancer/excavate': pkg('excavate'),
       '@necromancer/mcp': pkg('mcp'),
+      '@necromancer/graveyard': pkg('graveyard'),
     },
   },
   test: {
