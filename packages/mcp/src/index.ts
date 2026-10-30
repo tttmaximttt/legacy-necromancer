@@ -1,12 +1,14 @@
+import path from 'node:path';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import type { RequestHandlerExtra } from '@modelcontextprotocol/sdk/shared/protocol.js';
 import type { ServerNotification, ServerRequest } from '@modelcontextprotocol/sdk/types.js';
 import { z } from 'zod';
-import { ReportStore, slugFor, type ExhumeReport, type GraveyardReport, type InterviewReport } from '@necromancer/core';
+import { ReportStore, slugFor, type ExhumeReport, type GraveyardReport, type InterviewReport, type ReportKind } from '@necromancer/core';
 import { exhume as runExhume, type ExhumeOptions } from '@necromancer/excavate';
 import { graveyard as runGraveyard, type GraveyardOptions } from '@necromancer/graveyard';
 import { answerInterview, interviewBrief, proposeIntent, ProposalSchema, recordProposal } from '@necromancer/interview';
 import { ClaudeModel, hasCredentials, type StructuredModel } from '@necromancer/llm';
+import { DEFAULT_MAX_ITERATIONS, DEFAULT_TOKEN_BUDGET, DockerSandbox, FixCache, resurrect, type Sandbox } from '@necromancer/resurrect';
 
 export interface ServerOptions {
   /** Injected in tests; defaults to the real excavator. */
@@ -16,8 +18,10 @@ export interface ServerOptions {
   workdir?: string;
   /** Where reports are saved for `necromancer ui`. Defaults to ~/.necromancer/reports. */
   store?: ReportStore;
-  /** Model for the interview. Defaults to Claude when ANTHROPIC_API_KEY is set; otherwise the host agent proposes. */
+  /** Model for the interview and Resurrect's fixes. Defaults to Claude when ANTHROPIC_API_KEY is set. */
   model?: StructuredModel;
+  /** Where Resurrect runs containers. Defaults to the local Docker daemon. */
+  sandbox?: Sandbox;
 }
 
 /** Per-cluster file lists and lockfile notes get long on big repos; summaries keep the agent's context small. */
@@ -28,7 +32,7 @@ export function createServer(options: ServerOptions = {}): McpServer {
   const exhume = options.exhume ?? runExhume;
   const graveyard = options.graveyard ?? runGraveyard;
   const store = options.store ?? new ReportStore();
-  const saveNote = async (kind: 'exhume' | 'graveyard' | 'interview', report: ExhumeReport | GraveyardReport | InterviewReport) => {
+  const saveNote = async (kind: ReportKind, report: Parameters<ReportStore['save']>[1]) => {
     try {
       return { savedTo: await store.save(kind, report), view: 'Run `necromancer ui` to browse it.' };
     } catch (err) {
@@ -214,6 +218,62 @@ export function createServer(options: ServerOptions = {}): McpServer {
         });
       } catch (err) {
         return failure('record_interview', err);
+      }
+    },
+  );
+
+  server.registerTool(
+    'resurrect',
+    {
+      title: 'Bring a repository back to life in a sandbox',
+      description:
+        'Phase 5. Builds the project in Docker on the Node version of its era, with its databases (Mongo, Redis, Postgres, ' +
+        'MySQL…) as sidecars, and boots it until a port answers. Failures are fixed from a table of known fixes, then by ' +
+        'Claude if ANTHROPIC_API_KEY is set, for at most maxIterations attempts and tokenBudget tokens; otherwise it ends ' +
+        'with BLOCKED and a reason. Sandbox: network only while installing dependencies, no host mounts, no credentials, ' +
+        'CPU/memory/process/time limits. Takes minutes. Needs Docker on the machine running this server.',
+      inputSchema: {
+        source: z.string().min(1).describe('Git URL (https or ssh) or a local directory path'),
+        maxIterations: z.number().int().min(1).max(DEFAULT_MAX_ITERATIONS).default(DEFAULT_MAX_ITERATIONS),
+        tokenBudget: z.number().int().min(0).default(DEFAULT_TOKEN_BUDGET).describe('Tokens Claude may spend on fixes; 0 for known fixes only'),
+        save: z.boolean().default(true).describe('Save the report so the user can browse it with `necromancer ui`'),
+      },
+      annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: true },
+    },
+    async ({ source, maxIterations, tokenBudget, save }, extra) => {
+      try {
+        const saved = await store.load(slugFor(source)).catch(() => null);
+        const model = tokenBudget > 0 ? (options.model ?? (hasCredentials() ? new ClaudeModel() : null)) : null;
+        const report = await resurrect(source, {
+          sandbox: options.sandbox ?? new DockerSandbox(),
+          model,
+          maxIterations,
+          tokenBudget,
+          exhume: saved?.exhume,
+          graveyard: saved?.graveyard,
+          interview: saved?.interview,
+          fixCache: new FixCache(path.join(path.dirname(store.dir), 'fix-cache.json')),
+          workdir: options.workdir,
+          onProgress: progressReporter(extra),
+        });
+        return text({
+          outcome: report.outcome === 'resurrected' ? 'RESURRECTED' : `BLOCKED: ${report.blockedReason}`,
+          health: report.health,
+          era: report.era,
+          services: report.services,
+          attempts: report.attempts.map(({ errorExcerpt, ...a }) => ({
+            ...a,
+            ...(errorExcerpt && { errorExcerpt: errorExcerpt.split('\n').slice(-12).join('\n') }),
+          })),
+          llm: report.llm,
+          warnings: report.warnings,
+          dockerfile: report.dockerfile,
+          compose: report.compose,
+          ...(!model && tokenBudget > 0 && { note: 'No ANTHROPIC_API_KEY in the server environment, so only known fixes were tried.' }),
+          ...(save && (await saveNote('resurrect', report))),
+        });
+      } catch (err) {
+        return failure('resurrect', err);
       }
     },
   );

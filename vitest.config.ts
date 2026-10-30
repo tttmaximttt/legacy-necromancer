@@ -12,6 +12,7 @@ export default defineConfig({
       '@necromancer/graveyard': pkg('graveyard'),
       '@necromancer/llm': pkg('llm'),
       '@necromancer/interview': pkg('interview'),
+      '@necromancer/resurrect': pkg('resurrect'),
     },
   },
   test: {

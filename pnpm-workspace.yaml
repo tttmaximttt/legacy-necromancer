@@ -5,5 +5,9 @@ packages:
 ignoredBuiltDependencies:
   - tree-sitter-javascript
   - tree-sitter-typescript
+  # dockerode's optional SSH transport; the pure-JS fallbacks are enough for a local socket.
+  - cpu-features
+  - ssh2
+  - protobufjs
 onlyBuiltDependencies:
   - esbuild

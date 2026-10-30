@@ -276,3 +276,103 @@ export interface InterviewReport {
   answeredAt: string | null;
   warnings: string[];
 }
+
+// ── Phase 5: Resurrect ───────────────────────────────────────────────────
+
+export type ServiceKind = 'mongo' | 'redis' | 'postgres' | 'mysql' | 'rabbitmq' | 'elasticsearch' | 'memcached';
+
+export interface DetectedService {
+  kind: ServiceKind;
+  image: string;
+  /** Why we think the app needs it: a package name or a connection string. */
+  evidence: string[];
+  /** Variables pointing the app at it; services share the app's localhost. */
+  env: Record<string, string>;
+}
+
+/** Hard limits on every container Resurrect starts. */
+export interface SandboxLimits {
+  cpus: number;
+  memoryMb: number;
+  pids: number;
+  /** Per build, build-script or boot step. */
+  stepTimeoutSec: number;
+}
+
+/** One change to the build recipe. Fixes, known or proposed by the model, are lists of these. */
+export type RecipeOp =
+  | { op: 'setNodeImage'; tag: string }
+  | { op: 'aptInstall'; packages: string[] }
+  | { op: 'useDebianArchive' }
+  | { op: 'setEnv'; name: string; value: string }
+  | { op: 'setDependency'; name: string; version: string; dev?: boolean }
+  | { op: 'removeDependency'; name: string }
+  | { op: 'addInstallFlags'; flags: string[] }
+  | { op: 'dropLockfile' }
+  | { op: 'globalInstall'; spec: string }
+  | { op: 'runBeforeInstall'; command: string }
+  | { op: 'setBuildCommand'; command: string | null }
+  | { op: 'setStartCommand'; command: string | null }
+  | { op: 'setPort'; port: number | null };
+
+/** Everything the generated Dockerfile is rendered from. The repo itself is never edited. */
+export interface BuildRecipe {
+  nodeImage: string;
+  packageManager: 'npm' | 'yarn' | 'pnpm';
+  debianArchive: boolean;
+  aptPackages: string[];
+  env: Record<string, string>;
+  globalInstalls: string[];
+  beforeInstall: string[];
+  /** Run `bower install` after npm, for front ends from the bower era. */
+  bower: boolean;
+  installFlags: string[];
+  dropLockfile: boolean;
+  /** Edits to package.json in the build context. null removes the dependency. */
+  dependencyPatches: Record<string, { version: string | null; dev: boolean }>;
+  buildCommand: string | null;
+  startCommand: string | null;
+  port: number | null;
+}
+
+export type ResurrectPhase = 'install' | 'build' | 'boot';
+
+export interface AppliedFix {
+  source: 'known' | 'cache' | 'llm';
+  id: string;
+  description: string;
+  ops: RecipeOp[];
+}
+
+export interface ResurrectAttempt {
+  n: number;
+  /** Where it got to: the phase that failed, or "boot" on success. */
+  phase: ResurrectPhase;
+  ok: boolean;
+  durationMs: number;
+  /** Stable hash of the error, for caching fixes and spotting loops. */
+  signature: string | null;
+  /** The last lines of the failing step's log. */
+  errorExcerpt: string | null;
+  /** The fix applied after this attempt failed. */
+  fix: AppliedFix | null;
+}
+
+export interface ResurrectReport {
+  repo: { source: string; commit: string | null };
+  generatedAt: string;
+  outcome: 'resurrected' | 'blocked';
+  /** Set when blocked: the "BLOCKED: <reason>" line, without the prefix. */
+  blockedReason: string | null;
+  /** How it was judged alive: a port answering, a log line, or (for libraries) a clean install and build. */
+  health: { kind: 'port' | 'log' | 'library'; detail: string } | null;
+  era: { date: string | null; node: string; why: string };
+  services: DetectedService[];
+  recipe: BuildRecipe;
+  dockerfile: string;
+  compose: string;
+  limits: SandboxLimits;
+  attempts: ResurrectAttempt[];
+  llm: { model: string | null; calls: number; tokens: number; budget: number };
+  warnings: string[];
+}

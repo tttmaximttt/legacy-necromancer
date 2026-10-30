@@ -31,7 +31,7 @@ the model call is tested against a scripted model, so no API key is needed.
 | 2. Date + Graveyard | [`graveyard`](packages/graveyard) | deterministic | **working** |
 | 3. Map | [`ui`](packages/ui) | UI | **working** |
 | 4. Interview | [`interview`](packages/interview) | one structured LLM call + the user | **working** |
-| 5. Resurrect | [`resurrect`](packages/resurrect) | agent (known-fix table first) | stub |
+| 5. Resurrect | [`resurrect`](packages/resurrect) | agent (known-fix table first) | **working** |
 | 6. Witness | [`witness`](packages/witness) | deterministic | stub |
 | Stretch: Operate | [`surgeon`](packages/surgeon) | agent | stub |
 
@@ -61,6 +61,7 @@ dead repo is and what's rotting in it".
 | `exhume <repo> [--save]` | Phase 1 architecture report (JSON) |
 | `graveyard <repo> [--save]` | Phase 2 era + dependency report (JSON) |
 | `interview <repo>` | Phase 4: Claude proposes what the repo is for, with file:line evidence; you confirm or correct it and pick goals |
+| `resurrect <repo>` | Phase 5: builds and boots it in Docker on its era's Node, fixing failures until it runs or is `BLOCKED` |
 | `ui [--open]` | Serves the UI over saved reports on localhost |
 
 ## `necromancer exhume <git-url | path>`
@@ -148,14 +149,37 @@ without an API key too: the agent you're talking to gets the evidence and
 writes the proposal itself, and `record_interview` checks its citations the
 same way. Details are in the [package README](packages/interview/README.md).
 
+## `necromancer resurrect <git-url | path>`
+
+Builds the project in Docker on the Node version of its era, with its
+databases alongside, and boots it until its port answers. A 2017 Express
+and Mongoose app gets `node:6` and `mongo:3.4`. When a step fails, the
+next change comes from a table of known fixes (node-gyp needing Python,
+node-sass, end-of-life Debian mirrors, phantomjs downloads, peer
+dependencies…), then from fixes the model found for the same error before,
+then from Claude. It stops after 10 attempts, at a token budget, or when no
+fix applies, with `BLOCKED: <reason>`.
+
+```sh
+pnpm necromancer resurrect https://github.com/owner/old-app --out-dir ./revived
+```
+
+`--out-dir` also writes `Dockerfile.necromancer` and
+`docker-compose.necromancer.yml` with the same limits, for running it
+yourself. Without `ANTHROPIC_API_KEY` only known fixes are tried
+(`--no-llm` forces that). The exit code is 2 when blocked. Details,
+including the sandbox, are in the [package README](packages/resurrect/README.md).
+
 ## Safety
 
 Excavate only reads. It never installs dependencies or runs repo code.
+Resurrect does run repo code, including install scripts, but only in
+containers: no host mounts, no credentials, network only while installing,
+and CPU, memory, process and time limits on everything.
 Interview sends the files it picked (up to about 2,400 lines) to the
 Anthropic API; don't run it on code you can't share with it. Later
-phases that do (Resurrect, Witness, Operate) must run in a throwaway
-container, never on your machine, against shared environments, or in
-production.
+phases (Witness, Operate) must do the same, and none of it should ever
+point at shared environments or production.
 
 ## Development
 

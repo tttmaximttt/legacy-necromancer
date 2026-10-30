@@ -1,14 +1,15 @@
 import { spawn } from 'node:child_process';
 import { existsSync } from 'node:fs';
-import { writeFile } from 'node:fs/promises';
+import { mkdir, writeFile } from 'node:fs/promises';
 import type { AddressInfo } from 'node:net';
 import { createRequire } from 'node:module';
 import path from 'node:path';
 import { Command } from 'commander';
-import { ReportStore, type ReportKind } from '@necromancer/core';
+import { ReportStore, slugFor, type ReportKind } from '@necromancer/core';
 import { exhume } from '@necromancer/excavate';
 import { graveyard } from '@necromancer/graveyard';
-import { DEFAULT_MODEL, type Effort, type StructuredModel } from '@necromancer/llm';
+import { ClaudeModel, DEFAULT_MODEL, hasCredentials, type Effort, type StructuredModel } from '@necromancer/llm';
+import { DEFAULT_LIMITS, DEFAULT_MAX_ITERATIONS, DEFAULT_TOKEN_BUDGET, DockerSandbox, FixCache, resurrect, type Sandbox } from '@necromancer/resurrect';
 import { runInterview, terminalIo, type InterviewOptions } from './interview.js';
 import { createUiServer } from './server.js';
 
@@ -22,6 +23,8 @@ interface OutputOptions {
 export interface ProgramDeps {
   /** Injected in tests; defaults to Claude via the Anthropic API. */
   model?: StructuredModel;
+  /** Injected in tests; defaults to the local Docker daemon. */
+  sandbox?: Sandbox;
 }
 
 const EFFORTS: readonly Effort[] = ['low', 'medium', 'high', 'xhigh', 'max'];
@@ -143,6 +146,95 @@ export function createProgram(deps: ProgramDeps = {}): Command {
         io.close?.();
       }
     });
+
+  const int = (v: string) => Number.parseInt(v, 10);
+  program
+    .command('resurrect')
+    .description(
+      'Get the project installing, building and booting in a Docker sandbox pinned to its era. Known fixes first, then ' +
+        'Claude (if ANTHROPIC_API_KEY is set); stops with BLOCKED: <reason> when it cannot get further. Needs Docker.',
+    )
+    .argument('<source>', 'git URL or local path')
+    .option('-n, --max-iterations <n>', 'build attempts before giving up', int, DEFAULT_MAX_ITERATIONS)
+    .option('--token-budget <n>', 'input + output tokens the model may spend', int, DEFAULT_TOKEN_BUDGET)
+    .option('--no-llm', 'known fixes and cached fixes only')
+    .option('-m, --model <id>', 'Claude model', DEFAULT_MODEL)
+    .option('--cpus <n>', 'CPUs per container', Number, DEFAULT_LIMITS.cpus)
+    .option('--memory <mb>', 'memory per container, in MB', int, DEFAULT_LIMITS.memoryMb)
+    .option('--step-timeout <sec>', 'time limit for each install, build or boot step', int, DEFAULT_LIMITS.stepTimeoutSec)
+    .option('--health-timeout <sec>', 'how long to wait for the app to answer', int, 90)
+    .option('--out-dir <dir>', 'also write Dockerfile.necromancer and docker-compose.necromancer.yml here')
+    .option('--ca-file <file>', 'extra CA certificate for a TLS-intercepting proxy during install')
+    .option('--build-proxy', "pass this machine's HTTP(S)_PROXY to the install step")
+    .option('--keep-images', 'keep the built images')
+    .option('--reports <dir>', 'report store directory')
+    .option('-w, --workdir <dir>', 'where to clone remote repos')
+    .option('-q, --quiet', 'no progress output on stderr')
+    .action(
+      async (
+        source: string,
+        opts: {
+          maxIterations: number;
+          tokenBudget: number;
+          llm: boolean;
+          model: string;
+          cpus: number;
+          memory: number;
+          stepTimeout: number;
+          healthTimeout: number;
+          outDir?: string;
+          caFile?: string;
+          buildProxy?: boolean;
+          keepImages?: boolean;
+          reports?: string;
+          workdir?: string;
+          quiet?: boolean;
+        },
+      ) => {
+        const store = new ReportStore(opts.reports);
+        const saved = await store.load(slugFor(source));
+        const say = progress(opts, '☥');
+        let model: StructuredModel | null = null;
+        if (opts.llm) {
+          if (deps.model) model = deps.model;
+          else if (hasCredentials()) model = new ClaudeModel({ model: opts.model });
+          else say?.('no ANTHROPIC_API_KEY, so only known fixes will be tried');
+        }
+        const report = await resurrect(source, {
+          sandbox: deps.sandbox ?? new DockerSandbox({ buildProxy: opts.buildProxy, healthTimeoutSec: opts.healthTimeout }),
+          model,
+          maxIterations: opts.maxIterations,
+          tokenBudget: opts.tokenBudget,
+          limits: { cpus: opts.cpus, memoryMb: opts.memory, stepTimeoutSec: opts.stepTimeout },
+          exhume: saved?.exhume,
+          graveyard: saved?.graveyard,
+          interview: saved?.interview,
+          fixCache: new FixCache(path.join(path.dirname(store.dir), 'fix-cache.json')),
+          caFile: opts.caFile,
+          workdir: opts.workdir,
+          keepImages: opts.keepImages,
+          onProgress: say,
+        });
+        const file = await store.save('resurrect', report);
+        if (opts.outDir) {
+          await mkdir(opts.outDir, { recursive: true });
+          await writeFile(path.join(opts.outDir, 'Dockerfile.necromancer'), report.dockerfile);
+          await writeFile(path.join(opts.outDir, 'docker-compose.necromancer.yml'), report.compose);
+        }
+        if (report.outcome === 'resurrected') {
+          process.stderr.write(`
+RESURRECTED on ${report.recipe.nodeImage} after ${report.attempts.length} attempt(s): ${report.health!.detail}
+`);
+        } else {
+          process.stderr.write(`
+BLOCKED: ${report.blockedReason}
+`);
+          process.exitCode = 2;
+        }
+        process.stderr.write(`saved ${file}${opts.outDir ? ` and the Dockerfile and compose file to ${opts.outDir}` : ''}
+`);
+      },
+    );
 
   program
     .command('ui')

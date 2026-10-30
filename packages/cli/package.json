@@ -23,7 +23,8 @@
     "@necromancer/graveyard": "workspace:*",
     "@necromancer/ui": "workspace:*",
     "@necromancer/interview": "workspace:*",
-    "@necromancer/llm": "workspace:*"
+    "@necromancer/llm": "workspace:*",
+    "@necromancer/resurrect": "workspace:*"
   },
   "bin": {
     "necromancer": "./dist/bin.js"

@@ -14,6 +14,7 @@ The server uses stdio and runs on your machine. It needs `git` on `PATH`.
 | `graveyard` | Phase 2 report: era estimate and a tombstone per dependency (dead / dying / ailing / alive, advisories, successor). Read-only; calls the npm registry, the advisory database and GitHub. |
 | `interview` | Phase 4, step 1: proposes what the repo is for, with checked file:line citations, suggested goals and open questions. |
 | `record_interview` | Phase 4, step 2: records the user's confirmation or correction and their goals, for later stages. |
+| `resurrect` | Phase 5: builds and boots the repo in Docker on its era's Node, fixing failures until it runs or is `BLOCKED`. Needs Docker where the server runs. |
 
 `graveyard` takes `source`, `advisories` (`npm`, `osv` or `none`), `github`
 (default true) and `detail`. In `summary` mode, healthy dependencies are
@@ -38,10 +39,15 @@ calling `record_interview`, which takes `confirm`, `correction`,
 `acceptGoals` (1-based numbers or `"all"`), `goals`, and, in host mode,
 the agent's `proposal`, whose citations are checked against the repo.
 
+`resurrect` takes `source`, `maxIterations` (up to 10), `tokenBudget` (0
+for known fixes only) and `save`. It takes minutes and sends progress
+notifications. Claude proposes fixes only if `ANTHROPIC_API_KEY` is in the
+server's `env`.
+
 There is also an `autopsy` prompt that asks Claude to exhume a repo and give
 a verdict. In Claude Code it appears as `/mcp__necromancer__autopsy`.
 
-Later stages (`resurrect`, …) become tools here as they are built. They aren't stubbed yet, because a tool that does nothing only
+Later stages (`witness`, …) become tools here as they are built. They aren't stubbed yet, because a tool that does nothing only
 confuses the agent.
 
 ## Setup

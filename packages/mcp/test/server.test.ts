@@ -8,6 +8,7 @@ import { ReportStore, type ExhumeReport, type GraveyardReport, type Tombstone } 
 import { ScriptedModel } from '@necromancer/llm';
 import { createServer, summarize, type ServerOptions } from '@necromancer/mcp';
 import { fixtureRepo, goodProposal } from '../../interview/test/fixtures.js';
+import { deadApp, expressMongoApp, FakeSandbox, NODE_GYP_LOG } from '../../resurrect/test/helpers.js';
 
 const storeDir = await mkdtemp(path.join(os.tmpdir(), 'necro-store-'));
 
@@ -26,7 +27,7 @@ describe('necromancer MCP server', () => {
   it('lists the tools and the autopsy prompt', async () => {
     const client = await connect();
     const { tools } = await client.listTools();
-    expect(tools.map((t) => t.name)).toEqual(['exhume', 'graveyard', 'interview', 'record_interview']);
+    expect(tools.map((t) => t.name)).toEqual(['exhume', 'graveyard', 'interview', 'record_interview', 'resurrect']);
     expect(tools.slice(0, 2).every((t) => t.annotations?.readOnlyHint)).toBe(true);
     expect(Object.keys(tools[1]!.inputSchema.properties ?? {})).toEqual(['source', 'advisories', 'github', 'detail', 'save']);
     expect(Object.keys(tools[0]!.inputSchema.properties ?? {})).toEqual(['source', 'top', 'includeTests', 'detail', 'save']);
@@ -216,5 +217,28 @@ describe('necromancer MCP interview', () => {
     const result = await client.callTool({ name: 'record_interview', arguments: { source: '/nowhere/at-all', confirm: true } });
     expect(result.isError).toBe(true);
     expect(text(result)).toContain('call interview first');
+  });
+});
+
+describe('necromancer MCP resurrect', () => {
+  it('runs the build-fix loop and saves the report', async () => {
+    const root = await deadApp(expressMongoApp);
+    const sandbox = new FakeSandbox({ install: [{ ok: false, log: NODE_GYP_LOG }] });
+    const client = await connect({ sandbox });
+    const result = await client.callTool({ name: 'resurrect', arguments: { source: root, tokenBudget: 0 } });
+    expect(result.isError).toBeFalsy();
+    const body = JSON.parse(text(result));
+    expect(body.outcome).toBe('RESURRECTED');
+    expect(body.attempts[0].fix.id).toBe('node-gyp-python');
+    expect(body.dockerfile).toContain('FROM node:6');
+    expect(body.savedTo).toBe(path.join(storeDir, path.basename(root), 'resurrect.json'));
+  });
+
+  it('reports BLOCKED with the reason', async () => {
+    const root = await deadApp(expressMongoApp);
+    const client = await connect({ sandbox: new FakeSandbox({ boot: [{ ok: false, log: 'Error: Cannot find module ./secret' }] }) });
+    const body = JSON.parse(text(await client.callTool({ name: 'resurrect', arguments: { source: root, tokenBudget: 0, save: false } })));
+    expect(body.outcome).toMatch(/^BLOCKED: boot failed and no known fix matches/);
+    expect(body.savedTo).toBeUndefined();
   });
 });

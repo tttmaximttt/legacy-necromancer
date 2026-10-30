@@ -65,6 +65,7 @@ export function App() {
   const exhume = reports?.exhume ?? null;
   const graveyard = reports?.graveyard ?? null;
   const interview = reports?.interview ?? null;
+  const revived = reports?.resurrect ?? null;
   const source = exhume?.repo.source ?? graveyard?.repo.source ?? null;
 
   return (
@@ -116,6 +117,14 @@ export function App() {
                 <p className="intent">
                   <span className="intent-label">{interview.status === 'proposed' ? 'Proposed intent' : 'Intent'}</span> {interview.intent}
                   {interview.goals.length > 0 && <span className="muted"> · {interview.goals.length} goals</span>}
+                </p>
+              )}
+              {revived && (
+                <p className="intent">
+                  <span className="intent-label">{revived.outcome === 'resurrected' ? `${STATUS.alive.icon} Resurrected` : `${STATUS.dead.icon} Blocked`}</span>{' '}
+                  {revived.outcome === 'resurrected'
+                    ? `on ${revived.recipe.nodeImage}${revived.services.length ? ` with ${revived.services.map((s) => s.image).join(', ')}` : ''} after ${revived.attempts.length} attempt${revived.attempts.length === 1 ? '' : 's'}: ${revived.health?.detail}`
+                    : revived.blockedReason}
                 </p>
               )}
             </div>
