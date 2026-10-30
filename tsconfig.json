@@ -1,0 +1,32 @@
+{
+  "files": [],
+  "references": [
+    {
+      "path": "packages/core"
+    },
+    {
+      "path": "packages/excavate"
+    },
+    {
+      "path": "packages/graveyard"
+    },
+    {
+      "path": "packages/resurrect"
+    },
+    {
+      "path": "packages/witness"
+    },
+    {
+      "path": "packages/surgeon"
+    },
+    {
+      "path": "packages/llm"
+    },
+    {
+      "path": "packages/cli"
+    },
+    {
+      "path": "packages/ui"
+    }
+  ]
+}

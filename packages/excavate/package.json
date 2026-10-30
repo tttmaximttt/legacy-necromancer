@@ -1,0 +1,30 @@
+{
+  "name": "@necromancer/excavate",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Phase 1: reconstruct architecture from a repo (import graph, clusters, load-bearing files, churn, install-script audit).",
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -b"
+  },
+  "dependencies": {
+    "@necromancer/core": "workspace:*",
+    "graphology": "^0.26.0",
+    "graphology-communities-louvain": "^2.0.2",
+    "graphology-metrics": "^2.4.2",
+    "graphology-types": "^0.24.8",
+    "simple-git": "^4.0.2",
+    "tree-sitter-javascript": "^0.25.0",
+    "tree-sitter-typescript": "^0.23.2",
+    "web-tree-sitter": "^0.27.1"
+  }
+}

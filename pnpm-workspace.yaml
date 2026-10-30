@@ -1,0 +1,9 @@
+packages:
+  - packages/*
+
+# We only use the prebuilt .wasm grammars, never the native bindings.
+ignoredBuiltDependencies:
+  - tree-sitter-javascript
+  - tree-sitter-typescript
+onlyBuiltDependencies:
+  - esbuild

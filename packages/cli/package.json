@@ -1,0 +1,27 @@
+{
+  "name": "@necromancer/cli",
+  "version": "0.0.0",
+  "private": true,
+  "description": "The `necromancer` command line.",
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -b"
+  },
+  "dependencies": {
+    "@necromancer/core": "workspace:*",
+    "@necromancer/excavate": "workspace:*",
+    "commander": "^15.0.0"
+  },
+  "bin": {
+    "necromancer": "./dist/bin.js"
+  }
+}

@@ -1,0 +1,22 @@
+{
+  "name": "@necromancer/witness",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Phase 5: record behavioural snapshots of the revived app so upgrades can be checked against them.",
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -b"
+  },
+  "dependencies": {
+    "@necromancer/core": "workspace:*"
+  }
+}

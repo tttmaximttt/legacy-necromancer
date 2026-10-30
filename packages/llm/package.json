@@ -1,0 +1,22 @@
+{
+  "name": "@necromancer/llm",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Thin LLM client used by the agent phases (Resurrect, Operate).",
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -b"
+  },
+  "dependencies": {
+    "@necromancer/core": "workspace:*"
+  }
+}
