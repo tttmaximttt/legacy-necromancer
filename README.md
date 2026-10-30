@@ -27,9 +27,19 @@ deterministic, seeded, and testable without an LLM.
 | 5. Witness | [`witness`](packages/witness) | deterministic | stub |
 | Stretch: Operate | [`surgeon`](packages/surgeon) | agent | stub |
 
+## Use it from Claude
+
+[`packages/mcp`](packages/mcp) is an MCP server that exposes each stage as a
+tool, so Claude Code or Claude Desktop can run Necromancer as part of a
+conversation. In Claude Code, inside this repo, run `pnpm build` and it's
+picked up from `.mcp.json`. Then ask "exhume
+https://github.com/tttmaximttt/node-orm2 and tell me if it's worth reviving".
+Setup for Claude Desktop and other directories is in the
+[package README](packages/mcp/README.md).
+
 Shared code lives in [`core`](packages/core) (report types, seeded RNG) and
 [`llm`](packages/llm) (model client for the agent phases). The command line is
-[`cli`](packages/cli).
+[`cli`](packages/cli), and the MCP server is [`mcp`](packages/mcp).
 
 Phases 1 to 3 are the first demo: no Docker, no LLM, just "here's what this
 dead repo is and what's rotting in it".
