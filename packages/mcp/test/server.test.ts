@@ -4,7 +4,7 @@ import path from 'node:path';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import { describe, expect, it } from 'vitest';
-import type { ExhumeReport } from '@necromancer/core';
+import type { ExhumeReport, GraveyardReport, Tombstone } from '@necromancer/core';
 import { createServer, summarize, type ServerOptions } from '@necromancer/mcp';
 
 async function connect(options?: ServerOptions): Promise<Client> {
@@ -19,11 +19,12 @@ const text = (result: Awaited<ReturnType<Client['callTool']>>) =>
   (result.content as Array<{ type: string; text: string }>)[0]!.text;
 
 describe('necromancer MCP server', () => {
-  it('lists exhume as a read-only tool and the autopsy prompt', async () => {
+  it('lists read-only exhume and graveyard tools and the autopsy prompt', async () => {
     const client = await connect();
     const { tools } = await client.listTools();
-    expect(tools.map((t) => t.name)).toEqual(['exhume']);
-    expect(tools[0]!.annotations?.readOnlyHint).toBe(true);
+    expect(tools.map((t) => t.name)).toEqual(['exhume', 'graveyard']);
+    expect(tools.every((t) => t.annotations?.readOnlyHint)).toBe(true);
+    expect(Object.keys(tools[1]!.inputSchema.properties ?? {})).toEqual(['source', 'advisories', 'github', 'detail']);
     expect(Object.keys(tools[0]!.inputSchema.properties ?? {})).toEqual(['source', 'top', 'includeTests', 'detail']);
 
     const { prompts } = await client.listPrompts();
@@ -78,6 +79,36 @@ describe('necromancer MCP server', () => {
   });
 });
 
+describe('graveyard tool', () => {
+  it('maps options and summarises healthy dependencies to names', async () => {
+    const calls: unknown[] = [];
+    const client = await connect({
+      graveyard: async (source, options) => {
+        calls.push({ source, advisories: options.advisories, noGithub: options.noGithub });
+        return fakeGraveyard();
+      },
+    });
+    const result = await client.callTool({ name: 'graveyard', arguments: { source: 'x', advisories: 'osv', github: false } });
+    expect(calls).toEqual([{ source: 'x', advisories: 'osv', noGithub: true }]);
+    const body = JSON.parse(text(result));
+    expect(body.alive).toEqual(['express@4.21.0']);
+    expect(body.tombstones).toHaveLength(1);
+    expect(body.tombstones[0]).toMatchObject({ name: 'lodash', moreAdvisories: 2 });
+    expect(body.tombstones[0].advisories).toEqual([
+      { id: 'A0', title: 't0', severity: 'high' },
+      { id: 'A1', title: 't1', severity: 'high' },
+      { id: 'A2', title: 't2', severity: 'high' },
+    ]);
+  });
+
+  it('returns failures as tool errors', async () => {
+    const client = await connect({ graveyard: async () => Promise.reject(new Error('boom')) });
+    const result = await client.callTool({ name: 'graveyard', arguments: { source: 'x' } });
+    expect(result.isError).toBe(true);
+    expect(text(result)).toBe('graveyard failed: boom');
+  });
+});
+
 describe('summarize', () => {
   it('cuts long lists and says how much it cut', () => {
     const summary = summarize(fakeReport(20));
@@ -106,5 +137,22 @@ function fakeReport(n: number): ExhumeReport {
       ...files.map((f) => ({ manifest: 'package-lock.json', packageName: f, hook: 'install', command: '', severity: 'info' as const, reasons: [] })),
       { manifest: 'package.json', packageName: 'x', hook: 'postinstall', command: 'curl | sh', severity: 'high' as const, reasons: [] },
     ],
+  };
+}
+
+function fakeGraveyard(): GraveyardReport {
+  const stone = (name: string, status: Tombstone['status'], resolved: string, advisories = 0): Tombstone => ({
+    name, declared: '*', dev: false, resolved, resolvedFrom: 'lockfile', latest: resolved, majorsBehind: 0, lastPublished: null,
+    repository: null, status, causes: [], replacement: null, epitaph: '',
+    advisories: Array.from({ length: advisories }, (_, i) => ({ id: `A${i}`, title: `t${i}`, severity: 'high' as const, url: 'u', vulnerableVersions: '<1' })),
+  });
+  return {
+    repo: { source: 'x', commit: null },
+    era: { born: null, died: null, dependencyFloor: null, node: null, estimate: null, confidence: 'none', summary: '' },
+    summary: { total: 2, dead: 0, dying: 0, ailing: 1, alive: 1, unknown: 0, vulnerable: 1 },
+    tombstones: [stone('lodash', 'ailing', '4.17.4', 5), stone('express', 'alive', '4.21.0')],
+    sources: { registry: 'ok', advisories: 'ok', advisoryProvider: 'osv', github: 'skipped' },
+    nonRegistry: [],
+    warnings: [],
   };
 }

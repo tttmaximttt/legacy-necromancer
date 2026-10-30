@@ -21,7 +21,7 @@ deterministic, seeded, and testable without an LLM.
 | Phase | Package | Kind | Status |
 | --- | --- | --- | --- |
 | 1. Excavate | [`excavate`](packages/excavate) | deterministic | **working** |
-| 2. Graveyard | [`graveyard`](packages/graveyard) | deterministic | stub |
+| 2. Date + Graveyard | [`graveyard`](packages/graveyard) | deterministic | **working** |
 | 3. Map | [`ui`](packages/ui) | UI | stub |
 | 4. Resurrect | [`resurrect`](packages/resurrect) | agent (known-fix table first) | stub |
 | 5. Witness | [`witness`](packages/witness) | deterministic | stub |
@@ -82,6 +82,23 @@ Trimmed output for `node-orm2`, a 2012 to 2017 ORM:
   "caseMismatches": [{ "from": "lib/ErrorCodes.js", "specifier": "./error", "line": 2, "target": "lib/Error.js" }]
 }
 ```
+
+## `necromancer graveyard <git-url | path>`
+
+Dates the project (git history, dependency publish dates, `engines.node`)
+and puts a tombstone on every dependency. It records the version the
+project actually used (from the lockfile, or else the version `npm install`
+would have picked the day the project died), a status of **dead**,
+**dying**, **ailing** or **alive** with the reasons, known advisories, and
+a suggested successor. Data comes from the npm registry, the advisory
+database `npm audit` uses (or OSV.dev with `--advisories osv`), and GitHub
+for archived repos. Set `GITHUB_TOKEN` to check every dependency's repo.
+Details are in the [package README](packages/graveyard/README.md).
+
+For node-orm2 it finds 22 dependencies: 1 dead, 6 dying, 13 ailing and 2
+alive. lodash 4.17.4 has 10 advisories (worst critical). Its summary
+reads "Lived 2012–2017; manifest written no earlier than 2017-08
+(sinon@3.2.1)".
 
 ## Safety
 

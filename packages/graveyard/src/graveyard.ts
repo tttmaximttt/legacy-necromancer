@@ -61,16 +61,23 @@ export async function digGraveyard(input: DigInput, clients: Clients): Promise<G
   const { deps, nonRegistry } = collectDependencies(input.manifests);
 
   // Registry
-  let registryFailures = 0;
+  const registryErrors: string[] = [];
   const packuments = new Map<string, Packument | null>();
   await pool(deps, 8, async (d) => {
     try {
       packuments.set(d.registryName, await clients.registry.packument(d.registryName));
     } catch (err) {
-      registryFailures++;
-      warnings.push(`registry lookup failed for ${d.registryName}: ${message(err)}`);
+      registryErrors.push(`${d.registryName}: ${message(err)}`);
     }
   });
+  const registryFailures = registryErrors.length;
+  if (registryFailures && registryFailures === deps.length) {
+    warnings.push(`could not reach the npm registry for any package (${registryErrors[0]}); check network and proxy settings`);
+  } else if (registryFailures > 3) {
+    warnings.push(`registry lookup failed for ${registryFailures} packages, e.g. ${registryErrors.slice(0, 3).join('; ')}`);
+  } else {
+    for (const e of registryErrors) warnings.push(`registry lookup failed for ${e}`);
+  }
 
   // Versions actually used
   const locks = new Map<string, Map<string, string>>();

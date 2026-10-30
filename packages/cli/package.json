@@ -19,7 +19,8 @@
   "dependencies": {
     "@necromancer/core": "workspace:*",
     "@necromancer/excavate": "workspace:*",
-    "commander": "^15.0.0"
+    "commander": "^15.0.0",
+    "@necromancer/graveyard": "workspace:*"
   },
   "bin": {
     "necromancer": "./dist/bin.js"

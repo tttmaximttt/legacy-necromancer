@@ -23,6 +23,7 @@
     "@modelcontextprotocol/sdk": "^1.32.2",
     "@necromancer/core": "workspace:*",
     "@necromancer/excavate": "workspace:*",
-    "zod": "^4.6.7"
+    "zod": "^4.6.7",
+    "@necromancer/graveyard": "workspace:*"
   }
 }

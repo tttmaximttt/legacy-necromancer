@@ -1,11 +1,15 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
+import type { RequestHandlerExtra } from '@modelcontextprotocol/sdk/shared/protocol.js';
+import type { ServerNotification, ServerRequest } from '@modelcontextprotocol/sdk/types.js';
 import { z } from 'zod';
-import type { ExhumeReport } from '@necromancer/core';
+import type { ExhumeReport, GraveyardReport } from '@necromancer/core';
 import { exhume as runExhume, type ExhumeOptions } from '@necromancer/excavate';
+import { graveyard as runGraveyard, type GraveyardOptions } from '@necromancer/graveyard';
 
 export interface ServerOptions {
   /** Injected in tests; defaults to the real excavator. */
   exhume?: (source: string, options: ExhumeOptions) => Promise<ExhumeReport>;
+  graveyard?: (source: string, options: GraveyardOptions) => Promise<GraveyardReport>;
   /** Where remote repos are cloned. */
   workdir?: string;
 }
@@ -16,6 +20,7 @@ const SUMMARY_INFO_FINDINGS = 10;
 
 export function createServer(options: ServerOptions = {}): McpServer {
   const exhume = options.exhume ?? runExhume;
+  const graveyard = options.graveyard ?? runGraveyard;
   const server = new McpServer({ name: 'necromancer', version: '0.0.0' });
 
   server.registerTool(
@@ -39,27 +44,49 @@ export function createServer(options: ServerOptions = {}): McpServer {
       annotations: { readOnlyHint: true, openWorldHint: true },
     },
     async ({ source, top, includeTests, detail }, extra) => {
-      const progressToken = extra._meta?.progressToken;
-      let step = 0;
       try {
-        const report = await exhume(source, {
-          top,
-          includeTests,
-          workdir: options.workdir,
-          onProgress: (message) => {
-            if (progressToken === undefined) return;
-            void extra
-              .sendNotification({ method: 'notifications/progress', params: { progressToken, progress: ++step, message } })
-              .catch(() => {});
-          },
-        });
+        const report = await exhume(source, { top, includeTests, workdir: options.workdir, onProgress: progressReporter(extra) });
         const body = detail === 'full' ? report : summarize(report);
         return { content: [{ type: 'text', text: JSON.stringify(body, null, 2) }] };
       } catch (err) {
-        return {
-          isError: true,
-          content: [{ type: 'text', text: `exhume failed: ${err instanceof Error ? err.message : String(err)}` }],
-        };
+        return failure('exhume', err);
+      }
+    },
+  );
+
+  server.registerTool(
+    'graveyard',
+    {
+      title: 'Dig the dependency graveyard',
+      description:
+        'Date a JavaScript/TypeScript project (git history, dependency publish dates, engines.node) and check every ' +
+        'dependency against the npm registry, security advisories and GitHub: which are dead (deprecated, archived, ' +
+        'unpublished), dying (no release in 3+ years) or ailing (vulnerable, far behind), the version the project ' +
+        'actually used, and a suggested successor. Read-only. Check `sources` before concluding a package is healthy: ' +
+        'a failed lookup means missing evidence.',
+      inputSchema: {
+        source: z.string().min(1).describe('Git URL (https or ssh) or a local directory path'),
+        advisories: z.enum(['npm', 'osv', 'none']).default('npm').describe('Advisory database: npm (as npm audit), osv, or none'),
+        github: z.boolean().default(true).describe('Check whether source repos are archived (uses GITHUB_TOKEN if set)'),
+        detail: z
+          .enum(['summary', 'full'])
+          .default('summary')
+          .describe('"summary" lists healthy dependencies by name only; "full" returns every tombstone in full'),
+      },
+      annotations: { readOnlyHint: true, openWorldHint: true },
+    },
+    async ({ source, advisories, github, detail }, extra) => {
+      try {
+        const report = await graveyard(source, {
+          advisories,
+          noGithub: !github,
+          workdir: options.workdir,
+          onProgress: progressReporter(extra),
+        });
+        const body = detail === 'full' ? report : summarizeGraveyard(report);
+        return { content: [{ type: 'text', text: JSON.stringify(body, null, 2) }] };
+      } catch (err) {
+        return failure('graveyard', err);
       }
     },
   );
@@ -78,9 +105,10 @@ export function createServer(options: ServerOptions = {}): McpServer {
           content: {
             type: 'text',
             text:
-              `Run the necromancer \`exhume\` tool on ${source}. From the report, tell me: what the project is and how ` +
-              'it is structured (name the clusters by what they do, not by folder), which files are load-bearing and why, ' +
-              'how long ago it died, anything risky in its install scripts or imports, and whether it looks worth reviving. ' +
+              `Run the necromancer \`exhume\` and \`graveyard\` tools on ${source}. From the reports, tell me: what the project ` +
+              'is and how it is structured (name the clusters by what they do, not by folder), which files are load-bearing ' +
+              'and why, when it was alive, which dependencies are dead or dangerous and what replaces them, anything risky ' +
+              'in its install scripts or imports, and whether it looks worth reviving. ' +
               'Quote numbers from the report; do not guess beyond it.',
           },
         },
@@ -89,6 +117,43 @@ export function createServer(options: ServerOptions = {}): McpServer {
   );
 
   return server;
+}
+
+type ToolExtra = RequestHandlerExtra<ServerRequest, ServerNotification>;
+
+/** Forwards excavator progress as MCP progress notifications when the client asked for them. */
+function progressReporter(extra: ToolExtra): ((message: string) => void) | undefined {
+  const progressToken = extra._meta?.progressToken;
+  if (progressToken === undefined) return undefined;
+  let step = 0;
+  return (message) => {
+    void extra
+      .sendNotification({ method: 'notifications/progress', params: { progressToken, progress: ++step, message } })
+      .catch(() => {});
+  };
+}
+
+function failure(tool: string, err: unknown) {
+  return {
+    isError: true,
+    content: [{ type: 'text' as const, text: `${tool} failed: ${err instanceof Error ? err.message : String(err)}` }],
+  };
+}
+
+/** Healthy dependencies collapse to names; everything with a cause keeps its full tombstone. */
+export function summarizeGraveyard(report: GraveyardReport) {
+  const alive = report.tombstones.filter((t) => t.status === 'alive');
+  return {
+    ...report,
+    tombstones: report.tombstones
+      .filter((t) => t.status !== 'alive')
+      .map(({ advisories, ...t }) => ({
+        ...t,
+        advisories: advisories.slice(0, 3).map(({ id, title, severity }) => ({ id, title, severity })),
+        ...(advisories.length > 3 && { moreAdvisories: advisories.length - 3 }),
+      })),
+    alive: alive.map((t) => `${t.name}@${t.resolved ?? t.declared}`),
+  };
 }
 
 /** Same shape as the report, with long lists cut and a note of how much was cut. */

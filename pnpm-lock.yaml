@@ -29,6 +29,9 @@ importers:
       '@necromancer/excavate':
         specifier: workspace:*
         version: link:../excavate
+      '@necromancer/graveyard':
+        specifier: workspace:*
+        version: link:../graveyard
       commander:
         specifier: ^15.0.0
         version: 15.0.0
@@ -98,6 +101,9 @@ importers:
       '@necromancer/excavate':
         specifier: workspace:*
         version: link:../excavate
+      '@necromancer/graveyard':
+        specifier: workspace:*
+        version: link:../graveyard
       zod:
         specifier: ^4.6.7
         version: 4.6.7
