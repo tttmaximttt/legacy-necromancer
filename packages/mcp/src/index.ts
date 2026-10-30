@@ -2,7 +2,7 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import type { RequestHandlerExtra } from '@modelcontextprotocol/sdk/shared/protocol.js';
 import type { ServerNotification, ServerRequest } from '@modelcontextprotocol/sdk/types.js';
 import { z } from 'zod';
-import type { ExhumeReport, GraveyardReport } from '@necromancer/core';
+import { ReportStore, type ExhumeReport, type GraveyardReport } from '@necromancer/core';
 import { exhume as runExhume, type ExhumeOptions } from '@necromancer/excavate';
 import { graveyard as runGraveyard, type GraveyardOptions } from '@necromancer/graveyard';
 
@@ -12,6 +12,8 @@ export interface ServerOptions {
   graveyard?: (source: string, options: GraveyardOptions) => Promise<GraveyardReport>;
   /** Where remote repos are cloned. */
   workdir?: string;
+  /** Where reports are saved for `necromancer ui`. Defaults to ~/.necromancer/reports. */
+  store?: ReportStore;
 }
 
 /** Per-cluster file lists and lockfile notes get long on big repos; summaries keep the agent's context small. */
@@ -21,6 +23,14 @@ const SUMMARY_INFO_FINDINGS = 10;
 export function createServer(options: ServerOptions = {}): McpServer {
   const exhume = options.exhume ?? runExhume;
   const graveyard = options.graveyard ?? runGraveyard;
+  const store = options.store ?? new ReportStore();
+  const saveNote = async (kind: 'exhume' | 'graveyard', report: ExhumeReport | GraveyardReport) => {
+    try {
+      return { savedTo: await store.save(kind, report), view: 'Run `necromancer ui` to browse it.' };
+    } catch (err) {
+      return { savedTo: null, saveError: err instanceof Error ? err.message : String(err) };
+    }
+  };
   const server = new McpServer({ name: 'necromancer', version: '0.0.0' });
 
   server.registerTool(
@@ -40,13 +50,14 @@ export function createServer(options: ServerOptions = {}): McpServer {
           .enum(['summary', 'full'])
           .default('summary')
           .describe('"summary" trims cluster file lists and low-severity findings; "full" returns everything'),
+        save: z.boolean().default(true).describe('Save the report so the user can browse it with `necromancer ui`'),
       },
       annotations: { readOnlyHint: true, openWorldHint: true },
     },
-    async ({ source, top, includeTests, detail }, extra) => {
+    async ({ source, top, includeTests, detail, save }, extra) => {
       try {
         const report = await exhume(source, { top, includeTests, workdir: options.workdir, onProgress: progressReporter(extra) });
-        const body = detail === 'full' ? report : summarize(report);
+        const body = { ...(detail === 'full' ? report : summarize(report)), ...(save && (await saveNote('exhume', report))) };
         return { content: [{ type: 'text', text: JSON.stringify(body, null, 2) }] };
       } catch (err) {
         return failure('exhume', err);
@@ -72,10 +83,11 @@ export function createServer(options: ServerOptions = {}): McpServer {
           .enum(['summary', 'full'])
           .default('summary')
           .describe('"summary" lists healthy dependencies by name only; "full" returns every tombstone in full'),
+        save: z.boolean().default(true).describe('Save the report so the user can browse it with `necromancer ui`'),
       },
       annotations: { readOnlyHint: true, openWorldHint: true },
     },
-    async ({ source, advisories, github, detail }, extra) => {
+    async ({ source, advisories, github, detail, save }, extra) => {
       try {
         const report = await graveyard(source, {
           advisories,
@@ -83,7 +95,7 @@ export function createServer(options: ServerOptions = {}): McpServer {
           workdir: options.workdir,
           onProgress: progressReporter(extra),
         });
-        const body = detail === 'full' ? report : summarizeGraveyard(report);
+        const body = { ...(detail === 'full' ? report : summarizeGraveyard(report)), ...(save && (await saveNote('graveyard', report))) };
         return { content: [{ type: 'text', text: JSON.stringify(body, null, 2) }] };
       } catch (err) {
         return failure('graveyard', err);
@@ -157,7 +169,7 @@ export function summarizeGraveyard(report: GraveyardReport) {
 }
 
 /** Same shape as the report, with long lists cut and a note of how much was cut. */
-export function summarize(report: ExhumeReport) {
+export function summarize({ graph: _graph, ...report }: ExhumeReport) {
   const info = report.installScripts.filter((f) => f.severity === 'info');
   return {
     ...report,

@@ -116,6 +116,28 @@ export interface ExhumeReport {
   caseMismatches: Array<{ from: string; specifier: string; line: number; target: string }>;
   manifests: DependencySummary[];
   installScripts: InstallScriptFinding[];
+  /** The whole import graph, for the UI. Left out of MCP summaries. */
+  graph: ImportGraphData;
+}
+
+export interface GraphNode {
+  id: string;
+  /** -1 for files left out of clustering (tests, orphans). */
+  cluster: number;
+  loc: number;
+  isTest: boolean;
+  fanIn: number;
+  fanOut: number;
+  /** Load-bearing score; null for files that weren't ranked (tests by default). */
+  score: number | null;
+  blastRadius: number | null;
+  churn: number;
+}
+
+export interface ImportGraphData {
+  nodes: GraphNode[];
+  /** [importer, imported] */
+  edges: Array<[string, string]>;
 }
 
 // ── Phase 2: Date & Graveyard ────────────────────────────────────────────

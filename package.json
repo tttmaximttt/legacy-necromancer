@@ -8,9 +8,9 @@
   },
   "packageManager": "pnpm@10.28.0",
   "scripts": {
-    "build": "tsc -b",
+    "build": "tsc -b && pnpm --filter @necromancer/ui build",
     "clean": "tsc -b --clean",
-    "typecheck": "tsc -p tsconfig.test.json",
+    "typecheck": "tsc -p tsconfig.test.json && tsc -p packages/ui/tsconfig.json",
     "test": "vitest run",
     "test:watch": "vitest",
     "necromancer": "node packages/cli/dist/bin.js"

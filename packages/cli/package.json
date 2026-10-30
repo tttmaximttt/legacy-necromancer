@@ -20,7 +20,8 @@
     "@necromancer/core": "workspace:*",
     "@necromancer/excavate": "workspace:*",
     "commander": "^15.0.0",
-    "@necromancer/graveyard": "workspace:*"
+    "@necromancer/graveyard": "workspace:*",
+    "@necromancer/ui": "workspace:*"
   },
   "bin": {
     "necromancer": "./dist/bin.js"

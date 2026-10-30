@@ -10,8 +10,14 @@ and how to modernise it safely.
 ```sh
 pnpm install
 pnpm build
-pnpm necromancer exhume https://github.com/tttmaximttt/node-orm2 > report.json
+pnpm necromancer autopsy https://github.com/tttmaximttt/node-orm2 --open
 ```
+
+`autopsy` runs both analyses, saves the reports and opens the UI:
+
+![Architecture map of node-orm2](docs/screenshots/architecture.png)
+
+![Dependency graveyard of node-orm2](docs/screenshots/graveyard.png)
 
 ## Design
 
@@ -22,7 +28,7 @@ deterministic, seeded, and testable without an LLM.
 | --- | --- | --- | --- |
 | 1. Excavate | [`excavate`](packages/excavate) | deterministic | **working** |
 | 2. Date + Graveyard | [`graveyard`](packages/graveyard) | deterministic | **working** |
-| 3. Map | [`ui`](packages/ui) | UI | stub |
+| 3. Map | [`ui`](packages/ui) | UI | **working** |
 | 4. Resurrect | [`resurrect`](packages/resurrect) | agent (known-fix table first) | stub |
 | 5. Witness | [`witness`](packages/witness) | deterministic | stub |
 | Stretch: Operate | [`surgeon`](packages/surgeon) | agent | stub |
@@ -43,6 +49,15 @@ Shared code lives in [`core`](packages/core) (report types, seeded RNG) and
 
 Phases 1 to 3 are the first demo: no Docker, no LLM, just "here's what this
 dead repo is and what's rotting in it".
+
+## Commands
+
+| Command | Does |
+| --- | --- |
+| `autopsy <repo> [--open]` | `exhume` + `graveyard`, saves both, optionally opens the UI |
+| `exhume <repo> [--save]` | Phase 1 architecture report (JSON) |
+| `graveyard <repo> [--save]` | Phase 2 era + dependency report (JSON) |
+| `ui [--open]` | Serves the UI over saved reports on localhost |
 
 ## `necromancer exhume <git-url | path>`
 

@@ -88,6 +88,6 @@ describe('analyzeGraph', () => {
   });
 
   it('copes with an empty graph', () => {
-    expect(analyzeGraph(buildImportGraph([]))).toEqual({ clusters: [], loadBearing: [], orphans: [] });
+    expect(analyzeGraph(buildImportGraph([]))).toEqual({ clusters: [], loadBearing: [], ranked: [], orphans: [] });
   });
 });

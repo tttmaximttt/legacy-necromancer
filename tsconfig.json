@@ -26,9 +26,6 @@
       "path": "packages/cli"
     },
     {
-      "path": "packages/ui"
-    },
-    {
       "path": "packages/mcp"
     }
   ]

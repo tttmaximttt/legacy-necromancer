@@ -1,11 +1,11 @@
 import { readFile } from 'node:fs/promises';
 import path from 'node:path';
 import { simpleGit } from 'simple-git';
-import type { ExhumeReport, SourceFile } from '@necromancer/core';
+import type { ExhumeReport, ImportGraphData, RepoHistory, SourceFile } from '@necromancer/core';
 import { readHistory } from './churn.js';
 import { checkout } from './clone.js';
 import { isTooLarge, listRepoFiles } from './files.js';
-import { analyzeGraph, buildImportGraph } from './graph.js';
+import { analyzeGraph, buildImportGraph, type GraphAnalysis, type ImportGraph } from './graph.js';
 import { auditManifests } from './install-scripts.js';
 import { ImportParser, languageFor } from './parser.js';
 import { ImportResolver } from './resolve.js';
@@ -117,12 +117,33 @@ export async function exhume(source: string, options: ExhumeOptions = {}): Promi
       caseMismatches,
       manifests,
       installScripts: findings,
+      graph: graphData(graph, analysis, history.files),
     };
     if (options.keep) report.root = repo.root;
     return report;
   } finally {
     if (!options.keep) await repo.cleanup();
   }
+}
+
+function graphData(graph: ImportGraph, analysis: GraphAnalysis, churn: RepoHistory['files']): ImportGraphData {
+  const ranked = new Map(analysis.ranked.map((f) => [f.path, f]));
+  const clusterOf = new Map<string, number>();
+  for (const c of analysis.clusters) for (const f of c.files) clusterOf.set(f, c.id);
+  return {
+    nodes: graph.mapNodes((id, attrs) => ({
+      id,
+      cluster: clusterOf.get(id) ?? -1,
+      loc: attrs.loc,
+      isTest: attrs.isTest,
+      fanIn: graph.inDegree(id),
+      fanOut: graph.outDegree(id),
+      score: ranked.get(id)?.score ?? null,
+      blastRadius: ranked.get(id)?.blastRadius ?? null,
+      churn: churn[id]?.commits ?? 0,
+    })),
+    edges: graph.mapEdges((_e, _a, source, target) => [source, target] as [string, string]),
+  };
 }
 
 export function isTestFile(file: string): boolean {

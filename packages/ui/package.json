@@ -2,21 +2,33 @@
   "name": "@necromancer/ui",
   "version": "0.0.0",
   "private": true,
-  "description": "Phase 3: interactive dependency graveyard and architecture map.",
+  "description": "Phase 3: interactive architecture map and dependency graveyard, rendered from saved reports.",
   "type": "module",
   "exports": {
-    ".": {
-      "types": "./dist/index.d.ts",
-      "default": "./dist/index.js"
-    }
+    "./package.json": "./package.json"
   },
   "files": [
     "dist"
   ],
   "scripts": {
-    "build": "tsc -b"
+    "dev": "vite",
+    "build": "tsc -p tsconfig.json && vite build",
+    "preview": "vite preview"
   },
   "dependencies": {
-    "@necromancer/core": "workspace:*"
+    "@necromancer/core": "workspace:*",
+    "graphology": "^0.26.0",
+    "graphology-layout-forceatlas2": "^0.10.1",
+    "react": "^19.3.1",
+    "react-dom": "^19.3.1",
+    "sigma": "^4.0.4"
+  },
+  "devDependencies": {
+    "@types/react": "^19.3.0",
+    "@types/react-dom": "^19.3.0",
+    "@vitejs/plugin-react": "^6.1.2",
+    "graphology-types": "^0.24.8",
+    "typescript": "^7.0.2",
+    "vite": "^8.3.5"
   }
 }

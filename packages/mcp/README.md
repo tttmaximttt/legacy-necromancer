@@ -24,6 +24,9 @@ cluster file lists and low-severity findings are trimmed so the report stays
 around 5 to 10k characters. With `full`, everything is returned. The server
 sends progress notifications while it works.
 
+Both tools save their full report (pass `save: false` to skip), so you can
+browse anything Claude dug up with `necromancer ui`.
+
 There is also an `autopsy` prompt that asks Claude to exhume a repo and give
 a verdict. In Claude Code it appears as `/mcp__necromancer__autopsy`.
 
