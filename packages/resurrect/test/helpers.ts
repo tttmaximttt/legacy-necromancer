@@ -5,6 +5,8 @@ import path from 'node:path';
 import type { SandboxLimits } from '@necromancer/core';
 import type { BootOptions, BootResult, Sandbox, StepResult } from '@necromancer/resurrect';
 
+export type ExecHandler = (command: string[], env: Record<string, string>) => StepResult | Promise<StepResult>;
+
 type Step = { ok: boolean; log?: string; health?: BootResult['health'] };
 
 /**
@@ -12,12 +14,20 @@ type Step = { ok: boolean; log?: string; health?: BootResult['health'] };
  * Dockerfile and package.json it was handed for each install.
  */
 export class FakeSandbox implements Sandbox {
-  readonly calls: Array<{ step: 'install' | 'run' | 'boot'; image?: string; command?: string; outTag?: string; boot?: BootOptions; limits?: SandboxLimits }> = [];
+  readonly calls: Array<{
+    step: 'install' | 'run' | 'boot' | 'exec';
+    image?: string;
+    command?: string;
+    outTag?: string;
+    boot?: BootOptions;
+    limits?: SandboxLimits;
+    namespace?: string;
+  }> = [];
   readonly dockerfiles: string[] = [];
   readonly manifests: Array<Record<string, unknown>> = [];
   cleaned = 0;
 
-  constructor(private readonly script: { install?: Step[]; run?: Step[]; boot?: Step[] }) {}
+  constructor(private readonly script: { install?: Step[]; run?: Step[]; boot?: Step[]; exec?: ExecHandler }) {}
 
   async ping(): Promise<void> {}
 
@@ -36,7 +46,19 @@ export class FakeSandbox implements Sandbox {
   async boot(image: string, options: BootOptions): Promise<BootResult> {
     this.calls.push({ step: 'boot', image, boot: options });
     const s = this.take('boot');
-    return { ok: s.ok, log: s.log ?? '', durationMs: 1, health: s.ok ? (s.health ?? { kind: 'port', detail: 'port answered' }) : null };
+    return {
+      ok: s.ok,
+      log: s.log ?? '',
+      durationMs: 1,
+      health: s.ok ? (s.health ?? { kind: 'port', detail: 'port answered' }) : null,
+      namespace: s.ok ? 'app-container' : null,
+    };
+  }
+
+  async exec(image: string, namespace: string, command: string[], env: Record<string, string>, limits: SandboxLimits): Promise<StepResult> {
+    this.calls.push({ step: 'exec', image, namespace, command: command.join(' '), limits });
+    if (!this.script.exec) return { ok: true, log: '', durationMs: 1 };
+    return this.script.exec(command, env);
   }
 
   async cleanup(): Promise<void> {

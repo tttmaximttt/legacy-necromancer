@@ -10,6 +10,7 @@ import { exhume } from '@necromancer/excavate';
 import { graveyard } from '@necromancer/graveyard';
 import { ClaudeModel, DEFAULT_MODEL, hasCredentials, type Effort, type StructuredModel } from '@necromancer/llm';
 import { DEFAULT_LIMITS, DEFAULT_MAX_ITERATIONS, DEFAULT_TOKEN_BUDGET, DockerSandbox, FixCache, resurrect, type Sandbox } from '@necromancer/resurrect';
+import { compareWitness, witness } from '@necromancer/witness';
 import { runInterview, terminalIo, type InterviewOptions } from './interview.js';
 import { createUiServer } from './server.js';
 
@@ -233,6 +234,86 @@ BLOCKED: ${report.blockedReason}
         }
         process.stderr.write(`saved ${file}${opts.outDir ? ` and the Dockerfile and compose file to ${opts.outDir}` : ''}
 `);
+      },
+    );
+
+  program
+    .command('witness')
+    .description(
+      'Boot the resurrected app, call every route Exhume found and record normalized golden snapshots, then run the ' +
+        "project's own tests. Claude writes the request inputs if ANTHROPIC_API_KEY is set. Needs a prior `resurrect` and Docker.",
+    )
+    .argument('<source>', 'git URL or local path')
+    .option('--check', 'compare against the saved golden snapshots instead of replacing them; exits 1 on any difference')
+    .option('--no-llm', 'one placeholder request per route instead of model-written inputs')
+    .option('--no-tests', "don't run the project's test script")
+    .option('-m, --model <id>', 'Claude model', DEFAULT_MODEL)
+    .option('--step-timeout <sec>', 'time limit for each install, build or test step', int)
+    .option('--health-timeout <sec>', 'how long to wait for the app to answer', int, 90)
+    .option('--ca-file <file>', 'extra CA certificate for a TLS-intercepting proxy during install')
+    .option('--build-proxy', "pass this machine's HTTP(S)_PROXY to the install step")
+    .option('--reports <dir>', 'report store directory')
+    .option('-w, --workdir <dir>', 'where to clone remote repos')
+    .option('-q, --quiet', 'no progress output on stderr')
+    .action(
+      async (
+        source: string,
+        opts: {
+          check?: boolean;
+          llm: boolean;
+          tests: boolean;
+          model: string;
+          stepTimeout?: number;
+          healthTimeout: number;
+          caFile?: string;
+          buildProxy?: boolean;
+          reports?: string;
+          workdir?: string;
+          quiet?: boolean;
+        },
+      ) => {
+        const store = new ReportStore(opts.reports);
+        const saved = await store.load(slugFor(source));
+        if (!saved?.resurrect) throw new Error(`no resurrect report for ${source}; run \`necromancer resurrect ${source}\` first`);
+        if (opts.check && !saved.witness) throw new Error('no golden snapshots to check against; run `necromancer witness` without --check first');
+        const say = progress(opts, '👁');
+        let model: StructuredModel | null = null;
+        if (opts.llm) {
+          if (deps.model) model = deps.model;
+          else if (hasCredentials()) model = new ClaudeModel({ model: opts.model });
+          else say?.('no ANTHROPIC_API_KEY, so every route gets one placeholder request');
+        }
+        const report = await witness(source, {
+          sandbox: deps.sandbox ?? new DockerSandbox({ buildProxy: opts.buildProxy, healthTimeoutSec: opts.healthTimeout }),
+          resurrect: saved.resurrect,
+          exhume: saved.exhume,
+          interview: saved.interview,
+          // A check replays the golden run's exact requests, so only behaviour can differ.
+          model: opts.check ? null : model,
+          cases: opts.check ? saved.witness!.snapshots.map((s) => s.case) : undefined,
+          runTests: opts.tests,
+          limits: opts.stepTimeout ? { stepTimeoutSec: opts.stepTimeout } : undefined,
+          caFile: opts.caFile,
+          workdir: opts.workdir,
+          onProgress: say,
+        });
+        for (const w of report.warnings) process.stderr.write(`warning: ${w}\n`);
+        const tests = report.tests ? `; tests ${report.tests.ok ? 'passed' : 'failed'}${report.tests.summary ? ` (${report.tests.summary})` : ''}` : '';
+        if (opts.check) {
+          const diffs = compareWitness(saved.witness!, report);
+          if (!diffs.length) {
+            process.stderr.write(`\nNo behaviour changes across ${report.snapshots.length} request(s)${tests}\n`);
+            return;
+          }
+          process.stderr.write(`\n${diffs.length} difference(s) from the golden snapshots:\n`);
+          for (const d of diffs) process.stderr.write(`  ${d.what.padEnd(7)} ${d.case}: ${d.detail}\n`);
+          process.exitCode = 1;
+          return;
+        }
+        const file = await store.save('witness', report);
+        process.stderr.write(
+          `\nWITNESSED ${report.routes.exercised}/${report.routes.found} route(s) with ${report.snapshots.length} request(s)${tests}\nsaved ${file}\n`,
+        );
       },
     );
 

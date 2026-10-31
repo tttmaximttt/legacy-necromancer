@@ -66,6 +66,7 @@ export function App() {
   const graveyard = reports?.graveyard ?? null;
   const interview = reports?.interview ?? null;
   const revived = reports?.resurrect ?? null;
+  const witnessed = reports?.witness ?? null;
   const source = exhume?.repo.source ?? graveyard?.repo.source ?? null;
 
   return (
@@ -125,6 +126,13 @@ export function App() {
                   {revived.outcome === 'resurrected'
                     ? `on ${revived.recipe.nodeImage}${revived.services.length ? ` with ${revived.services.map((s) => s.image).join(', ')}` : ''} after ${revived.attempts.length} attempt${revived.attempts.length === 1 ? '' : 's'}: ${revived.health?.detail}`
                     : revived.blockedReason}
+                </p>
+              )}
+              {witnessed && (
+                <p className="intent">
+                  <span className="intent-label">Witnessed</span> {witnessed.routes.exercised} of {witnessed.routes.found} routes,{' '}
+                  {witnessed.snapshots.length} golden snapshot{witnessed.snapshots.length === 1 ? '' : 's'}
+                  {witnessed.tests && <span className="muted"> · tests {witnessed.tests.ok ? 'passing' : 'failing'}{witnessed.tests.summary ? ` (${witnessed.tests.summary})` : ''}</span>}
                 </p>
               )}
             </div>

@@ -26,6 +26,9 @@
     },
     {
       "path": "../resurrect"
+    },
+    {
+      "path": "../witness"
     }
   ]
 }

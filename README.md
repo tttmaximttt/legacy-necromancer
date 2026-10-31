@@ -21,7 +21,7 @@ pnpm necromancer autopsy https://github.com/tttmaximttt/node-orm2 --open
 
 ## Design
 
-A pipeline in which only two steps are agents and one is a single model
+A pipeline in which only two steps are agents and two make a single model
 call. Everything else is deterministic, seeded, and testable without an LLM;
 the model call is tested against a scripted model, so no API key is needed.
 
@@ -32,7 +32,7 @@ the model call is tested against a scripted model, so no API key is needed.
 | 3. Map | [`ui`](packages/ui) | UI | **working** |
 | 4. Interview | [`interview`](packages/interview) | one structured LLM call + the user | **working** |
 | 5. Resurrect | [`resurrect`](packages/resurrect) | agent (known-fix table first) | **working** |
-| 6. Witness | [`witness`](packages/witness) | deterministic | stub |
+| 6. Witness | [`witness`](packages/witness) | deterministic, inputs from one LLM call | **working** |
 | Stretch: Operate | [`surgeon`](packages/surgeon) | agent | stub |
 
 ## Use it from Claude
@@ -62,6 +62,7 @@ dead repo is and what's rotting in it".
 | `graveyard <repo> [--save]` | Phase 2 era + dependency report (JSON) |
 | `interview <repo>` | Phase 4: Claude proposes what the repo is for, with file:line evidence; you confirm or correct it and pick goals |
 | `resurrect <repo>` | Phase 5: builds and boots it in Docker on its era's Node, fixing failures until it runs or is `BLOCKED` |
+| `witness <repo> [--check]` | Phase 6: calls every route on the revived app and records normalized golden snapshots, runs its tests; `--check` compares a new run |
 | `ui [--open]` | Serves the UI over saved reports on localhost |
 
 ## `necromancer exhume <git-url | path>`
@@ -170,16 +171,38 @@ yourself. Without `ANTHROPIC_API_KEY` only known fixes are tried
 (`--no-llm` forces that). The exit code is 2 when blocked. Details,
 including the sandbox, are in the [package README](packages/resurrect/README.md).
 
+## `necromancer witness <git-url | path>`
+
+Boots the app the way `resurrect` got it running and calls every route that
+`exhume` found. Claude writes the requests from the handler code (one to
+three per route), or each route gets one placeholder request without
+`ANTHROPIC_API_KEY`. The responses are saved as golden snapshots, with
+timestamps, ids, tokens and anything else that changes between two
+identical requests blanked. The project's own `test` script runs next to the
+app.
+
+```sh
+pnpm necromancer witness https://github.com/owner/old-app
+# later, after changing something:
+pnpm necromancer witness https://github.com/owner/old-app --check
+```
+
+`--check` re-sends the saved requests, prints what changed (status, headers,
+body, tests), exits 1 on any difference, and keeps the golden snapshots.
+Details are in the [package README](packages/witness/README.md).
+
 ## Safety
 
 Excavate only reads. It never installs dependencies or runs repo code.
 Resurrect does run repo code, including install scripts, but only in
 containers: no host mounts, no credentials, network only while installing,
 and CPU, memory, process and time limits on everything.
-Interview sends the files it picked (up to about 2,400 lines) to the
-Anthropic API; don't run it on code you can't share with it. Later
-phases (Witness, Operate) must do the same, and none of it should ever
-point at shared environments or production.
+Witness runs the app in the same sandbox and sends requests to it from
+inside. Interview sends the files it picked (up to about 2,400 lines) to the
+Anthropic API, and Witness sends about 30 lines around each route handler;
+don't run them on code you can't share with it. Operate must follow the same
+rules, and none of it should ever point at shared environments or
+production.
 
 ## Development
 

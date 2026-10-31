@@ -1,6 +1,5 @@
-/**
- * Phase 6: records behavioural snapshots of the revived app (HTTP responses, CLI output, test results) with timestamps and IDs normalised, so later upgrades can be checked against them.
- *
- * Not implemented yet; see the roadmap in the root README.
- */
-export const phase = 'witness' as const;
+export { witness, testSummary, MAX_ROUTES, type WitnessOptions } from './witness.js';
+export { compareWitness, type WitnessDifference } from './compare.js';
+export { defaultCases, generateCases, fillPath, CasesSchema, INPUTS_SYSTEM_PROMPT, type InputOptions } from './inputs.js';
+export { normalizeJson, normalizeText, normalizeHeaders, normalizeBody, differingPaths, blank } from './normalize.js';
+export { RUNNER, MARKER, runnerEnv, parseRunnerOutput, type RawResponse } from './runner.js';

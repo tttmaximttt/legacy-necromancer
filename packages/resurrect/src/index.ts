@@ -1,4 +1,4 @@
-export { resurrect, firstError, DEFAULT_MAX_ITERATIONS, DEFAULT_TOKEN_BUDGET, type ResurrectOptions } from './resurrect.js';
+export { resurrect, firstError, BuildContext, DEFAULT_MAX_ITERATIONS, DEFAULT_TOKEN_BUDGET, type ResurrectOptions } from './resurrect.js';
 export { DockerSandbox, READY_LOG, type Sandbox, type StepResult, type BootOptions, type BootResult, type BootService, type DockerSandboxOptions } from './docker.js';
 export { readFacts, chooseNode, detectServices, initialRecipe, findPort, SERVICES, type ProjectFacts } from './detect.js';
 export { applyOps, validateOp, changesRecipe, renderDockerfile, patchManifest, installCommand, RecipeOpSchema } from './recipe.js';

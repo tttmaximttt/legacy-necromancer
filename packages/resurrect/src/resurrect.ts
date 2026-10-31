@@ -108,13 +108,8 @@ export async function resurrect(source: string, options: ResurrectOptions): Prom
     }
 
     // The sandbox gets a copy of the repo; the checkout is never modified.
-    await cp(repo.root, context, { recursive: true, filter: (src) => !/[/\\](\.git|node_modules)([/\\]|$)/.test(src.slice(repo.root.length)) });
-    const originalManifest = facts.manifest;
-    const lockfiles = new Map<string, string>();
-    for (const f of LOCKFILES) {
-      const text = await readFile(path.join(repo.root, f), 'utf8').catch(() => null);
-      if (text !== null) lockfiles.set(f, text);
-    }
+    const manifest = facts.manifest;
+    const build = await BuildContext.copy(repo.root, context, manifest);
     const tagBase = `necromancer/${slugFor(source).toLowerCase().replace(/[^a-z0-9_.-]/g, '-')}`;
 
     let pendingLlmFix: { signature: string; fix: AppliedFix } | null = null;
@@ -122,7 +117,7 @@ export async function resurrect(source: string, options: ResurrectOptions): Prom
 
     try {
       for (let n = 1; n <= maxIterations; n++) {
-        await writeContext(context, recipe, originalManifest, lockfiles, options.caFile);
+        await build.write(recipe, options.caFile);
         const started = Date.now();
         const tag = `${tagBase}:attempt-${n}`;
         log(`attempt ${n}/${maxIterations}: installing on ${recipe.nodeImage}`);
@@ -193,8 +188,8 @@ export async function resurrect(source: string, options: ResurrectOptions): Prom
           phase,
           log: tail(step.log, 120),
           recipe,
-          dependencies: { ...asRecord(originalManifest.devDependencies), ...asRecord(originalManifest.dependencies) },
-          devOnly: new Set(Object.keys(asRecord(originalManifest.devDependencies)).filter((d) => !(d in asRecord(originalManifest.dependencies)))),
+          dependencies: { ...asRecord(manifest.devDependencies), ...asRecord(manifest.dependencies) },
+          devOnly: new Set(Object.keys(asRecord(manifest.devDependencies)).filter((d) => !(d in asRecord(manifest.dependencies)))),
         };
         let fix: AppliedFix | null = null;
         const known = findKnownFix(ctx);
@@ -269,23 +264,37 @@ export async function resurrect(source: string, options: ResurrectOptions): Prom
   }
 }
 
-async function writeContext(
-  dir: string,
-  recipe: BuildRecipe,
-  manifest: Record<string, unknown>,
-  lockfiles: Map<string, string>,
-  caFile: string | undefined,
-): Promise<void> {
-  await writeFile(path.join(dir, 'package.json'), `${JSON.stringify(patchManifest(manifest, recipe), null, 2)}\n`);
-  for (const [name, text] of lockfiles) {
-    if (recipe.dropLockfile) await rm(path.join(dir, name), { force: true });
-    else await writeFile(path.join(dir, name), text);
+/** The sandbox's copy of the repo: everything but .git and node_modules, with the recipe's manifest and Dockerfile. */
+export class BuildContext {
+  private constructor(
+    readonly dir: string,
+    private readonly manifest: Record<string, unknown>,
+    private readonly lockfiles: Map<string, string>,
+  ) {}
+
+  static async copy(root: string, dir: string, manifest: Record<string, unknown>): Promise<BuildContext> {
+    await cp(root, dir, { recursive: true, filter: (src) => !/[/\\](\.git|node_modules)([/\\]|$)/.test(src.slice(root.length)) });
+    const lockfiles = new Map<string, string>();
+    for (const f of LOCKFILES) {
+      const text = await readFile(path.join(root, f), 'utf8').catch(() => null);
+      if (text !== null) lockfiles.set(f, text);
+    }
+    return new BuildContext(dir, manifest, lockfiles);
   }
-  await writeFile(path.join(dir, 'Dockerfile.necromancer'), renderDockerfile(recipe, { caFile }));
-  await writeFile(path.join(dir, '.dockerignore'), 'node_modules\n.git\n');
-  if (caFile) {
-    await rm(path.join(dir, '.necromancer'), { recursive: true, force: true });
-    await cp(caFile, path.join(dir, '.necromancer', 'ca.crt'));
+
+  async write(recipe: BuildRecipe, caFile?: string): Promise<void> {
+    const dir = this.dir;
+    await writeFile(path.join(dir, 'package.json'), `${JSON.stringify(patchManifest(this.manifest, recipe), null, 2)}\n`);
+    for (const [name, text] of this.lockfiles) {
+      if (recipe.dropLockfile) await rm(path.join(dir, name), { force: true });
+      else await writeFile(path.join(dir, name), text);
+    }
+    await writeFile(path.join(dir, 'Dockerfile.necromancer'), renderDockerfile(recipe, { caFile }));
+    await writeFile(path.join(dir, '.dockerignore'), 'node_modules\n.git\n');
+    if (caFile) {
+      await rm(path.join(dir, '.necromancer'), { recursive: true, force: true });
+      await cp(caFile, path.join(dir, '.necromancer', 'ca.crt'));
+    }
   }
 }
 

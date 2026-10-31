@@ -9,6 +9,7 @@ import { graveyard as runGraveyard, type GraveyardOptions } from '@necromancer/g
 import { answerInterview, interviewBrief, proposeIntent, ProposalSchema, recordProposal } from '@necromancer/interview';
 import { ClaudeModel, hasCredentials, type StructuredModel } from '@necromancer/llm';
 import { DEFAULT_MAX_ITERATIONS, DEFAULT_TOKEN_BUDGET, DockerSandbox, FixCache, resurrect, type Sandbox } from '@necromancer/resurrect';
+import { compareWitness, witness } from '@necromancer/witness';
 
 export interface ServerOptions {
   /** Injected in tests; defaults to the real excavator. */
@@ -18,7 +19,7 @@ export interface ServerOptions {
   workdir?: string;
   /** Where reports are saved for `necromancer ui`. Defaults to ~/.necromancer/reports. */
   store?: ReportStore;
-  /** Model for the interview and Resurrect's fixes. Defaults to Claude when ANTHROPIC_API_KEY is set. */
+  /** Model for the interview, Resurrect's fixes and Witness inputs. Defaults to Claude when ANTHROPIC_API_KEY is set. */
   model?: StructuredModel;
   /** Where Resurrect runs containers. Defaults to the local Docker daemon. */
   sandbox?: Sandbox;
@@ -278,6 +279,69 @@ export function createServer(options: ServerOptions = {}): McpServer {
     },
   );
 
+  server.registerTool(
+    'witness',
+    {
+      title: 'Record how the revived app behaves',
+      description:
+        'Phase 6. Boots the app the way `resurrect` got it running, sends every route Exhume found one to three requests ' +
+        '(written by Claude from the handler code when ANTHROPIC_API_KEY is set, placeholders otherwise), and records the ' +
+        "responses as golden snapshots with timestamps, IDs, tokens and other volatile values blanked. Runs the project's " +
+        'own tests next to it. With check: true, re-sends the saved golden requests and reports what changed instead of ' +
+        'saving. Needs a prior `resurrect` and Docker; takes minutes.',
+      inputSchema: {
+        source: z.string().min(1).describe('Git URL (https or ssh) or a local directory path'),
+        check: z.boolean().default(false).describe('Compare against the saved golden snapshots instead of replacing them'),
+        runTests: z.boolean().default(true).describe("Run the project's test script"),
+        save: z.boolean().default(true).describe('Save the snapshots as the new golden run (ignored with check)'),
+      },
+      annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: true },
+    },
+    async ({ source, check, runTests, save }, extra) => {
+      try {
+        const saved = await store.load(slugFor(source)).catch(() => null);
+        if (!saved?.resurrect) throw new Error('No resurrect report for this source; run the `resurrect` tool first.');
+        if (check && !saved.witness) throw new Error('No golden snapshots to check against; run `witness` without check first.');
+        const model = check ? null : (options.model ?? (hasCredentials() ? new ClaudeModel() : null));
+        const report = await witness(source, {
+          sandbox: options.sandbox ?? new DockerSandbox(),
+          resurrect: saved.resurrect,
+          exhume: saved.exhume,
+          interview: saved.interview,
+          model,
+          cases: check ? saved.witness!.snapshots.map((s) => s.case) : undefined,
+          runTests,
+          workdir: options.workdir,
+          onProgress: progressReporter(extra),
+        });
+        const summary = {
+          routes: report.routes,
+          inputs: report.inputs,
+          tests: report.tests && { ...report.tests, logTail: report.tests.logTail.split('\n').slice(-15).join('\n') },
+          warnings: report.warnings,
+        };
+        if (check) {
+          const differences = compareWitness(saved.witness!, report);
+          return text({ ...summary, unchanged: differences.length === 0, differences });
+        }
+        return text({
+          ...summary,
+          snapshots: report.snapshots.map((s) => ({
+            request: `${s.case.method} ${s.case.path}`,
+            name: s.case.name,
+            status: s.response.status,
+            error: s.response.error,
+            body: truncate(JSON.stringify(s.response.body) ?? 'null', 400),
+          })),
+          ...(!model && { note: 'No ANTHROPIC_API_KEY in the server environment, so each route got one placeholder request.' }),
+          ...(save && (await saveNote('witness', report))),
+        });
+      } catch (err) {
+        return failure('witness', err);
+      }
+    },
+  );
+
   server.registerPrompt(
     'autopsy',
     {
@@ -377,4 +441,8 @@ export function summarize({ graph: _graph, ...report }: ExhumeReport) {
       hint: 'Call exhume again with detail "full" for complete lists and per-manifest dependency versions.',
     },
   };
+}
+
+function truncate(value: string, max: number): string {
+  return value.length > max ? `${value.slice(0, max)}…` : value;
 }

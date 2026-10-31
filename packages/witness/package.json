@@ -17,6 +17,10 @@
     "build": "tsc -b"
   },
   "dependencies": {
-    "@necromancer/core": "workspace:*"
+    "@necromancer/core": "workspace:*",
+    "@necromancer/excavate": "workspace:*",
+    "@necromancer/llm": "workspace:*",
+    "@necromancer/resurrect": "workspace:*",
+    "zod": "^4.6.7"
   }
 }

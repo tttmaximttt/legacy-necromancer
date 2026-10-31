@@ -24,7 +24,8 @@
     "@necromancer/ui": "workspace:*",
     "@necromancer/interview": "workspace:*",
     "@necromancer/llm": "workspace:*",
-    "@necromancer/resurrect": "workspace:*"
+    "@necromancer/resurrect": "workspace:*",
+    "@necromancer/witness": "workspace:*"
   },
   "bin": {
     "necromancer": "./dist/bin.js"

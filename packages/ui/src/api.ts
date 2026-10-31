@@ -1,4 +1,4 @@
-import type { ExhumeReport, GraveyardReport, InterviewReport, ResurrectReport, StoredRepo } from '@necromancer/core';
+import type { ExhumeReport, GraveyardReport, InterviewReport, ResurrectReport, StoredRepo, WitnessReport } from '@necromancer/core';
 
 export interface Reports {
   exhume: ExhumeReport | null;
@@ -6,6 +6,7 @@ export interface Reports {
   /** Only from the server; dropped files never include it. */
   interview?: InterviewReport | null;
   resurrect?: ResurrectReport | null;
+  witness?: WitnessReport | null;
 }
 
 /** null means there is no API (the UI was opened as static files); the user can still drop JSON in. */

@@ -13,6 +13,7 @@ export default defineConfig({
       '@necromancer/llm': pkg('llm'),
       '@necromancer/interview': pkg('interview'),
       '@necromancer/resurrect': pkg('resurrect'),
+      '@necromancer/witness': pkg('witness'),
     },
   },
   test: {

@@ -9,6 +9,7 @@ import { ScriptedModel } from '@necromancer/llm';
 import { createServer, summarize, type ServerOptions } from '@necromancer/mcp';
 import { fixtureRepo, goodProposal } from '../../interview/test/fixtures.js';
 import { deadApp, expressMongoApp, FakeSandbox, NODE_GYP_LOG } from '../../resurrect/test/helpers.js';
+import { answering } from '../../witness/test/helpers.js';
 
 const storeDir = await mkdtemp(path.join(os.tmpdir(), 'necro-store-'));
 
@@ -27,7 +28,7 @@ describe('necromancer MCP server', () => {
   it('lists the tools and the autopsy prompt', async () => {
     const client = await connect();
     const { tools } = await client.listTools();
-    expect(tools.map((t) => t.name)).toEqual(['exhume', 'graveyard', 'interview', 'record_interview', 'resurrect']);
+    expect(tools.map((t) => t.name)).toEqual(['exhume', 'graveyard', 'interview', 'record_interview', 'resurrect', 'witness']);
     expect(tools.slice(0, 2).every((t) => t.annotations?.readOnlyHint)).toBe(true);
     expect(Object.keys(tools[1]!.inputSchema.properties ?? {})).toEqual(['source', 'advisories', 'github', 'detail', 'save']);
     expect(Object.keys(tools[0]!.inputSchema.properties ?? {})).toEqual(['source', 'top', 'includeTests', 'detail', 'save']);
@@ -240,5 +241,40 @@ describe('necromancer MCP resurrect', () => {
     const body = JSON.parse(text(await client.callTool({ name: 'resurrect', arguments: { source: root, tokenBudget: 0, save: false } })));
     expect(body.outcome).toMatch(/^BLOCKED: boot failed and no known fix matches/);
     expect(body.savedTo).toBeUndefined();
+  });
+});
+
+describe('necromancer MCP witness', () => {
+  const app = {
+    ...expressMongoApp,
+    'package.json': JSON.stringify({ name: 'dead-api', scripts: { start: 'node server.js', test: 'mocha' }, dependencies: { express: '^4.15.0' } }),
+    'server.js': "var app = require('express')();\napp.get('/health', function (req, res) { res.json({ ok: true }); });\napp.listen(3000);\n",
+  };
+
+  it('needs a resurrect report first', async () => {
+    const root = await deadApp(app);
+    const result = await (await connect({ sandbox: new FakeSandbox({}) })).callTool({ name: 'witness', arguments: { source: root } });
+    expect(result.isError).toBe(true);
+    expect(text(result)).toContain('run the `resurrect` tool first');
+  });
+
+  it('records snapshots, then checks a later run against them', async () => {
+    const root = await deadApp(app);
+    let ok = true;
+    const client = await connect({ sandbox: new FakeSandbox({ exec: answering(() => ({ status: 200, body: { ok } })) }) });
+    await client.callTool({ name: 'resurrect', arguments: { source: root, tokenBudget: 0 } });
+
+    const golden = JSON.parse(text(await client.callTool({ name: 'witness', arguments: { source: root } })));
+    expect(golden.routes).toEqual({ found: 1, exercised: 1, skipped: [] });
+    expect(golden.snapshots).toEqual([{ request: 'GET /health', name: 'default', status: 200, error: null, body: '{"ok":true}' }]);
+    expect(golden.tests.summary).toBe('2 passing');
+    expect(golden.savedTo).toBe(path.join(storeDir, path.basename(root), 'witness.json'));
+
+    expect(JSON.parse(text(await client.callTool({ name: 'witness', arguments: { source: root, check: true } }))).unchanged).toBe(true);
+    ok = false;
+    const check = JSON.parse(text(await client.callTool({ name: 'witness', arguments: { source: root, check: true } })));
+    expect(check.unchanged).toBe(false);
+    expect(check.differences).toEqual([{ case: 'GET /health (default)', what: 'body', detail: 'changed at /ok' }]);
+    expect(check.savedTo).toBeUndefined();
   });
 });

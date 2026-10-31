@@ -28,6 +28,8 @@ export interface BootOptions {
 
 export interface BootResult extends StepResult {
   health: { kind: 'port' | 'log'; detail: string } | null;
+  /** The running app's container, whose network namespace `exec` can join; null if it isn't running. */
+  namespace: string | null;
 }
 
 /**
@@ -43,6 +45,11 @@ export interface Sandbox {
   run(image: string, command: string, env: Record<string, string>, limits: SandboxLimits, outTag?: string): Promise<StepResult>;
   /** Starts services and the app with no network beyond their shared localhost, and waits for a health signal. */
   boot(image: string, options: BootOptions): Promise<BootResult>;
+  /**
+   * Runs a command from `image` inside a booted app's network namespace (its localhost and services, nothing
+   * else), with the same limits; used to send requests and run the project's tests next to the live app.
+   */
+  exec(image: string, namespace: string, command: string[], env: Record<string, string>, limits: SandboxLimits): Promise<StepResult>;
   /** Removes every container and image this sandbox created. */
   cleanup(): Promise<void>;
 }
@@ -218,7 +225,28 @@ export class DockerSandbox implements Sandbox {
       health = { kind: 'log', detail: `kept running for ${Math.round((Date.now() - started) / 1000)}s without crashing (no port to probe)` };
     }
     const log = `${await logsOf(app)}${serviceLogs.length ? `\n${serviceLogs.join('\n')}\n` : ''}${!health && !crashed ? `\nno health signal within ${this.options.healthTimeoutSec ?? 90}s\n` : ''}`;
-    return { ok: health !== null, log, durationMs: Date.now() - started, health };
+    return { ok: health !== null, log, durationMs: Date.now() - started, health, namespace: crashed ? null : app.id };
+  }
+
+  async exec(image: string, namespace: string, command: string[], env: Record<string, string>, limits: SandboxLimits): Promise<StepResult> {
+    const started = Date.now();
+    const c = await this.create({
+      Image: image,
+      Cmd: command,
+      Env: toEnv(env),
+      WorkingDir: '/app',
+      HostConfig: { ...SECURE_HOST, ...resources(limits), NetworkMode: `container:${namespace}` },
+    });
+    await c.start();
+    const exit = await waitFor(c, limits.stepTimeoutSec * 1000);
+    const log = await logsOf(c);
+    await this.remove(c);
+    return {
+      ok: exit.code === 0,
+      log: exit.timedOut ? `${log}\ntimed out after ${limits.stepTimeoutSec}s\n` : log,
+      durationMs: Date.now() - started,
+      ...(exit.timedOut && { timedOut: true }),
+    };
   }
 
   /** Connects to localhost:port from inside a namespace, using node from the app image (every era has net.connect). */

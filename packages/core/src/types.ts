@@ -11,6 +11,28 @@ export interface RawImport {
   line: number;
 }
 
+/** An HTTP route registration found in source, e.g. `router.get('/users/:id', …)`. */
+export interface RawRoute {
+  method: string;
+  path: string;
+  line: number;
+}
+
+/** `app.use('/api', target)`: routes registered in `specifier` are served under `prefix`. */
+export interface RawMount {
+  prefix: string;
+  specifier: string;
+  line: number;
+}
+
+/** A route with any mount prefixes applied. `method` is upper-case, or ALL. */
+export interface HttpRoute {
+  method: string;
+  path: string;
+  file: string;
+  line: number;
+}
+
 export type ResolvedImport =
   /** `caseMismatch`: only resolves on a case-insensitive filesystem (macOS, Windows). */
   | { type: 'internal'; target: string; raw: RawImport; caseMismatch?: boolean }
@@ -118,6 +140,8 @@ export interface ExhumeReport {
   installScripts: InstallScriptFinding[];
   /** The whole import graph, for the UI. Left out of MCP summaries. */
   graph: ImportGraphData;
+  /** HTTP routes registered with Express-style or Hapi-style calls. Missing in reports from before phase 6. */
+  routes?: HttpRoute[];
 }
 
 export interface GraphNode {
@@ -374,5 +398,62 @@ export interface ResurrectReport {
   limits: SandboxLimits;
   attempts: ResurrectAttempt[];
   llm: { model: string | null; calls: number; tokens: number; budget: number };
+  warnings: string[];
+}
+
+// ── Phase 6: Witness ─────────────────────────────────────────────────────
+
+/** One request to send to the revived app. `route` is the pattern it exercises, e.g. "GET /users/:id". */
+export interface WitnessCase {
+  route: string;
+  name: string;
+  method: string;
+  /** Concrete path with parameters filled in, and any query string. */
+  path: string;
+  headers: Record<string, string>;
+  /** Raw request body, usually JSON. */
+  body: string | null;
+}
+
+export interface WitnessResponse {
+  status: number | null;
+  /** Only headers whose value is behaviour, normalized: content-type, location, cache-control, set-cookie names… */
+  headers: Record<string, string>;
+  /** JSON bodies are parsed and normalized; anything else is normalized text. */
+  body: unknown;
+  /** Set when the request never got a response: connection refused, timeout. */
+  error: string | null;
+}
+
+export interface WitnessSnapshot {
+  case: WitnessCase;
+  response: WitnessResponse;
+  /** JSON paths that changed between two identical requests and were blanked as `<volatile>`. */
+  volatile: string[];
+}
+
+export interface WitnessTestRun {
+  command: string;
+  ok: boolean;
+  /** e.g. "42 passing, 1 failing" when the runner's summary line is recognised. */
+  summary: string | null;
+  durationMs: number;
+  logTail: string;
+}
+
+/**
+ * Phase 6: golden snapshots of how the revived app answers every route found by Exhume, plus the result of
+ * its own tests. Later upgrades must reproduce these.
+ */
+export interface WitnessReport {
+  repo: { source: string; commit: string | null };
+  generatedAt: string;
+  /** The image and start command the snapshots were taken against. */
+  target: { nodeImage: string; startCommand: string | null; services: string[] };
+  routes: { found: number; exercised: number; skipped: Array<{ route: string; reason: string }> };
+  /** `replay` when a check re-sent a golden run's requests. */
+  inputs: { source: 'claude-api' | 'default' | 'replay'; model: string | null; tokens: number };
+  snapshots: WitnessSnapshot[];
+  tests: WitnessTestRun | null;
   warnings: string[];
 }

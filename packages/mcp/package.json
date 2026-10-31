@@ -27,6 +27,7 @@
     "@necromancer/graveyard": "workspace:*",
     "@necromancer/interview": "workspace:*",
     "@necromancer/llm": "workspace:*",
-    "@necromancer/resurrect": "workspace:*"
+    "@necromancer/resurrect": "workspace:*",
+    "@necromancer/witness": "workspace:*"
   }
 }
