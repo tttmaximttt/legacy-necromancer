@@ -1,7 +1,7 @@
 import Anthropic from '@anthropic-ai/sdk';
 import { describe, expect, it } from 'vitest';
 import { z } from 'zod';
-import { ClaudeModel, LlmError, ScriptedModel, hasCredentials } from '@necromancer/llm';
+import { ClaudeModel, LlmError, ScriptedModel, findCredentials, hasCredentials } from '@necromancer/llm';
 
 const Answer = z.object({ answer: z.string(), score: z.number() });
 
@@ -99,10 +99,48 @@ describe('ClaudeModel', () => {
     expect((err as LlmError).kind).toBe(kind);
   });
 
-  it('detects credentials in the environment', () => {
-    expect(hasCredentials({})).toBe(false);
-    expect(hasCredentials({ ANTHROPIC_API_KEY: 'k' })).toBe(true);
-    expect(hasCredentials({ ANTHROPIC_AUTH_TOKEN: 't' })).toBe(true);
+  it('detects credentials in the environment or the file, ignoring blanks and placeholders', () => {
+    expect(hasCredentials({}, {})).toBe(false);
+    expect(hasCredentials({ ANTHROPIC_API_KEY: '  ', NECROMANCER_ANTHROPIC_API_KEY: '${user_config.anthropic_api_key}' }, {})).toBe(false);
+    expect(hasCredentials({ ANTHROPIC_API_KEY: 'k' }, {})).toBe(true);
+    expect(hasCredentials({ ANTHROPIC_AUTH_TOKEN: 't' }, {})).toBe(true);
+    expect(hasCredentials({}, { ANTHROPIC_API_KEY: 'k' })).toBe(true);
+  });
+});
+
+describe('findCredentials', () => {
+  it('takes the first key in order and only that one', () => {
+    const env = { NECROMANCER_ANTHROPIC_API_KEY: 'own', ANTHROPIC_API_KEY: 'shell', ANTHROPIC_AUTH_TOKEN: 'token' };
+    expect(findCredentials(env, {})).toEqual({
+      apiKey: 'own',
+      baseURL: 'https://api.anthropic.com',
+      from: 'NECROMANCER_ANTHROPIC_API_KEY in the environment (the plugin setting, if you use the plugin)',
+    });
+    expect(findCredentials({ ANTHROPIC_AUTH_TOKEN: 'token' }, {})).toEqual({
+      authToken: 'token',
+      baseURL: 'https://api.anthropic.com',
+      from: 'ANTHROPIC_AUTH_TOKEN in the environment',
+    });
+  });
+
+  it('never mixes a key from one place with a base URL or key from the other', () => {
+    const file = { ANTHROPIC_BASE_URL: 'https://gateway.example', ANTHROPIC_AUTH_TOKEN: 'gw', NECROMANCER_ANTHROPIC_API_KEY: 'file-own' };
+    expect(findCredentials({ ANTHROPIC_API_KEY: 'real' }, file)).toEqual({
+      apiKey: 'real',
+      baseURL: 'https://api.anthropic.com',
+      from: 'ANTHROPIC_API_KEY in the environment',
+    });
+    expect(findCredentials({ ANTHROPIC_BASE_URL: 'https://shell-gateway.example' }, file)).toEqual({
+      apiKey: 'file-own',
+      baseURL: 'https://gateway.example',
+      from: 'NECROMANCER_ANTHROPIC_API_KEY in ~/.necromancer/.env',
+    });
+  });
+
+  it('says where a rejected key came from', async () => {
+    const { client } = stubClient(() => ({ status: 401, json: { type: 'error', error: { type: 'authentication_error', message: 'bad' } } }));
+    const err = (await new ClaudeModel({ client }).generate({ system: 's', prompt: 'p', schema: Answer }).catch((e: unknown) => e)) as LlmError;
+    expect(err.message).toContain('/plugin configure necromancer@legacy-necromancer');
   });
 });
 

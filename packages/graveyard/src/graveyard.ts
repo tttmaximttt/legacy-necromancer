@@ -1,5 +1,6 @@
 import path from 'node:path';
 import semver from 'semver';
+import { setting } from '@necromancer/core';
 import type {
   Advisory,
   Cause,
@@ -186,7 +187,7 @@ export async function graveyard(source: string, options: GraveyardOptions = {}):
     const files = await listRepoFiles(repo.root);
     const { manifests } = await auditManifests(repo.root, files);
     const { files: _perFile, ...history } = await readHistory(repo.root);
-    const token = process.env.GITHUB_TOKEN ?? process.env.GH_TOKEN;
+    const token = setting('GITHUB_TOKEN') ?? setting('GH_TOKEN');
     const provider = options.advisories ?? 'npm';
     log(`digging up ${manifests.reduce((n, m) => n + Object.keys(m.dependencies).length + Object.keys(m.devDependencies).length, 0)} dependencies`);
     return await digGraveyard(

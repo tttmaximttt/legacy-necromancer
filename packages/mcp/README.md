@@ -32,8 +32,7 @@ Both tools save their full report (pass `save: false` to skip), so you can
 browse anything Claude dug up with `necromancer ui`.
 
 `interview` takes `source`, `proposer` and `effort`. With `proposer: "auto"`
-(the default) it calls Claude if `ANTHROPIC_API_KEY` is set in the server's
-`env`. Otherwise it returns the evidence and instructions, and the agent
+(the default) it calls Claude if the server has an API key (see below). Otherwise it returns the evidence and instructions, and the agent
 you're talking to writes the proposal itself (`proposer: "host"` forces
 this). Either way the agent is told to show you the proposal and ask before
 calling `record_interview`, which takes `confirm`, `correction`,
@@ -42,11 +41,11 @@ the agent's `proposal`, whose citations are checked against the repo.
 
 `resurrect` takes `source`, `maxIterations` (up to 10), `tokenBudget` (0
 for known fixes only) and `save`. It takes minutes and sends progress
-notifications. Claude proposes fixes only if `ANTHROPIC_API_KEY` is in the
-server's `env`.
+notifications. Claude proposes fixes only if the server has an
+API key.
 
 `witness` takes `source`, `check`, `runTests` (default true) and `save`.
-Claude writes the requests if `ANTHROPIC_API_KEY` is in the server's `env`;
+Claude writes the requests if the server has an API key;
 otherwise each route gets one placeholder request. With `check: true` it
 re-sends the saved golden requests and returns `unchanged` and a list of
 `differences`, without saving.
@@ -73,10 +72,13 @@ and the other slash commands:
 claude mcp add --scope user necromancer -- npx -y legacy-necromancer mcp
 ```
 
-To let Claude write fixes and test inputs from inside the tools, pass your key:
-add `-e ANTHROPIC_API_KEY=sk-ant-...` before the `--`. Without it, `interview`
-lets the Claude you're talking to write the proposal itself, and `resurrect`
-and `witness` use known fixes and placeholder requests.
+To let Claude write fixes and test inputs from inside the tools, give the
+server a key: put `ANTHROPIC_API_KEY=sk-ant-...` in `~/.necromancer/.env`, or
+add `-e NECROMANCER_ANTHROPIC_API_KEY=sk-ant-...` before the `--` (that one is
+saved in plain text in `~/.claude.json`). Without a key, `interview` lets the
+Claude you're talking to write the proposal itself, and `resurrect` and
+`witness` use known fixes and placeholder requests. All the options are in
+[Setting your API key](../../README.md#setting-your-api-key).
 
 Check it with `claude mcp list`, or with `/mcp` inside a session. Inside this
 repo it's already configured: after `pnpm build`, the root `.mcp.json` runs the
@@ -104,6 +106,11 @@ path to `npx` as the `command` (`which npx`), and add
 `"env": { "PATH": "/usr/local/bin:/usr/bin:/bin" }`, adjusted to wherever
 `git` and `node` live.
 
+Claude Desktop doesn't pass your shell's variables to the server either, so
+for Claude to write fixes and test inputs, put your key in
+`~/.necromancer/.env` or add `"NECROMANCER_ANTHROPIC_API_KEY": "sk-ant-..."` to
+that `env` block.
+
 ### Behind a proxy
 
 MCP clients start servers with a minimal environment, so proxy variables
@@ -117,5 +124,10 @@ example `"env": { "HTTPS_PROXY": "http://proxy:3128", "NODE_USE_ENV_PROXY": "1" 
 
 | Env var | Default | Meaning |
 | --- | --- | --- |
+| `NECROMANCER_ANTHROPIC_API_KEY` | unset | Anthropic API key for this server only; wins over `ANTHROPIC_API_KEY` |
+| `ANTHROPIC_API_KEY` | unset | Anthropic API key |
 | `NECROMANCER_WORKDIR` | OS temp dir | Where remote repos are cloned (deleted after each call) |
 | `GITHUB_TOKEN` / `GH_TOKEN` | unset | GitHub API token for the archived check; without one only quiet packages are checked |
+
+The key variables and `GITHUB_TOKEN` can also go in `~/.necromancer/.env`.
+Values set in the server's environment win.

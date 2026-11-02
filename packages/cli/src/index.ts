@@ -10,7 +10,7 @@ import { ReportStore, slugFor, type ReportKind } from '@necromancer/core';
 import { exhume } from '@necromancer/excavate';
 import { runStdio } from '@necromancer/mcp';
 import { graveyard } from '@necromancer/graveyard';
-import { ClaudeModel, DEFAULT_MODEL, hasCredentials, type Effort, type StructuredModel } from '@necromancer/llm';
+import { ClaudeModel, credentialsHint, DEFAULT_MODEL, hasCredentials, type Effort, type StructuredModel } from '@necromancer/llm';
 import { DEFAULT_LIMITS, DEFAULT_MAX_ITERATIONS, DEFAULT_TOKEN_BUDGET, DockerSandbox, FixCache, resurrect, type Sandbox } from '@necromancer/resurrect';
 import { compareWitness, witness } from '@necromancer/witness';
 import { runInterview, terminalIo, type InterviewOptions } from './interview.js';
@@ -126,7 +126,7 @@ export function createProgram(deps: ProgramDeps = {}): Command {
     .command('interview')
     .description(
       'Ask Claude what the project is for, with file:line evidence, then confirm or correct it and set goals for the revival. ' +
-        'Needs ANTHROPIC_API_KEY. Without answer flags it asks interactively.',
+        'Needs an Anthropic API key (see "Setting your API key" in the README). Without answer flags it asks interactively.',
     )
     .argument('<source>', 'git URL or local path')
     .option('-m, --model <id>', 'Claude model', DEFAULT_MODEL)
@@ -155,7 +155,7 @@ export function createProgram(deps: ProgramDeps = {}): Command {
     .command('resurrect')
     .description(
       'Get the project installing, building and booting in a Docker sandbox pinned to its era. Known fixes first, then ' +
-        'Claude (if ANTHROPIC_API_KEY is set); stops with BLOCKED: <reason> when it cannot get further. Needs Docker.',
+        'Claude (if an Anthropic API key is set); stops with BLOCKED: <reason> when it cannot get further. Needs Docker.',
     )
     .argument('<source>', 'git URL or local path')
     .option('-n, --max-iterations <n>', 'build attempts before giving up', int, DEFAULT_MAX_ITERATIONS)
@@ -201,7 +201,7 @@ export function createProgram(deps: ProgramDeps = {}): Command {
         if (opts.llm) {
           if (deps.model) model = deps.model;
           else if (hasCredentials()) model = new ClaudeModel({ model: opts.model });
-          else say?.('no ANTHROPIC_API_KEY, so only known fixes will be tried');
+          else say?.(`no Anthropic API key, so only known fixes will be tried (to add one, ${credentialsHint()})`);
         }
         const report = await resurrect(source, {
           sandbox: deps.sandbox ?? new DockerSandbox({ buildProxy: opts.buildProxy, healthTimeoutSec: opts.healthTimeout }),
@@ -243,7 +243,7 @@ BLOCKED: ${report.blockedReason}
     .command('witness')
     .description(
       'Boot the resurrected app, call every route Exhume found and record normalized golden snapshots, then run the ' +
-        "project's own tests. Claude writes the request inputs if ANTHROPIC_API_KEY is set. Needs a prior `resurrect` and Docker.",
+        "project's own tests. Claude writes the request inputs if an Anthropic API key is set. Needs a prior `resurrect` and Docker.",
     )
     .argument('<source>', 'git URL or local path')
     .option('--check', 'compare against the saved golden snapshots instead of replacing them; exits 1 on any difference')
@@ -283,7 +283,7 @@ BLOCKED: ${report.blockedReason}
         if (opts.llm) {
           if (deps.model) model = deps.model;
           else if (hasCredentials()) model = new ClaudeModel({ model: opts.model });
-          else say?.('no ANTHROPIC_API_KEY, so every route gets one placeholder request');
+          else say?.(`no Anthropic API key, so every route gets one placeholder request (to add one, ${credentialsHint()})`);
         }
         const report = await witness(source, {
           sandbox: deps.sandbox ?? new DockerSandbox({ buildProxy: opts.buildProxy, healthTimeoutSec: opts.healthTimeout }),
