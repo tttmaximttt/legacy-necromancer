@@ -14,7 +14,9 @@ Use it from Claude Code:
 claude mcp add necromancer -- npx -y legacy-necromancer mcp
 ```
 
-Needs Node 22+, git, and Docker for `resurrect` and `witness`. Set `ANTHROPIC_API_KEY` to let Claude
-write fixes and request inputs.
+Needs Node 22+, git, and Docker for `resurrect` and `witness`. An Anthropic API key is optional and
+lets Claude write fixes and request inputs: put `ANTHROPIC_API_KEY=sk-ant-...` in `~/.necromancer/.env`.
+Other ways to set it are in
+[Setting your API key](https://github.com/tttmaximttt/legacy-necromancer#setting-your-api-key).
 
 Full docs: https://github.com/tttmaximttt/legacy-necromancer

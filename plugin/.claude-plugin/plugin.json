@@ -7,5 +7,13 @@
   "homepage": "https://github.com/tttmaximttt/legacy-necromancer#readme",
   "repository": "https://github.com/tttmaximttt/legacy-necromancer",
   "license": "MIT",
-  "keywords": ["legacy-code", "nodejs", "docker", "dependencies", "code-archaeology"]
+  "keywords": ["legacy-code", "nodejs", "docker", "dependencies", "code-archaeology"],
+  "userConfig": {
+    "anthropic_api_key": {
+      "type": "string",
+      "title": "Anthropic API key (optional)",
+      "description": "Lets Necromancer ask Claude to write fixes and test inputs. Claude Code keeps it in secure storage and gives it only to the Necromancer server. Leave it empty to use ANTHROPIC_API_KEY or ~/.necromancer/.env instead.",
+      "sensitive": true
+    }
+  }
 }

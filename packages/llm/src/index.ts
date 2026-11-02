@@ -117,7 +117,7 @@ function createClient(): Anthropic {
 }
 
 export function credentialsHint(): string {
-  return 'no Anthropic credentials: set ANTHROPIC_API_KEY (https://platform.claude.com/settings/keys)';
+  return 'no Anthropic credentials: set ANTHROPIC_API_KEY, or put it in ~/.necromancer/.env (https://platform.claude.com/settings/keys)';
 }
 
 /** True when an API key or token is in the environment, so a call is worth attempting. */
@@ -129,7 +129,9 @@ function translate(err: unknown): LlmError {
   if (err instanceof LlmError) return err;
   const detail = err instanceof Error ? err.message : String(err);
   if (err instanceof Anthropic.AuthenticationError || err instanceof Anthropic.PermissionDeniedError) {
-    return new LlmError('credentials', `${credentialsHint()} (${detail})`, { cause: err });
+    return new LlmError('credentials', `the Anthropic API rejected the key. Necromancer uses the first one set of: NECROMANCER_ANTHROPIC_API_KEY (the plugin setting, /plugin configure necromancer@legacy-necromancer), ANTHROPIC_API_KEY or ANTHROPIC_AUTH_TOKEN, then ~/.necromancer/.env (${detail})`, {
+      cause: err,
+    });
   }
   if (err instanceof Anthropic.RateLimitError) return new LlmError('rate_limit', `rate limited; try again shortly (${detail})`, { cause: err });
   if (err instanceof Anthropic.InternalServerError) return new LlmError('overloaded', `the API is overloaded or failing (${detail})`, { cause: err });

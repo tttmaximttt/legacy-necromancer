@@ -4,3 +4,4 @@ dist/
 coverage/
 .necromancer/
 .claude/worktrees/
+.omc/

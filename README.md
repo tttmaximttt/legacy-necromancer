@@ -10,8 +10,8 @@ upgrade it without breaking anything.
 ## Getting started
 
 You need Node 22+ and git. `resurrect` and `witness` also need Docker running.
-Set `ANTHROPIC_API_KEY` if you want Claude to write fixes and test inputs;
-everything else works without it.
+An Anthropic API key is optional: it lets Claude write fixes and test
+inputs. [Setting your API key](#setting-your-api-key) shows where it goes.
 
 ### In Claude Code (plugin)
 
@@ -72,6 +72,115 @@ them. `autopsy` opens it straight away:
 ![Architecture map of node-orm2](docs/screenshots/architecture.png)
 
 ![Dependency graveyard of node-orm2](docs/screenshots/graveyard.png)
+
+## Setting your API key
+
+Three commands call Claude: `interview` asks what the project is for,
+`resurrect` asks for a fix when no known fix applies, and `witness` asks
+for test requests. Everything else works without a key, and so do these
+three, just with less help:
+
+- `interview` in the terminal needs the key to make a proposal (answering a
+  saved one with `--reuse` doesn't). Through the MCP server it doesn't: the
+  Claude you're talking to writes the proposal instead.
+- `resurrect` only tries the known fixes.
+- `witness` sends one placeholder request per route.
+
+Create a key at [platform.claude.com](https://platform.claude.com/settings/keys).
+Calls are billed to that API account, not to a Claude subscription.
+
+Necromancer takes the first key it finds here:
+
+1. `NECROMANCER_ANTHROPIC_API_KEY` in its environment (the plugin setting
+   ends up here)
+2. `ANTHROPIC_API_KEY` in its environment
+3. the same variables in the file `~/.necromancer/.env`
+
+### One file for everything
+
+The file works the same way for the terminal, the plugin, the MCP server and
+Claude Desktop, so it's the simplest option:
+
+```sh
+mkdir -p ~/.necromancer
+touch ~/.necromancer/.env
+chmod 600 ~/.necromancer/.env
+```
+
+Open it in an editor and add:
+
+```sh
+ANTHROPIC_API_KEY=sk-ant-...
+```
+
+Variables that are already set in the environment win over the file. Other
+settings can go there too, such as `GITHUB_TOKEN` for `graveyard`. Settings
+that Node reads when it starts, such as `NODE_USE_ENV_PROXY` or
+`NODE_EXTRA_CA_CERTS`, don't work from the file.
+
+### Claude Code plugin
+
+`/plugin install` asks for the key. The field is optional, and it needs
+Claude Code 2.1.119 or later (`claude update`). Claude Code
+keeps it in secure storage (the macOS Keychain, or `~/.claude/.credentials.json`
+on Linux) and passes it only to the Necromancer server. To add or change it
+later, run `/plugin configure necromancer@legacy-necromancer` and restart
+Claude Code.
+
+Don't export `ANTHROPIC_API_KEY` in the shell you start `claude` from just
+for Necromancer. Claude Code would then use that key for itself and bill
+your API account instead of your Claude subscription. Use the plugin
+setting or the file instead.
+
+### Claude Code, MCP server only
+
+```sh
+claude mcp add necromancer -e NECROMANCER_ANTHROPIC_API_KEY=sk-ant-... -- npx -y legacy-necromancer mcp
+```
+
+If you already added the server, remove it first with
+`claude mcp remove necromancer`. This saves the key in plain text in
+`~/.claude.json`. The file above keeps it out of your Claude Code config.
+
+### Claude Desktop
+
+Claude Desktop doesn't pass your shell's variables to servers. Use the file,
+or add the key to the server in `claude_desktop_config.json`:
+
+```json
+"env": { "NECROMANCER_ANTHROPIC_API_KEY": "sk-ant-..." }
+```
+
+### Terminal
+
+```sh
+export ANTHROPIC_API_KEY=sk-ant-...
+```
+
+That lasts for one shell session. Use the file to keep it. If you also run
+Claude Code from that shell, export `NECROMANCER_ANTHROPIC_API_KEY` instead,
+for the reason above.
+
+### CI
+
+Save the key as a secret and pass it as a variable. In a GitHub Actions job
+on `ubuntu-latest`, which has Docker:
+
+```yaml
+- run: npx -y legacy-necromancer resurrect .
+  env:
+    ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+```
+
+### Through an API gateway
+
+If your company sends Anthropic traffic through its own gateway, set
+`ANTHROPIC_BASE_URL` to it, plus `ANTHROPIC_AUTH_TOKEN` if it expects a
+bearer token instead of a key. Put them in `~/.necromancer/.env` rather than
+the shell you start Claude Code from, which would point Claude Code at the
+gateway too. The gateway has to pass requests to Anthropic unchanged,
+including beta headers and the model name `claude-opus-5-5`. Other
+providers, such as Bedrock, Vertex or OpenAI, aren't supported yet.
 
 ## Design
 
@@ -182,7 +291,7 @@ suggested goals by number and add your own. Later stages read the result
 (`intent` and `goals` in `interview.json`).
 
 ```sh
-export ANTHROPIC_API_KEY=…
+export ANTHROPIC_API_KEY=…   # or see "Setting your API key"
 pnpm necromancer interview https://github.com/tttmaximttt/node-orm2              # asks interactively
 pnpm necromancer interview --reuse <repo> --yes --accept-goals 1,2 --goal "…"   # or answer with flags
 ```

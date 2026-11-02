@@ -272,7 +272,7 @@ export function createServer(options: ServerOptions = {}): McpServer {
           warnings: report.warnings,
           dockerfile: report.dockerfile,
           compose: report.compose,
-          ...(!model && tokenBudget > 0 && { note: 'No ANTHROPIC_API_KEY in the server environment, so only known fixes were tried.' }),
+          ...(!model && tokenBudget > 0 && { note: 'No ANTHROPIC_API_KEY in the server environment or ~/.necromancer/.env, so only known fixes were tried.' }),
           ...(save && (await saveNote('resurrect', report))),
         });
       } catch (err) {
@@ -335,7 +335,7 @@ export function createServer(options: ServerOptions = {}): McpServer {
             error: s.response.error,
             body: truncate(JSON.stringify(s.response.body) ?? 'null', 400),
           })),
-          ...(!model && { note: 'No ANTHROPIC_API_KEY in the server environment, so each route got one placeholder request.' }),
+          ...(!model && { note: 'No ANTHROPIC_API_KEY in the server environment or ~/.necromancer/.env, so each route got one placeholder request.' }),
           ...(save && (await saveNote('witness', report))),
         });
       } catch (err) {
