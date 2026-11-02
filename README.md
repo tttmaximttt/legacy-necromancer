@@ -186,40 +186,16 @@ gateway too. The gateway has to pass requests to Anthropic unchanged,
 including beta headers and the model name `claude-opus-5-5`. Other
 providers, such as Bedrock, Vertex or OpenAI, aren't supported yet.
 
-## Design
-
-A pipeline in which only two steps are agents and two make a single model
-call. Everything else is deterministic, seeded, and testable without an LLM;
-the model call is tested against a scripted model, so no API key is needed.
-
-| Phase | Package | Kind | Status |
-| --- | --- | --- | --- |
-| 1. Excavate | [`excavate`](packages/excavate) | deterministic | **working** |
-| 2. Date + Graveyard | [`graveyard`](packages/graveyard) | deterministic | **working** |
-| 3. Map | [`ui`](packages/ui) | UI | **working** |
-| 4. Interview | [`interview`](packages/interview) | one structured LLM call + the user | **working** |
-| 5. Resurrect | [`resurrect`](packages/resurrect) | agent (known-fix table first) | **working** |
-| 6. Witness | [`witness`](packages/witness) | deterministic, inputs from one LLM call | **working** |
-| Stretch: Operate | [`surgeon`](packages/surgeon) | agent | stub |
-
-Shared code lives in [`core`](packages/core) (report types, seeded RNG) and
-[`llm`](packages/llm) (structured-output Claude client, plus a scripted
-model for tests). The command line is
-[`cli`](packages/cli), and the MCP server is [`mcp`](packages/mcp).
-
-Phases 1 to 3 are the first demo: no Docker, no LLM, just "here's what this
-dead repo is and what's rotting in it".
-
 ## Commands
 
 | Command | Does |
 | --- | --- |
 | `autopsy <repo> [--open]` | `exhume` + `graveyard`, saves both, optionally opens the UI |
-| `exhume <repo> [--save]` | Phase 1 architecture report (JSON) |
-| `graveyard <repo> [--save]` | Phase 2 era + dependency report (JSON) |
-| `interview <repo>` | Phase 4: Claude proposes what the repo is for, with file:line evidence; you confirm or correct it and pick goals |
-| `resurrect <repo>` | Phase 5: builds and boots it in Docker on its era's Node, fixing failures until it runs or is `BLOCKED` |
-| `witness <repo> [--check]` | Phase 6: calls every route on the revived app and records normalized golden snapshots, runs its tests; `--check` compares a new run |
+| `exhume <repo> [--save]` | Architecture report (JSON) |
+| `graveyard <repo> [--save]` | Era and dependency report (JSON) |
+| `interview <repo>` | Claude proposes what the repo is for, with file:line evidence; you confirm or correct it and pick goals |
+| `resurrect <repo>` | Builds and boots it in Docker on its era's Node, fixing failures until it runs or is `BLOCKED` |
+| `witness <repo> [--check]` | Calls every route on the revived app and records normalized golden snapshots, runs its tests; `--check` compares a new run |
 | `ui [--open]` | Serves the UI over saved reports on localhost |
 | `mcp` | Runs the MCP server on stdio, for Claude Code or any MCP client |
 
@@ -296,8 +272,8 @@ suggested goals by number and add your own. Later stages read the result
 
 ```sh
 export ANTHROPIC_API_KEY=…   # or see "Setting your API key"
-pnpm necromancer interview https://github.com/tttmaximttt/node-orm2              # asks interactively
-pnpm necromancer interview --reuse <repo> --yes --accept-goals 1,2 --goal "…"   # or answer with flags
+necromancer interview https://github.com/tttmaximttt/node-orm2              # asks interactively
+necromancer interview --reuse <repo> --yes --accept-goals 1,2 --goal "…"   # or answer with flags
 ```
 
 It uses `claude-opus-5-5` at medium effort by default (`--model`,
@@ -320,7 +296,7 @@ then from Claude. It stops after 10 attempts, at a token budget, or when no
 fix applies, with `BLOCKED: <reason>`.
 
 ```sh
-pnpm necromancer resurrect https://github.com/owner/old-app --out-dir ./revived
+necromancer resurrect https://github.com/owner/old-app --out-dir ./revived
 ```
 
 `--out-dir` also writes `Dockerfile.necromancer` and
@@ -340,9 +316,9 @@ identical requests blanked. The project's own `test` script runs next to the
 app.
 
 ```sh
-pnpm necromancer witness https://github.com/owner/old-app
+necromancer witness https://github.com/owner/old-app
 # later, after changing something:
-pnpm necromancer witness https://github.com/owner/old-app --check
+necromancer witness https://github.com/owner/old-app --check
 ```
 
 `--check` re-sends the saved requests, prints what changed (status, headers,
@@ -358,34 +334,5 @@ and CPU, memory, process and time limits on everything.
 Witness runs the app in the same sandbox and sends requests to it from
 inside. Interview sends the files it picked (up to about 2,400 lines) to the
 Anthropic API, and Witness sends about 30 lines around each route handler;
-don't run them on code you can't share with it. Operate must follow the same
-rules, and none of it should ever point at shared environments or
-production.
-
-## Development
-
-Node 22+, pnpm 10.
-
-```sh
-pnpm build        # tsc -b across all packages
-pnpm test         # vitest
-pnpm necromancer  # run the built CLI
-```
-
-Inside this repo, Claude Code picks up the local MCP server from `.mcp.json`
-after `pnpm build`.
-
-### Releasing
-
-The npm package is [`packages/legacy-necromancer`](packages/legacy-necromancer):
-the CLI and MCP server bundled into one file. To release:
-
-1. Bump `version` in `packages/legacy-necromancer/package.json`, commit,
-   then tag and push: `git tag v0.1.1 && git push origin v0.1.1`. The
-   release workflow builds, tests, runs the packed package end to end and
-   publishes to npm. It needs an `NPM_TOKEN` repository secret.
-2. Once it's on npm, point the plugin at it and commit:
-   `node .github/scripts/plugin-version.mjs set 0.1.1`.
-
-The plugin installs from `main`, so it must only ever run a version that is
-already published. CI fails if it points at one that isn't.
+don't run them on code you can't share with it. Don't point any of it at
+shared environments or production.
