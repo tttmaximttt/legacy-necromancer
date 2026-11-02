@@ -59,24 +59,28 @@ confuses the agent.
 
 ## Setup
 
-Build first, from the repo root:
+The easiest way is the Claude Code plugin, which also adds `/necromancer:autopsy`
+and the other slash commands:
 
-```sh
-pnpm install && pnpm build
+```text
+/plugin marketplace add tttmaximttt/legacy-necromancer
+/plugin install necromancer@legacy-necromancer
 ```
 
-### Claude Code
-
-Inside this repo, it's already configured: the root `.mcp.json` registers the
-server, and Claude Code asks you to approve it the first time.
-
-To use it from any directory:
+### Claude Code, server only
 
 ```sh
-claude mcp add --scope user necromancer -- node /absolute/path/to/necromancer/packages/mcp/dist/bin.js
+claude mcp add --scope user necromancer -- npx -y legacy-necromancer mcp
 ```
 
-Check it with `claude mcp list`, or with `/mcp` inside a session.
+To let Claude write fixes and test inputs from inside the tools, pass your key:
+add `-e ANTHROPIC_API_KEY=sk-ant-...` before the `--`. Without it, `interview`
+lets the Claude you're talking to write the proposal itself, and `resurrect`
+and `witness` use known fixes and placeholder requests.
+
+Check it with `claude mcp list`, or with `/mcp` inside a session. Inside this
+repo it's already configured: after `pnpm build`, the root `.mcp.json` runs the
+local build.
 
 ### Claude Desktop
 
@@ -87,18 +91,18 @@ Open **Settings → Developer → Edit Config** and add the server to
 {
   "mcpServers": {
     "necromancer": {
-      "command": "node",
-      "args": ["/absolute/path/to/necromancer/packages/mcp/dist/bin.js"]
+      "command": "npx",
+      "args": ["-y", "legacy-necromancer", "mcp"]
     }
   }
 }
 ```
 
 Restart Claude Desktop. If the tool fails with `spawn git ENOENT` or
-`spawn node ENOENT`, the app can't see your shell's `PATH`. Use the absolute
-path to `node` as the `command` (`which node`), and add
+`spawn npx ENOENT`, the app can't see your shell's `PATH`. Use the absolute
+path to `npx` as the `command` (`which npx`), and add
 `"env": { "PATH": "/usr/local/bin:/usr/bin:/bin" }`, adjusted to wherever
-`git` lives.
+`git` and `node` live.
 
 ### Behind a proxy
 

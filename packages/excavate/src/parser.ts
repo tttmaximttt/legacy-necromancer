@@ -1,4 +1,7 @@
+import { existsSync } from 'node:fs';
 import { createRequire } from 'node:module';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { Language, Parser, type Node } from 'web-tree-sitter';
 import type { ImportKind, RawImport, RawMount, RawRoute, SourceLanguage } from '@necromancer/core';
 
@@ -9,6 +12,16 @@ const GRAMMARS: Record<SourceLanguage, string> = {
   typescript: 'tree-sitter-typescript/tree-sitter-typescript.wasm',
   tsx: 'tree-sitter-typescript/tree-sitter-tsx.wasm',
 };
+
+/**
+ * The published npm bundle ships the grammar .wasm files in `grammars/` next to itself, so the tree-sitter
+ * grammar packages (which carry node-gyp install scripts) need not be installed; in the workspace they resolve
+ * from node_modules.
+ */
+function grammarPath(lang: SourceLanguage): string {
+  const bundled = path.join(path.dirname(fileURLToPath(import.meta.url)), 'grammars', path.basename(GRAMMARS[lang]));
+  return existsSync(bundled) ? bundled : require.resolve(GRAMMARS[lang]);
+}
 
 const EXTENSIONS: Record<string, SourceLanguage> = {
   '.js': 'javascript',
@@ -47,7 +60,7 @@ export class ImportParser {
     const entries = await Promise.all(
       (Object.keys(GRAMMARS) as SourceLanguage[]).map(async (lang) => {
         const parser = new Parser();
-        parser.setLanguage(await Language.load(require.resolve(GRAMMARS[lang])));
+        parser.setLanguage(await Language.load(grammarPath(lang)));
         return [lang, parser] as const;
       }),
     );

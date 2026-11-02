@@ -17,3 +17,7 @@ jobs:
       - run: pnpm build
       - run: pnpm typecheck
       - run: pnpm test
+      - run: pnpm --filter legacy-necromancer build
+      - run: pnpm --filter legacy-necromancer smoke
+      - name: The plugin runs a version that is on npm
+        run: node .github/scripts/plugin-version.mjs check

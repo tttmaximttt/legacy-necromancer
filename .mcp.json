@@ -2,7 +2,7 @@
   "mcpServers": {
     "necromancer": {
       "command": "node",
-      "args": ["packages/mcp/dist/bin.js"]
+      "args": ["packages/cli/dist/bin.js", "mcp"]
     }
   }
 }

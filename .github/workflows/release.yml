@@ -1,0 +1,36 @@
+name: release
+on:
+  push:
+    tags: ['v*']
+permissions:
+  contents: read
+  id-token: write
+concurrency: release
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          registry-url: https://registry.npmjs.org
+      - name: The tag matches the package version and is on main
+        run: |
+          version="$(node -p "require('./packages/legacy-necromancer/package.json').version")"
+          test "v$version" = "$GITHUB_REF_NAME" || { echo "tag $GITHUB_REF_NAME but package.json says $version"; exit 1; }
+          git merge-base --is-ancestor "$GITHUB_SHA" origin/main || { echo "tag a commit that is on main"; exit 1; }
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm build
+      - run: pnpm typecheck
+      - run: pnpm test
+      - run: pnpm --filter legacy-necromancer build
+      - run: pnpm --filter legacy-necromancer smoke
+      - run: npm publish --provenance
+        working-directory: packages/legacy-necromancer
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
