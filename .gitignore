@@ -5,3 +5,4 @@ coverage/
 .necromancer/
 .claude/worktrees/
 .omc/
+AGENTS.md
