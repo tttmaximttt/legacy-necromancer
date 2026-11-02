@@ -1,0 +1,34 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "rootDir": "src",
+    "outDir": "dist",
+    "tsBuildInfoFile": "dist/.tsbuildinfo"
+  },
+  "include": [
+    "src"
+  ],
+  "references": [
+    {
+      "path": "../core"
+    },
+    {
+      "path": "../excavate"
+    },
+    {
+      "path": "../graveyard"
+    },
+    {
+      "path": "../interview"
+    },
+    {
+      "path": "../llm"
+    },
+    {
+      "path": "../resurrect"
+    },
+    {
+      "path": "../witness"
+    }
+  ]
+}

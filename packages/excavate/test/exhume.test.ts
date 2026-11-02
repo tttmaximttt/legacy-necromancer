@@ -91,6 +91,9 @@ describe('exhume', () => {
       { name: 'should', importedBy: 1 },
     ]);
     expect(report.manifests[0]).toMatchObject({ name: 'old-app', engines: { node: '0.10.x' } });
+    expect(report.graph.edges).toContainEqual(['routes/users.js', 'lib/db.js']);
+    expect(report.graph.nodes.find((n) => n.id === 'test/users.test.js')).toMatchObject({ isTest: true, cluster: -1, score: null });
+    expect(report.graph.nodes.find((n) => n.id === 'lib/db.js')).toMatchObject({ fanIn: 3, churn: 3, blastRadius: 4 });
     expect(report.installScripts).toEqual([
       expect.objectContaining({ packageName: 'old-app', hook: 'postinstall', severity: 'high' }),
     ]);

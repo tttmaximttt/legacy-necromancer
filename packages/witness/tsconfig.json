@@ -11,6 +11,15 @@
   "references": [
     {
       "path": "../core"
+    },
+    {
+      "path": "../excavate"
+    },
+    {
+      "path": "../llm"
+    },
+    {
+      "path": "../resurrect"
     }
   ]
 }

@@ -8,6 +8,12 @@ export default defineConfig({
     alias: {
       '@necromancer/core': pkg('core'),
       '@necromancer/excavate': pkg('excavate'),
+      '@necromancer/mcp': pkg('mcp'),
+      '@necromancer/graveyard': pkg('graveyard'),
+      '@necromancer/llm': pkg('llm'),
+      '@necromancer/interview': pkg('interview'),
+      '@necromancer/resurrect': pkg('resurrect'),
+      '@necromancer/witness': pkg('witness'),
     },
   },
   test: {

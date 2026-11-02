@@ -1,4 +1,4 @@
-export { exhume, detectPackageManager, isTestFile, type ExhumeOptions } from './exhume.js';
+export { exhume, applyMounts, detectPackageManager, headCommit, isTestFile, type ExhumeOptions } from './exhume.js';
 export { checkout, type Checkout } from './clone.js';
 export { listRepoFiles, isIgnoredPath } from './files.js';
 export { ImportParser, languageFor, SOURCE_EXTENSIONS, type ParsedSource } from './parser.js';

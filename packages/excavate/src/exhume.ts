@@ -1,13 +1,13 @@
 import { readFile } from 'node:fs/promises';
 import path from 'node:path';
 import { simpleGit } from 'simple-git';
-import type { ExhumeReport, SourceFile } from '@necromancer/core';
+import type { ExhumeReport, HttpRoute, ImportGraphData, RawMount, RawRoute, RepoHistory, SourceFile } from '@necromancer/core';
 import { readHistory } from './churn.js';
 import { checkout } from './clone.js';
 import { isTooLarge, listRepoFiles } from './files.js';
-import { analyzeGraph, buildImportGraph } from './graph.js';
+import { analyzeGraph, buildImportGraph, type GraphAnalysis, type ImportGraph } from './graph.js';
 import { auditManifests } from './install-scripts.js';
-import { ImportParser, languageFor } from './parser.js';
+import { ImportParser, joinRoute, languageFor } from './parser.js';
 import { ImportResolver } from './resolve.js';
 
 export interface ExhumeOptions {
@@ -38,6 +38,8 @@ export async function exhume(source: string, options: ExhumeOptions = {}): Promi
     const parser = await ImportParser.create();
     const resolver = new ImportResolver(allFiles, await readMains(repo.root, allFiles));
     const files: SourceFile[] = [];
+    const routesByFile = new Map<string, RawRoute[]>();
+    const mountsByFile = new Map<string, Array<RawMount & { target: string }>>();
     try {
       for (const rel of sourcePaths) {
         const abs = path.join(repo.root, rel);
@@ -53,6 +55,12 @@ export async function exhume(source: string, options: ExhumeOptions = {}): Promi
           isTest: isTestFile(rel),
           imports: parsed.imports.map((imp) => resolver.resolve(rel, imp)),
         });
+        if (parsed.routes.length && !isTestFile(rel)) routesByFile.set(rel, parsed.routes);
+        const mounts = parsed.mounts.flatMap((m) => {
+          const r = resolver.resolve(rel, { specifier: m.specifier, kind: 'require', line: m.line });
+          return r.type === 'internal' ? [{ ...m, target: r.target }] : [];
+        });
+        if (mounts.length) mountsByFile.set(rel, mounts);
       }
     } finally {
       parser.dispose();
@@ -117,12 +125,65 @@ export async function exhume(source: string, options: ExhumeOptions = {}): Promi
       caseMismatches,
       manifests,
       installScripts: findings,
+      graph: graphData(graph, analysis, history.files),
+      routes: applyMounts(routesByFile, mountsByFile),
     };
     if (options.keep) report.root = repo.root;
     return report;
   } finally {
     if (!options.keep) await repo.cleanup();
   }
+}
+
+function graphData(graph: ImportGraph, analysis: GraphAnalysis, churn: RepoHistory['files']): ImportGraphData {
+  const ranked = new Map(analysis.ranked.map((f) => [f.path, f]));
+  const clusterOf = new Map<string, number>();
+  for (const c of analysis.clusters) for (const f of c.files) clusterOf.set(f, c.id);
+  return {
+    nodes: graph.mapNodes((id, attrs) => ({
+      id,
+      cluster: clusterOf.get(id) ?? -1,
+      loc: attrs.loc,
+      isTest: attrs.isTest,
+      fanIn: graph.inDegree(id),
+      fanOut: graph.outDegree(id),
+      score: ranked.get(id)?.score ?? null,
+      blastRadius: ranked.get(id)?.blastRadius ?? null,
+      churn: churn[id]?.commits ?? 0,
+    })),
+    edges: graph.mapEdges((_e, _a, source, target) => [source, target] as [string, string]),
+  };
+}
+
+/**
+ * Prefixes each file's routes with the paths it is mounted under (`app.use('/api', require('./api'))`),
+ * following mounts of mounts. A file that is never mounted serves its routes as written.
+ */
+export function applyMounts(routesByFile: Map<string, RawRoute[]>, mountsByFile: Map<string, Array<RawMount & { target: string }>>): HttpRoute[] {
+  const mountedAt = new Map<string, Array<{ from: string; prefix: string }>>();
+  for (const [from, mounts] of mountsByFile) {
+    for (const m of mounts) mountedAt.set(m.target, [...(mountedAt.get(m.target) ?? []), { from, prefix: m.prefix }]);
+  }
+  const prefixes = (file: string, depth: number): string[] => {
+    const parents = mountedAt.get(file);
+    if (!parents || depth > 5) return [''];
+    return parents.flatMap((p) => prefixes(p.from, depth + 1).map((outer) => joinRoute(outer, p.prefix)));
+  };
+  const out: HttpRoute[] = [];
+  const seen = new Set<string>();
+  for (const [file, routes] of [...routesByFile].sort(([a], [b]) => a.localeCompare(b))) {
+    for (const prefix of prefixes(file, 0)) {
+      for (const r of routes) {
+        const route = { method: r.method, path: joinRoute(prefix, r.path), file, line: r.line };
+        const key = `${route.method} ${route.path}`;
+        if (!seen.has(key)) {
+          seen.add(key);
+          out.push(route);
+        }
+      }
+    }
+  }
+  return out;
 }
 
 export function isTestFile(file: string): boolean {
@@ -148,7 +209,7 @@ function countLines(text: string): number {
   return text.split('\n').filter((l) => l.trim()).length;
 }
 
-async function headCommit(root: string): Promise<string | null> {
+export async function headCommit(root: string): Promise<string | null> {
   try {
     return (await simpleGit(root).revparse(['HEAD'])).trim();
   } catch {

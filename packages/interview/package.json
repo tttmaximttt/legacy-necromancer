@@ -1,0 +1,25 @@
+{
+  "name": "@necromancer/interview",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Phase 4: propose what a repo is for, with file:line evidence, and record the user's confirmation and goals.",
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -b"
+  },
+  "dependencies": {
+    "@necromancer/core": "workspace:*",
+    "@necromancer/excavate": "workspace:*",
+    "@necromancer/llm": "workspace:*",
+    "zod": "^4.6.7"
+  }
+}

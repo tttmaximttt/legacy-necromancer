@@ -1,0 +1,33 @@
+{
+  "name": "@necromancer/mcp",
+  "version": "0.0.0",
+  "private": true,
+  "description": "MCP server that lets Claude (or any MCP client) run Necromancer stages as tools.",
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "bin": {
+    "necromancer-mcp": "./dist/bin.js"
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -b"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.32.2",
+    "@necromancer/core": "workspace:*",
+    "@necromancer/excavate": "workspace:*",
+    "zod": "^4.6.7",
+    "@necromancer/graveyard": "workspace:*",
+    "@necromancer/interview": "workspace:*",
+    "@necromancer/llm": "workspace:*",
+    "@necromancer/resurrect": "workspace:*",
+    "@necromancer/witness": "workspace:*"
+  }
+}

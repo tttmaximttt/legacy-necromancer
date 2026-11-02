@@ -11,6 +11,28 @@ export interface RawImport {
   line: number;
 }
 
+/** An HTTP route registration found in source, e.g. `router.get('/users/:id', …)`. */
+export interface RawRoute {
+  method: string;
+  path: string;
+  line: number;
+}
+
+/** `app.use('/api', target)`: routes registered in `specifier` are served under `prefix`. */
+export interface RawMount {
+  prefix: string;
+  specifier: string;
+  line: number;
+}
+
+/** A route with any mount prefixes applied. `method` is upper-case, or ALL. */
+export interface HttpRoute {
+  method: string;
+  path: string;
+  file: string;
+  line: number;
+}
+
 export type ResolvedImport =
   /** `caseMismatch`: only resolves on a case-insensitive filesystem (macOS, Windows). */
   | { type: 'internal'; target: string; raw: RawImport; caseMismatch?: boolean }
@@ -116,4 +138,322 @@ export interface ExhumeReport {
   caseMismatches: Array<{ from: string; specifier: string; line: number; target: string }>;
   manifests: DependencySummary[];
   installScripts: InstallScriptFinding[];
+  /** The whole import graph, for the UI. Left out of MCP summaries. */
+  graph: ImportGraphData;
+  /** HTTP routes registered with Express-style or Hapi-style calls. Missing in reports from before phase 6. */
+  routes?: HttpRoute[];
+}
+
+export interface GraphNode {
+  id: string;
+  /** -1 for files left out of clustering (tests, orphans). */
+  cluster: number;
+  loc: number;
+  isTest: boolean;
+  fanIn: number;
+  fanOut: number;
+  /** Load-bearing score; null for files that weren't ranked (tests by default). */
+  score: number | null;
+  blastRadius: number | null;
+  churn: number;
+}
+
+export interface ImportGraphData {
+  nodes: GraphNode[];
+  /** [importer, imported] */
+  edges: Array<[string, string]>;
+}
+
+// ── Phase 2: Date & Graveyard ────────────────────────────────────────────
+
+export interface EraEstimate {
+  /** First commit, if there is history. */
+  born: string | null;
+  /** Last commit: when the project stopped moving. */
+  died: string | null;
+  /**
+   * Earliest date the manifest as written could exist: the newest publish
+   * date among the minimum versions its ranges allow.
+   */
+  dependencyFloor: { date: string; package: string; version: string } | null;
+  /** The Node release the `engines.node` range targets. */
+  node: { range: string; release: string; released: string } | null;
+  /** Best guess at the year–month the code is from. */
+  estimate: string | null;
+  confidence: 'high' | 'medium' | 'low' | 'none';
+  summary: string;
+}
+
+/** dead: deprecated, archived or gone. dying: unmaintained. ailing: works but vulnerable or far behind. */
+export type TombstoneStatus = 'dead' | 'dying' | 'ailing' | 'alive' | 'unknown';
+
+export type CauseKind = 'deprecated' | 'archived' | 'missing' | 'abandoned' | 'vulnerable' | 'outdated';
+
+export interface Cause {
+  kind: CauseKind;
+  detail: string;
+}
+
+export interface Advisory {
+  id: string;
+  title: string;
+  severity: 'critical' | 'high' | 'moderate' | 'low' | 'unknown';
+  url: string | null;
+  /** Affected range when the source provides one. */
+  vulnerableVersions: string | null;
+}
+
+export interface Replacement {
+  name: string;
+  reason: string;
+  /** Where the suggestion came from: our curated table, or the deprecation message itself. */
+  source: 'known' | 'deprecation-message';
+}
+
+export interface Tombstone {
+  name: string;
+  /** Range from package.json. */
+  declared: string;
+  dev: boolean;
+  /** Version the project actually used, best effort. */
+  resolved: string | null;
+  /** lockfile: pinned. era: newest matching version published before the last commit. latest: newest matching version today. */
+  resolvedFrom: 'lockfile' | 'era' | 'latest' | null;
+  latest: string | null;
+  /** Majors between resolved and latest. */
+  majorsBehind: number | null;
+  lastPublished: string | null;
+  repository: string | null;
+  status: TombstoneStatus;
+  causes: Cause[];
+  advisories: Advisory[];
+  replacement: Replacement | null;
+  /** One line, for the UI. */
+  epitaph: string;
+}
+
+export type SourceStatus = 'ok' | 'partial' | 'failed' | 'skipped';
+
+export interface GraveyardReport {
+  repo: { source: string; commit: string | null };
+  era: EraEstimate;
+  summary: Record<TombstoneStatus, number> & { total: number; vulnerable: number };
+  tombstones: Tombstone[];
+  /** Which lookups worked. A `failed` source means its causes are missing, not absent. */
+  sources: { registry: SourceStatus; advisories: SourceStatus; advisoryProvider: string; github: SourceStatus };
+  /** Dependencies that aren't on the registry (git, file:, tarball URLs). */
+  nonRegistry: Array<{ name: string; spec: string }>;
+  warnings: string[];
+}
+
+/** A span of a repo file the model points at to back a claim. Line numbers are 1-based and inclusive. */
+export interface Citation {
+  file: string;
+  startLine: number;
+  endLine: number;
+  /** A short excerpt the model says is on those lines. */
+  quote: string;
+  /** Whether the quote really is on those lines of that file at the analysed commit. */
+  verified: boolean;
+}
+
+export interface IntentClaim {
+  claim: string;
+  evidence: Citation[];
+}
+
+/** What the project seems to be for, as proposed by the model (or the agent hosting the MCP server). */
+export interface IntentProposal {
+  /** One or two sentences: what it is and who it is for. */
+  summary: string;
+  /** What it does, each backed by citations. */
+  capabilities: IntentClaim[];
+  /** Constraints a revival must respect: public API, supported runtimes, file formats, protocols. */
+  constraints: IntentClaim[];
+  suggestedGoals: string[];
+  /** What the evidence couldn't settle; worth asking the user. */
+  openQuestions: string[];
+  confidence: 'high' | 'medium' | 'low';
+}
+
+export interface InterviewGoal {
+  text: string;
+  origin: 'suggested' | 'user';
+}
+
+/**
+ * Phase 4: the repo's intent, proposed from evidence and then confirmed or corrected by the user, plus the goals
+ * later stages work towards. `intent` is the version later stages should trust.
+ */
+export interface InterviewReport {
+  repo: { source: string; commit: string | null };
+  generatedAt: string;
+  proposedBy: { kind: 'claude-api'; model: string; fellBack: boolean } | { kind: 'host'; name: string };
+  /** Files shown to the model, and how much of each. */
+  evidence: Array<{ path: string; lines: number; truncated: boolean }>;
+  proposal: IntentProposal;
+  status: 'proposed' | 'confirmed' | 'corrected';
+  /** The user's correction when status is "corrected", otherwise the proposal's summary. */
+  intent: string;
+  corrections: string | null;
+  goals: InterviewGoal[];
+  answeredAt: string | null;
+  warnings: string[];
+}
+
+// ── Phase 5: Resurrect ───────────────────────────────────────────────────
+
+export type ServiceKind = 'mongo' | 'redis' | 'postgres' | 'mysql' | 'rabbitmq' | 'elasticsearch' | 'memcached';
+
+export interface DetectedService {
+  kind: ServiceKind;
+  image: string;
+  /** Why we think the app needs it: a package name or a connection string. */
+  evidence: string[];
+  /** Variables pointing the app at it; services share the app's localhost. */
+  env: Record<string, string>;
+}
+
+/** Hard limits on every container Resurrect starts. */
+export interface SandboxLimits {
+  cpus: number;
+  memoryMb: number;
+  pids: number;
+  /** Per build, build-script or boot step. */
+  stepTimeoutSec: number;
+}
+
+/** One change to the build recipe. Fixes, known or proposed by the model, are lists of these. */
+export type RecipeOp =
+  | { op: 'setNodeImage'; tag: string }
+  | { op: 'aptInstall'; packages: string[] }
+  | { op: 'useDebianArchive' }
+  | { op: 'setEnv'; name: string; value: string }
+  | { op: 'setDependency'; name: string; version: string; dev?: boolean }
+  | { op: 'removeDependency'; name: string }
+  | { op: 'addInstallFlags'; flags: string[] }
+  | { op: 'dropLockfile' }
+  | { op: 'globalInstall'; spec: string }
+  | { op: 'runBeforeInstall'; command: string }
+  | { op: 'setBuildCommand'; command: string | null }
+  | { op: 'setStartCommand'; command: string | null }
+  | { op: 'setPort'; port: number | null };
+
+/** Everything the generated Dockerfile is rendered from. The repo itself is never edited. */
+export interface BuildRecipe {
+  nodeImage: string;
+  packageManager: 'npm' | 'yarn' | 'pnpm';
+  debianArchive: boolean;
+  aptPackages: string[];
+  env: Record<string, string>;
+  globalInstalls: string[];
+  beforeInstall: string[];
+  /** Run `bower install` after npm, for front ends from the bower era. */
+  bower: boolean;
+  installFlags: string[];
+  dropLockfile: boolean;
+  /** Edits to package.json in the build context. null removes the dependency. */
+  dependencyPatches: Record<string, { version: string | null; dev: boolean }>;
+  buildCommand: string | null;
+  startCommand: string | null;
+  port: number | null;
+}
+
+export type ResurrectPhase = 'install' | 'build' | 'boot';
+
+export interface AppliedFix {
+  source: 'known' | 'cache' | 'llm';
+  id: string;
+  description: string;
+  ops: RecipeOp[];
+}
+
+export interface ResurrectAttempt {
+  n: number;
+  /** Where it got to: the phase that failed, or "boot" on success. */
+  phase: ResurrectPhase;
+  ok: boolean;
+  durationMs: number;
+  /** Stable hash of the error, for caching fixes and spotting loops. */
+  signature: string | null;
+  /** The last lines of the failing step's log. */
+  errorExcerpt: string | null;
+  /** The fix applied after this attempt failed. */
+  fix: AppliedFix | null;
+}
+
+export interface ResurrectReport {
+  repo: { source: string; commit: string | null };
+  generatedAt: string;
+  outcome: 'resurrected' | 'blocked';
+  /** Set when blocked: the "BLOCKED: <reason>" line, without the prefix. */
+  blockedReason: string | null;
+  /** How it was judged alive: a port answering, a log line, or (for libraries) a clean install and build. */
+  health: { kind: 'port' | 'log' | 'library'; detail: string } | null;
+  era: { date: string | null; node: string; why: string };
+  services: DetectedService[];
+  recipe: BuildRecipe;
+  dockerfile: string;
+  compose: string;
+  limits: SandboxLimits;
+  attempts: ResurrectAttempt[];
+  llm: { model: string | null; calls: number; tokens: number; budget: number };
+  warnings: string[];
+}
+
+// ── Phase 6: Witness ─────────────────────────────────────────────────────
+
+/** One request to send to the revived app. `route` is the pattern it exercises, e.g. "GET /users/:id". */
+export interface WitnessCase {
+  route: string;
+  name: string;
+  method: string;
+  /** Concrete path with parameters filled in, and any query string. */
+  path: string;
+  headers: Record<string, string>;
+  /** Raw request body, usually JSON. */
+  body: string | null;
+}
+
+export interface WitnessResponse {
+  status: number | null;
+  /** Only headers whose value is behaviour, normalized: content-type, location, cache-control, set-cookie names… */
+  headers: Record<string, string>;
+  /** JSON bodies are parsed and normalized; anything else is normalized text. */
+  body: unknown;
+  /** Set when the request never got a response: connection refused, timeout. */
+  error: string | null;
+}
+
+export interface WitnessSnapshot {
+  case: WitnessCase;
+  response: WitnessResponse;
+  /** JSON paths that changed between two identical requests and were blanked as `<volatile>`. */
+  volatile: string[];
+}
+
+export interface WitnessTestRun {
+  command: string;
+  ok: boolean;
+  /** e.g. "42 passing, 1 failing" when the runner's summary line is recognised. */
+  summary: string | null;
+  durationMs: number;
+  logTail: string;
+}
+
+/**
+ * Phase 6: golden snapshots of how the revived app answers every route found by Exhume, plus the result of
+ * its own tests. Later upgrades must reproduce these.
+ */
+export interface WitnessReport {
+  repo: { source: string; commit: string | null };
+  generatedAt: string;
+  /** The image and start command the snapshots were taken against. */
+  target: { nodeImage: string; startCommand: string | null; services: string[] };
+  routes: { found: number; exercised: number; skipped: Array<{ route: string; reason: string }> };
+  /** `replay` when a check re-sent a golden run's requests. */
+  inputs: { source: 'claude-api' | 'default' | 'replay'; model: string | null; tokens: number };
+  snapshots: WitnessSnapshot[];
+  tests: WitnessTestRun | null;
+  warnings: string[];
 }

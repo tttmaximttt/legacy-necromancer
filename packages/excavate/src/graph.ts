@@ -29,6 +29,8 @@ export function buildImportGraph(files: SourceFile[]): ImportGraph {
 export interface GraphAnalysis {
   clusters: ModuleCluster[];
   loadBearing: LoadBearingFile[];
+  /** Every analysed file with its score components, best first; `loadBearing` is the top of this. */
+  ranked: LoadBearingFile[];
   orphans: string[];
 }
 
@@ -68,7 +70,7 @@ export function analyzeGraph(fullGraph: ImportGraph, options: AnalyzeOptions = {
   const maxBlast = max([...blast.values()]);
   const maxChurn = max(nodes.map((n) => Math.log1p(churn[n]?.commits ?? 0)));
 
-  const loadBearing = nodes
+  const ranked = nodes
     .map((node): LoadBearingFile => {
       const b = betweenness[node] ?? 0;
       const fanIn = graph.inDegree(node);
@@ -89,11 +91,10 @@ export function analyzeGraph(fullGraph: ImportGraph, options: AnalyzeOptions = {
         cluster: clusterOf.get(node) ?? -1,
       };
     })
-    .filter((f) => f.fanIn + f.fanOut > 0)
-    .sort((a, b) => b.score - a.score || a.path.localeCompare(b.path))
-    .slice(0, top);
+    .sort((a, b) => b.score - a.score || a.path.localeCompare(b.path));
+  const loadBearing = ranked.filter((f) => f.fanIn + f.fanOut > 0).slice(0, top);
 
-  return { clusters, loadBearing, orphans };
+  return { clusters, loadBearing, ranked, orphans };
 }
 
 /** Number of files that reach `node` by following imports backwards. */
