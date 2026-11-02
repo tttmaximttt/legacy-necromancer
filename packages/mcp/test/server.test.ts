@@ -1,4 +1,4 @@
-import { mkdtemp, mkdir, writeFile } from 'node:fs/promises';
+import { mkdtemp, mkdir, readFile, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
@@ -25,6 +25,12 @@ const text = (result: Awaited<ReturnType<Client['callTool']>>) =>
   (result.content as Array<{ type: string; text: string }>)[0]!.text;
 
 describe('necromancer MCP server', () => {
+  it('reports the version of the package it ships in', async () => {
+    const { version } = JSON.parse(await readFile(new URL('../package.json', import.meta.url), 'utf8')) as { version: string };
+    const client = await connect();
+    expect(client.getServerVersion()).toEqual({ name: 'necromancer', version });
+  });
+
   it('lists the tools and the autopsy prompt', async () => {
     const client = await connect();
     const { tools } = await client.listTools();

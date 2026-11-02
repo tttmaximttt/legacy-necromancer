@@ -26,8 +26,7 @@
     "@necromancer/llm": "workspace:*",
     "@necromancer/resurrect": "workspace:*",
     "@necromancer/witness": "workspace:*",
-    "@necromancer/mcp": "workspace:*",
-    "@modelcontextprotocol/sdk": "^1.32.2"
+    "@necromancer/mcp": "workspace:*"
   },
   "bin": {
     "necromancer": "./dist/bin.js"

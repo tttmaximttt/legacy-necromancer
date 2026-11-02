@@ -1,15 +1,14 @@
 import { spawn } from 'node:child_process';
-import { existsSync } from 'node:fs';
+import { existsSync, readdirSync } from 'node:fs';
 import { mkdir, writeFile } from 'node:fs/promises';
 import type { AddressInfo } from 'node:net';
 import { createRequire } from 'node:module';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
-import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { Command } from 'commander';
 import { ReportStore, slugFor, type ReportKind } from '@necromancer/core';
 import { exhume } from '@necromancer/excavate';
-import { createServer as createMcpServer } from '@necromancer/mcp';
+import { runStdio } from '@necromancer/mcp';
 import { graveyard } from '@necromancer/graveyard';
 import { ClaudeModel, DEFAULT_MODEL, hasCredentials, type Effort, type StructuredModel } from '@necromancer/llm';
 import { DEFAULT_LIMITS, DEFAULT_MAX_ITERATIONS, DEFAULT_TOKEN_BUDGET, DockerSandbox, FixCache, resurrect, type Sandbox } from '@necromancer/resurrect';
@@ -324,10 +323,7 @@ BLOCKED: ${report.blockedReason}
     .command('mcp')
     .description('Run the MCP server on stdio, for Claude Code or any other MCP client.')
     .option('-w, --workdir <dir>', 'where to clone remote repos', process.env.NECROMANCER_WORKDIR)
-    .action(async (opts: { workdir?: string }) => {
-      // stdout carries the MCP protocol, so nothing else may write to it.
-      await createMcpServer({ workdir: opts.workdir }).connect(new StdioServerTransport());
-    });
+    .action((opts: { workdir?: string }) => runStdio({ workdir: opts.workdir }));
 
   program
     .command('ui')
@@ -359,28 +355,53 @@ async function emit(kind: ReportKind, report: Parameters<ReportStore['save']>[1]
   else if (!opts.save) process.stdout.write(json);
 }
 
-/** The version of the package this file was installed from: the npm package once bundled, else the workspace's. */
-function packageVersion(): string {
-  return (createRequire(import.meta.url)('../package.json') as { version: string }).version;
+/** The name the CLI is published under on npm; the workspace packages are all @necromancer/*. */
+export const PUBLISHED_PACKAGE = 'legacy-necromancer';
+
+/** The package this file was installed from: the npm package once bundled, else the workspace's cli package. */
+function ownPackage(): { name: string; version: string } {
+  return createRequire(import.meta.url)('../package.json') as { name: string; version: string };
 }
 
-/** Built UI assets shipped by @necromancer/ui, or null if it hasn't been built. */
+function packageVersion(): string {
+  return ownPackage().version;
+}
+
+/** A built UI: an index.html and the assets it loads. */
+export function isUiBuild(dir: string): boolean {
+  if (!existsSync(path.join(dir, 'index.html'))) return false;
+  try {
+    return readdirSync(path.join(dir, 'assets')).length > 0;
+  } catch {
+    return false;
+  }
+}
+
+/** Built UI assets: the copy next to the npm bundle, else @necromancer/ui's dist, or null if neither is built. */
 export function uiDistDir(): string | null {
   // The npm package bundles the CLI into one file with the UI copied next to it.
   const bundled = path.join(path.dirname(fileURLToPath(import.meta.url)), 'ui');
-  if (existsSync(path.join(bundled, 'index.html'))) return bundled;
+  if (isUiBuild(bundled)) return bundled;
   try {
     const pkg = createRequire(import.meta.url).resolve('@necromancer/ui/package.json');
     const dist = path.join(path.dirname(pkg), 'dist');
-    return existsSync(path.join(dist, 'index.html')) ? dist : null;
+    return isUiBuild(dist) ? dist : null;
   } catch {
     return null;
   }
 }
 
+/** What to tell the user when there is no UI to serve; the fix differs for an npm install and a checkout. */
+export function uiMissingWarning(packageName: string = ownPackage().name): string {
+  return packageName === PUBLISHED_PACKAGE
+    ? `warning: this ${PUBLISHED_PACKAGE} install is missing its UI files; reinstall ${PUBLISHED_PACKAGE}, or report it at ` +
+        'https://github.com/tttmaximttt/legacy-necromancer/issues if that does not fix it. The API still works.\n'
+    : 'warning: UI is not built; run `pnpm build` first. The API still works.\n';
+}
+
 async function serve(opts: { port: number; reports?: string; open?: boolean; slug?: string }): Promise<void> {
   const dist = uiDistDir();
-  if (!dist) process.stderr.write('warning: UI is not built; run `pnpm build` first. The API still works.\n');
+  if (!dist) process.stderr.write(uiMissingWarning());
   const server = createUiServer(new ReportStore(opts.reports), dist);
   let port = opts.port;
   for (;;) {

@@ -1,5 +1,7 @@
+import { createRequire } from 'node:module';
 import path from 'node:path';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
+import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import type { RequestHandlerExtra } from '@modelcontextprotocol/sdk/shared/protocol.js';
 import type { ServerNotification, ServerRequest } from '@modelcontextprotocol/sdk/types.js';
 import { z } from 'zod';
@@ -40,7 +42,7 @@ export function createServer(options: ServerOptions = {}): McpServer {
       return { savedTo: null, saveError: err instanceof Error ? err.message : String(err) };
     }
   };
-  const server = new McpServer({ name: 'necromancer', version: '0.0.0' });
+  const server = new McpServer({ name: 'necromancer', version: serverVersion() });
 
   server.registerTool(
     'exhume',
@@ -368,6 +370,17 @@ export function createServer(options: ServerOptions = {}): McpServer {
   );
 
   return server;
+}
+
+/** Runs the server over stdin/stdout until the client disconnects. */
+export async function runStdio(options: ServerOptions = {}): Promise<void> {
+  // stdout carries the MCP protocol, so nothing else may write to it.
+  await createServer(options).connect(new StdioServerTransport());
+}
+
+/** The version of the package this file was installed from: the npm package once bundled, else the workspace's. */
+export function serverVersion(): string {
+  return (createRequire(import.meta.url)('../package.json') as { version: string }).version;
 }
 
 type ToolExtra = RequestHandlerExtra<ServerRequest, ServerNotification>;
