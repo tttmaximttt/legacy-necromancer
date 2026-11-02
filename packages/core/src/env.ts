@@ -2,6 +2,7 @@ import { readFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { parseEnv } from 'node:util';
+import { errorMessage } from './errors.js';
 
 /** Where Necromancer looks for settings such as ANTHROPIC_API_KEY when they aren't in the environment. */
 export function defaultEnvFile(): string {
@@ -21,7 +22,7 @@ export function readEnvFile(file: string = defaultEnvFile()): Record<string, str
     text = readFileSync(file, 'utf8');
   } catch (err) {
     if ((err as NodeJS.ErrnoException).code === 'ENOENT') return {};
-    throw new Error(`can't read ${file}: ${err instanceof Error ? err.message : String(err)}`, { cause: err });
+    throw new Error(`can't read ${file}: ${errorMessage(err)}`, { cause: err });
   }
   if (text.includes('\u0000')) throw new Error(`can't read ${file}: save it as UTF-8`);
   const vars: Record<string, string> = {};
@@ -40,7 +41,7 @@ export function fileSettings(): Record<string, string> {
     try {
       cached = readEnvFile();
     } catch (err) {
-      process.stderr.write(`necromancer: ignoring settings file: ${err instanceof Error ? err.message : String(err)}\n`);
+      process.stderr.write(`necromancer: ignoring settings file: ${errorMessage(err)}\n`);
       cached = {};
     }
   }

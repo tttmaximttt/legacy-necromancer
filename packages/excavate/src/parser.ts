@@ -170,13 +170,7 @@ function importFrom(node: Node): RawImport | null {
 }
 
 function literal(node: Node | null, kind: ImportKind, at: Node): RawImport | null {
-  if (!node) return null;
-  let specifier: string | null = null;
-  if (node.type === 'string') {
-    specifier = node.text.slice(1, -1);
-  } else if (node.type === 'template_string' && !node.namedChildren.some((c) => c?.type === 'template_substitution')) {
-    specifier = node.text.slice(1, -1);
-  }
+  const specifier = stringValue(node);
   // Computed specifiers (`require(name)`) can't be resolved statically.
   if (!specifier) return null;
   return { specifier, kind, line: at.startPosition.row + 1 };

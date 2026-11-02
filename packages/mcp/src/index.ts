@@ -5,7 +5,7 @@ import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import type { RequestHandlerExtra } from '@modelcontextprotocol/sdk/shared/protocol.js';
 import type { ServerNotification, ServerRequest } from '@modelcontextprotocol/sdk/types.js';
 import { z } from 'zod';
-import { ReportStore, slugFor, type ExhumeReport, type GraveyardReport, type InterviewReport, type ReportKind } from '@necromancer/core';
+import { errorMessage, ReportStore, slugFor, type ExhumeReport, type GraveyardReport, type InterviewReport, type ReportKind } from '@necromancer/core';
 import { exhume as runExhume, type ExhumeOptions } from '@necromancer/excavate';
 import { graveyard as runGraveyard, type GraveyardOptions } from '@necromancer/graveyard';
 import { answerInterview, interviewBrief, proposeIntent, ProposalSchema, recordProposal } from '@necromancer/interview';
@@ -30,6 +30,8 @@ export interface ServerOptions {
 /** Per-cluster file lists and lockfile notes get long on big repos; summaries keep the agent's context small. */
 const SUMMARY_FILES_PER_CLUSTER = 8;
 const SUMMARY_INFO_FINDINGS = 10;
+const SUMMARY_ORPHANS = 20;
+const SUMMARY_EXTERNAL_PACKAGES = 30;
 
 export function createServer(options: ServerOptions = {}): McpServer {
   const exhume = options.exhume ?? runExhume;
@@ -39,9 +41,13 @@ export function createServer(options: ServerOptions = {}): McpServer {
     try {
       return { savedTo: await store.save(kind, report), view: 'Run `necromancer ui` to browse it.' };
     } catch (err) {
-      return { savedTo: null, saveError: err instanceof Error ? err.message : String(err) };
+      return { savedTo: null, saveError: errorMessage(err) };
     }
   };
+  /** Earlier reports for this source, or null when there are none or the store can't be read. */
+  const loadSaved = (source: string) => store.load(slugFor(source)).catch(() => null);
+  const defaultSandbox = () => options.sandbox ?? new DockerSandbox();
+  const defaultModel = () => options.model ?? (hasCredentials() ? new ClaudeModel() : null);
   const server = new McpServer({ name: 'necromancer', version: serverVersion() });
 
   server.registerTool(
@@ -69,7 +75,7 @@ export function createServer(options: ServerOptions = {}): McpServer {
       try {
         const report = await exhume(source, { top, includeTests, workdir: options.workdir, onProgress: progressReporter(extra) });
         const body = { ...(detail === 'full' ? report : summarize(report)), ...(save && (await saveNote('exhume', report))) };
-        return { content: [{ type: 'text', text: JSON.stringify(body, null, 2) }] };
+        return text(body);
       } catch (err) {
         return failure('exhume', err);
       }
@@ -107,7 +113,7 @@ export function createServer(options: ServerOptions = {}): McpServer {
           onProgress: progressReporter(extra),
         });
         const body = { ...(detail === 'full' ? report : summarizeGraveyard(report)), ...(save && (await saveNote('graveyard', report))) };
-        return { content: [{ type: 'text', text: JSON.stringify(body, null, 2) }] };
+        return text(body);
       } catch (err) {
         return failure('graveyard', err);
       }
@@ -136,7 +142,7 @@ export function createServer(options: ServerOptions = {}): McpServer {
     },
     async ({ source, proposer, effort }, extra) => {
       try {
-        const saved = await store.load(slugFor(source)).catch(() => null);
+        const saved = await loadSaved(source);
         const common = { exhume: saved?.exhume, workdir: options.workdir, onProgress: progressReporter(extra) };
         const useApi = proposer === 'claude-api' || (proposer === 'auto' && (options.model !== undefined || hasCredentials()));
         if (!useApi) {
@@ -196,7 +202,7 @@ export function createServer(options: ServerOptions = {}): McpServer {
       try {
         let interview: InterviewReport;
         if (proposal) {
-          const saved = await store.load(slugFor(source)).catch(() => null);
+          const saved = await loadSaved(source);
           interview = (await recordProposal(source, proposal, host, { exhume: saved?.exhume, workdir: options.workdir, onProgress: progressReporter(extra) }))
             .interview;
         } else {
@@ -245,10 +251,10 @@ export function createServer(options: ServerOptions = {}): McpServer {
     },
     async ({ source, maxIterations, tokenBudget, save }, extra) => {
       try {
-        const saved = await store.load(slugFor(source)).catch(() => null);
-        const model = tokenBudget > 0 ? (options.model ?? (hasCredentials() ? new ClaudeModel() : null)) : null;
+        const saved = await loadSaved(source);
+        const model = tokenBudget > 0 ? defaultModel() : null;
         const report = await resurrect(source, {
-          sandbox: options.sandbox ?? new DockerSandbox(),
+          sandbox: defaultSandbox(),
           model,
           maxIterations,
           tokenBudget,
@@ -301,12 +307,12 @@ export function createServer(options: ServerOptions = {}): McpServer {
     },
     async ({ source, check, runTests, save }, extra) => {
       try {
-        const saved = await store.load(slugFor(source)).catch(() => null);
+        const saved = await loadSaved(source);
         if (!saved?.resurrect) throw new Error('No resurrect report for this source; run the `resurrect` tool first.');
         if (check && !saved.witness) throw new Error('No golden snapshots to check against; run `witness` without check first.');
-        const model = check ? null : (options.model ?? (hasCredentials() ? new ClaudeModel() : null));
+        const model = check ? null : defaultModel();
         const report = await witness(source, {
-          sandbox: options.sandbox ?? new DockerSandbox(),
+          sandbox: defaultSandbox(),
           resurrect: saved.resurrect,
           exhume: saved.exhume,
           interview: saved.interview,
@@ -404,7 +410,7 @@ function progressReporter(extra: ToolExtra): ((message: string) => void) | undef
 function failure(tool: string, err: unknown) {
   return {
     isError: true,
-    content: [{ type: 'text' as const, text: `${tool} failed: ${err instanceof Error ? err.message : String(err)}` }],
+    content: [{ type: 'text' as const, text: `${tool} failed: ${errorMessage(err)}` }],
   };
 }
 
@@ -434,8 +440,8 @@ export function summarize({ graph: _graph, ...report }: ExhumeReport) {
       files: files.slice(0, SUMMARY_FILES_PER_CLUSTER),
       ...(files.length > SUMMARY_FILES_PER_CLUSTER && { moreFiles: files.length - SUMMARY_FILES_PER_CLUSTER }),
     })),
-    orphans: report.orphans.slice(0, 20),
-    externalPackages: report.externalPackages.slice(0, 30),
+    orphans: report.orphans.slice(0, SUMMARY_ORPHANS),
+    externalPackages: report.externalPackages.slice(0, SUMMARY_EXTERNAL_PACKAGES),
     manifests: report.manifests.map(({ manifest, name, engines, dependencies, devDependencies }) => ({
       manifest,
       name,
@@ -448,8 +454,8 @@ export function summarize({ graph: _graph, ...report }: ExhumeReport) {
       ...info.slice(0, SUMMARY_INFO_FINDINGS),
     ],
     truncated: {
-      orphans: Math.max(0, report.orphans.length - 20),
-      externalPackages: Math.max(0, report.externalPackages.length - 30),
+      orphans: Math.max(0, report.orphans.length - SUMMARY_ORPHANS),
+      externalPackages: Math.max(0, report.externalPackages.length - SUMMARY_EXTERNAL_PACKAGES),
       infoInstallScripts: Math.max(0, info.length - SUMMARY_INFO_FINDINGS),
       hint: 'Call exhume again with detail "full" for complete lists and per-manifest dependency versions.',
     },

@@ -1,6 +1,6 @@
 import { spawn } from 'node:child_process';
 import Docker from 'dockerode';
-import type { SandboxLimits } from '@necromancer/core';
+import { errorMessage, type SandboxLimits } from '@necromancer/core';
 import { serviceLimits } from './compose.js';
 
 export interface StepResult {
@@ -93,7 +93,7 @@ export class DockerSandbox implements Sandbox {
     try {
       await this.docker.ping();
     } catch (err) {
-      throw new Error(`Docker is not reachable (${err instanceof Error ? err.message : String(err)}); start Docker and try again`);
+      throw new Error(`Docker is not reachable (${errorMessage(err)}); start Docker and try again`);
     }
   }
 
@@ -132,7 +132,7 @@ export class DockerSandbox implements Sandbox {
         );
       });
     } catch (err) {
-      error ??= abort.signal.aborted ? `timed out after ${limits.stepTimeoutSec}s` : err instanceof Error ? err.message : String(err);
+      error ??= abort.signal.aborted ? `timed out after ${limits.stepTimeoutSec}s` : errorMessage(err);
     } finally {
       clearTimeout(timer);
     }
@@ -158,17 +158,13 @@ export class DockerSandbox implements Sandbox {
       this.images.add(outTag);
     }
     await this.remove(container);
-    return {
-      ok: exit.code === 0,
-      log: exit.timedOut ? `${log}\ntimed out after ${limits.stepTimeoutSec}s\n` : log,
-      durationMs: Date.now() - started,
-      ...(exit.timedOut && { timedOut: true }),
-    };
+    return stepResult(exit, log, started, limits);
   }
 
   async boot(image: string, options: BootOptions): Promise<BootResult> {
     const started = Date.now();
-    const deadline = started + (this.options.healthTimeoutSec ?? 90) * 1000;
+    const healthTimeoutSec = this.options.healthTimeoutSec ?? 90;
+    const deadline = started + healthTimeoutSec * 1000;
     const { limits } = options;
     // The first service owns the network namespace (loopback only); everything else joins it.
     let owner: Docker.Container | null = null;
@@ -224,7 +220,7 @@ export class DockerSandbox implements Sandbox {
     if (!health && !crashed && !options.port) {
       health = { kind: 'log', detail: `kept running for ${Math.round((Date.now() - started) / 1000)}s without crashing (no port to probe)` };
     }
-    const log = `${await logsOf(app)}${serviceLogs.length ? `\n${serviceLogs.join('\n')}\n` : ''}${!health && !crashed ? `\nno health signal within ${this.options.healthTimeoutSec ?? 90}s\n` : ''}`;
+    const log = `${await logsOf(app)}${serviceLogs.length ? `\n${serviceLogs.join('\n')}\n` : ''}${!health && !crashed ? `\nno health signal within ${healthTimeoutSec}s\n` : ''}`;
     return { ok: health !== null, log, durationMs: Date.now() - started, health, namespace: crashed ? null : app.id };
   }
 
@@ -241,12 +237,7 @@ export class DockerSandbox implements Sandbox {
     const exit = await waitFor(c, limits.stepTimeoutSec * 1000);
     const log = await logsOf(c);
     await this.remove(c);
-    return {
-      ok: exit.code === 0,
-      log: exit.timedOut ? `${log}\ntimed out after ${limits.stepTimeoutSec}s\n` : log,
-      durationMs: Date.now() - started,
-      ...(exit.timedOut && { timedOut: true }),
-    };
+    return stepResult(exit, log, started, limits);
   }
 
   /** Connects to localhost:port from inside a namespace, using node from the app image (every era has net.connect). */
@@ -284,6 +275,15 @@ export class DockerSandbox implements Sandbox {
     await c.remove({ force: true }).catch(() => {});
     this.containers.delete(c.id);
   }
+}
+
+function stepResult(exit: { code: number | null; timedOut: boolean }, log: string, started: number, limits: SandboxLimits): StepResult {
+  return {
+    ok: exit.code === 0,
+    log: exit.timedOut ? `${log}\ntimed out after ${limits.stepTimeoutSec}s\n` : log,
+    durationMs: Date.now() - started,
+    ...(exit.timedOut && { timedOut: true }),
+  };
 }
 
 function toEnv(env: Record<string, string>): string[] {

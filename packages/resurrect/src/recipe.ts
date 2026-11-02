@@ -65,8 +65,7 @@ export function validateOp(op: RecipeOp): void {
     case 'runBeforeInstall':
     case 'setBuildCommand':
     case 'setStartCommand': {
-      const command = op.op === 'runBeforeInstall' ? op.command : op.command;
-      if (command !== null && (/[\n\r]/.test(command) || command.length > 400)) bad('commands must be one line, under 400 characters');
+      if (op.command !== null && (/[\n\r]/.test(op.command) || op.command.length > 400)) bad('commands must be one line, under 400 characters');
       break;
     }
     case 'setPort':

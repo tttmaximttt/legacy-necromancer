@@ -1,7 +1,8 @@
 import { readFile } from 'node:fs/promises';
 import path from 'node:path';
 import semver from 'semver';
-import type { BuildRecipe, DetectedService, ServiceKind } from '@necromancer/core';
+import { slugFor, type BuildRecipe, type DetectedService, type ServiceKind } from '@necromancer/core';
+import type { BootService } from './docker.js';
 
 /** What Resurrect needs to know about a checkout, read once. */
 export interface ProjectFacts {
@@ -104,7 +105,7 @@ export function chooseNode(facts: Pick<ProjectFacts, 'nodeVersionFile' | 'engine
   }
   const allowed = (line: string) => {
     if (!facts.enginesNode || !semver.validRange(facts.enginesNode)) return true;
-    return semver.intersects(facts.enginesNode, line.startsWith('0.') ? `${line}.x` : `${line}.x`);
+    return semver.intersects(facts.enginesNode, `${line}.x`);
   };
   const date = eraDate?.slice(0, 7) ?? null;
   const atEra = date ? ([...NODE_LINES].reverse().find(([, from]) => from <= date) ?? NODE_LINES[0]!) : null;
@@ -231,11 +232,11 @@ export function detectServices(facts: ProjectFacts, eraDate: string | null): Det
 
 /** The first recipe, before any fixes. */
 export function initialRecipe(facts: ProjectFacts, nodeTag: string, services: DetectedService[]): BuildRecipe {
-  const run = (script: string) => (facts.packageManager === 'npm' ? `npm run ${script}` : `${facts.packageManager} run ${script}`);
+  const run = (script: string) => `${facts.packageManager} run ${script}`;
   const main = typeof facts.manifest?.main === 'string' ? facts.manifest.main.replace(/^\.\//, '') : null;
   const entry = [main, main && `${main}.js`, 'server.js', 'app.js', 'index.js'].find((f) => f && facts.files.includes(f)) ?? null;
   const looksLikeServer = facts.listenPort !== null || 'start' in facts.scripts;
-  const startCommand = 'start' in facts.scripts ? (facts.packageManager === 'npm' ? 'npm start' : `${facts.packageManager} start`) : looksLikeServer && entry ? `node ${entry}` : null;
+  const startCommand = 'start' in facts.scripts ? `${facts.packageManager} start` : looksLikeServer && entry ? `node ${entry}` : null;
   const env: Record<string, string> = { NODE_ENV: 'development' };
   if (facts.listenPort) env.PORT = String(facts.listenPort);
   for (const s of services) Object.assign(env, s.env);
@@ -257,7 +258,12 @@ export function initialRecipe(facts: ProjectFacts, nodeTag: string, services: De
   };
 }
 
-/** Environment for a service's own container. */
-export function serviceEnv(kind: ServiceKind): Record<string, string> {
-  return SERVICES[kind].serviceEnv;
+/** The image repository for a source's builds: `necromancer/<slug>`, lowercased as Docker requires. */
+export function imageRepoFor(source: string): string {
+  return `necromancer/${slugFor(source).toLowerCase().replace(/[^a-z0-9_.-]/g, '-')}`;
+}
+
+/** Sidecar containers for the detected services, as the sandbox boots them. */
+export function bootServices(services: DetectedService[]): BootService[] {
+  return services.map((s) => ({ image: s.image, port: SERVICES[s.kind].port, env: SERVICES[s.kind].serviceEnv }));
 }

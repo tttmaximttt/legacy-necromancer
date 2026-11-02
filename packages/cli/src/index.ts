@@ -32,10 +32,12 @@ export interface ProgramDeps {
 
 const EFFORTS: readonly Effort[] = ['low', 'medium', 'high', 'xhigh', 'max'];
 
+const int = (v: string) => Number.parseInt(v, 10);
+
 export function createProgram(deps: ProgramDeps = {}): Command {
   const program = new Command('necromancer')
     .description('An AI archaeologist for abandoned JavaScript/TypeScript projects.')
-    .version(packageVersion());
+    .version(ownPackage().version);
 
   const withOutput = (cmd: Command) =>
     cmd
@@ -50,8 +52,8 @@ export function createProgram(deps: ProgramDeps = {}): Command {
       .command('exhume')
       .description('Reconstruct a repo’s architecture: module clusters, load-bearing files, churn, install-script audit.')
       .argument('<source>', 'git URL or local path')
-      .option('-t, --top <n>', 'number of load-bearing files to report', (v) => Number.parseInt(v, 10), 5)
-      .option('-s, --seed <n>', 'clustering seed', (v) => Number.parseInt(v, 10), 42)
+      .option('-t, --top <n>', 'number of load-bearing files to report', int, 5)
+      .option('-s, --seed <n>', 'clustering seed', int, 42)
       .option('-k, --keep', 'keep the clone after the run')
       .option('--include-tests', 'rank test files as load-bearing too'),
   ).action(
@@ -94,7 +96,7 @@ export function createProgram(deps: ProgramDeps = {}): Command {
     .option('--reports <dir>', 'report store directory')
     .option('-w, --workdir <dir>', 'where to clone remote repos')
     .option('--open', 'start the UI and open it in a browser afterwards')
-    .option('-p, --port <n>', 'UI port when --open is given', (v) => Number.parseInt(v, 10), 4173)
+    .option('-p, --port <n>', 'UI port when --open is given', int, 4173)
     .option('-q, --quiet', 'no progress output on stderr')
     .action(
       async (
@@ -150,7 +152,6 @@ export function createProgram(deps: ProgramDeps = {}): Command {
       }
     });
 
-  const int = (v: string) => Number.parseInt(v, 10);
   program
     .command('resurrect')
     .description(
@@ -197,14 +198,9 @@ export function createProgram(deps: ProgramDeps = {}): Command {
         const store = new ReportStore(opts.reports);
         const saved = await store.load(slugFor(source));
         const say = progress(opts, '☥');
-        let model: StructuredModel | null = null;
-        if (opts.llm) {
-          if (deps.model) model = deps.model;
-          else if (hasCredentials()) model = new ClaudeModel({ model: opts.model });
-          else say?.(`no Anthropic API key, so only known fixes will be tried (to add one, ${credentialsHint()})`);
-        }
+        const model = chooseModel(opts, deps, () => say?.(`no Anthropic API key, so only known fixes will be tried (to add one, ${credentialsHint()})`));
         const report = await resurrect(source, {
-          sandbox: deps.sandbox ?? new DockerSandbox({ buildProxy: opts.buildProxy, healthTimeoutSec: opts.healthTimeout }),
+          sandbox: chooseSandbox(opts, deps),
           model,
           maxIterations: opts.maxIterations,
           tokenBudget: opts.tokenBudget,
@@ -279,14 +275,9 @@ BLOCKED: ${report.blockedReason}
         if (!saved?.resurrect) throw new Error(`no resurrect report for ${source}; run \`necromancer resurrect ${source}\` first`);
         if (opts.check && !saved.witness) throw new Error('no golden snapshots to check against; run `necromancer witness` without --check first');
         const say = progress(opts, '👁');
-        let model: StructuredModel | null = null;
-        if (opts.llm) {
-          if (deps.model) model = deps.model;
-          else if (hasCredentials()) model = new ClaudeModel({ model: opts.model });
-          else say?.(`no Anthropic API key, so every route gets one placeholder request (to add one, ${credentialsHint()})`);
-        }
+        const model = chooseModel(opts, deps, () => say?.(`no Anthropic API key, so every route gets one placeholder request (to add one, ${credentialsHint()})`));
         const report = await witness(source, {
-          sandbox: deps.sandbox ?? new DockerSandbox({ buildProxy: opts.buildProxy, healthTimeoutSec: opts.healthTimeout }),
+          sandbox: chooseSandbox(opts, deps),
           resurrect: saved.resurrect,
           exhume: saved.exhume,
           interview: saved.interview,
@@ -328,12 +319,25 @@ BLOCKED: ${report.blockedReason}
   program
     .command('ui')
     .description('Browse saved reports: interactive architecture map and dependency graveyard.')
-    .option('-p, --port <n>', 'port (falls back to the next free one)', (v) => Number.parseInt(v, 10), 4173)
+    .option('-p, --port <n>', 'port (falls back to the next free one)', int, 4173)
     .option('--reports <dir>', 'report store directory')
     .option('--open', 'open it in a browser')
     .action((opts: { port: number; reports?: string; open?: boolean }) => serve(opts));
 
   return program;
+}
+
+/** The injected model, else Claude when a key is set; `onNoKey` runs when the model was wanted but there is no key. */
+function chooseModel(opts: { llm: boolean; model: string }, deps: ProgramDeps, onNoKey: () => void): StructuredModel | null {
+  if (!opts.llm) return null;
+  if (deps.model) return deps.model;
+  if (hasCredentials()) return new ClaudeModel({ model: opts.model });
+  onNoKey();
+  return null;
+}
+
+function chooseSandbox(opts: { buildProxy?: boolean; healthTimeout: number }, deps: ProgramDeps): Sandbox {
+  return deps.sandbox ?? new DockerSandbox({ buildProxy: opts.buildProxy, healthTimeoutSec: opts.healthTimeout });
 }
 
 function advisoryProvider(value: string): 'npm' | 'osv' | 'none' {
@@ -361,10 +365,6 @@ export const PUBLISHED_PACKAGE = 'legacy-necromancer';
 /** The package this file was installed from: the npm package once bundled, else the workspace's cli package. */
 function ownPackage(): { name: string; version: string } {
   return createRequire(import.meta.url)('../package.json') as { name: string; version: string };
-}
-
-function packageVersion(): string {
-  return ownPackage().version;
 }
 
 /** A built UI: an index.html and the assets it loads. */

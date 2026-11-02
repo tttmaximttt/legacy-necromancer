@@ -2,10 +2,10 @@ import { mkdtemp, readFile, rm } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import type { ExhumeReport, HttpRoute, InterviewReport, ResurrectReport, SandboxLimits, WitnessCase, WitnessReport, WitnessSnapshot, WitnessTestRun } from '@necromancer/core';
-import { slugFor } from '@necromancer/core';
+import { errorMessage } from '@necromancer/core';
 import { checkout, exhume as runExhume, headCommit } from '@necromancer/excavate';
 import type { StructuredModel } from '@necromancer/llm';
-import { BuildContext, DEFAULT_LIMITS, SERVICES, firstError, tail, type Sandbox } from '@necromancer/resurrect';
+import { BuildContext, bootServices, DEFAULT_LIMITS, firstError, imageRepoFor, tail, type Sandbox } from '@necromancer/resurrect';
 import { defaultCases, generateCases } from './inputs.js';
 import { blank, differingPaths, normalizeBody, normalizeHeaders } from './normalize.js';
 import { parseRunnerOutput, RUNNER, runnerEnv } from './runner.js';
@@ -64,7 +64,7 @@ export async function witness(source: string, options: WitnessOptions): Promise<
     const manifest = JSON.parse(await readFile(path.join(repo.root, 'package.json'), 'utf8')) as { scripts?: Record<string, string> };
     const build = await BuildContext.copy(repo.root, contextDir, manifest);
     await build.write(recipe, options.caFile);
-    const tag = `necromancer/${slugFor(source).toLowerCase().replace(/[^a-z0-9_.-]/g, '-')}:witness`;
+    const tag = `${imageRepoFor(source)}:witness`;
 
     try {
       log(`installing on ${recipe.nodeImage}`);
@@ -87,7 +87,7 @@ export async function witness(source: string, options: WitnessOptions): Promise<
           command: recipe.startCommand,
           env: recipe.env,
           port: recipe.port,
-          services: resurrect.services.map((s) => ({ image: s.image, port: SERVICES[s.kind].port, env: SERVICES[s.kind].serviceEnv })),
+          services: bootServices(resurrect.services),
           limits,
         });
         if (!boot.ok || !boot.namespace) throw new Error(`the app did not boot: ${firstError(boot.log)}`);
@@ -105,7 +105,7 @@ export async function witness(source: string, options: WitnessOptions): Promise<
               cases = generated.cases;
               inputs = { source: 'claude-api', model: options.model.name, tokens: generated.tokens };
             } catch (err) {
-              warnings.push(`could not generate inputs (${err instanceof Error ? err.message : String(err)}); used one placeholder request per route`);
+              warnings.push(`could not generate inputs (${errorMessage(err)}); used one placeholder request per route`);
             }
           }
           log(`sending ${cases.length} requests`);
@@ -161,7 +161,7 @@ async function runTests(
   log: (m: string) => void,
 ): Promise<WitnessTestRun | null> {
   if (!scripts.test || DEFAULT_TEST.test(scripts.test)) return null;
-  const command = recipe.packageManager === 'npm' ? 'npm test' : `${recipe.packageManager} test`;
+  const command = `${recipe.packageManager} test`;
   log(`running the project's tests: ${command}`);
   // Next to the running app when there is one, so tests that expect its databases on localhost find them.
   const result = namespace
