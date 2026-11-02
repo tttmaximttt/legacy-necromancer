@@ -146,12 +146,6 @@ importers:
       simple-git:
         specifier: ^4.0.2
         version: 4.0.2
-      tree-sitter-javascript:
-        specifier: ^0.25.0
-        version: 0.25.0
-      tree-sitter-typescript:
-        specifier: ^0.23.2
-        version: 0.23.2
       web-tree-sitter:
         specifier: ^0.27.1
         version: 0.27.1
@@ -165,6 +159,12 @@ importers:
       esbuild:
         specifier: ^0.28.2
         version: 0.28.2
+      tree-sitter-javascript:
+        specifier: ^0.25.0
+        version: 0.25.0
+      tree-sitter-typescript:
+        specifier: ^0.23.2
+        version: 0.23.2
 
   packages/llm:
     dependencies:
