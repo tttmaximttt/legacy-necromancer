@@ -30,8 +30,14 @@ Restart Claude Code, then try:
 ```
 
 Or just ask in plain words: "exhume this repo and tell me if it's worth
-reviving". The plugin starts the MCP server with `npx`, so the first call
-takes a few seconds while it downloads.
+reviving".
+
+The plugin starts the MCP server with `npx`, which downloads the package the
+first time. On a slow connection that can take longer than Claude Code waits
+for a server to start, and `/mcp` shows it as failed. Wait a minute and
+reconnect it from `/mcp`, or start Claude Code once with
+`MCP_TIMEOUT=120000 claude`. You can also install it up front with
+`npm install -g legacy-necromancer`, which makes every start instant.
 
 ### In Claude Code (MCP server only)
 
@@ -261,10 +267,12 @@ after `pnpm build`.
 The npm package is [`packages/legacy-necromancer`](packages/legacy-necromancer):
 the CLI and MCP server bundled into one file. To release:
 
-1. Bump `version` in `packages/legacy-necromancer/package.json`,
-   `plugin/.claude-plugin/plugin.json` and the `npx` pin in
-   `plugin/.mcp.json` (the build fails if they differ).
-2. Commit, then tag and push: `git tag v0.1.1 && git push origin v0.1.1`.
+1. Bump `version` in `packages/legacy-necromancer/package.json`, commit,
+   then tag and push: `git tag v0.1.1 && git push origin v0.1.1`. The
+   release workflow builds, tests, runs the packed package end to end and
+   publishes to npm. It needs an `NPM_TOKEN` repository secret.
+2. Once it's on npm, point the plugin at it and commit:
+   `node .github/scripts/plugin-version.mjs set 0.1.1`.
 
-The release workflow builds, tests and publishes to npm. It needs an
-`NPM_TOKEN` repository secret.
+The plugin installs from `main`, so it must only ever run a version that is
+already published. CI fails if it points at one that isn't.
