@@ -1,0 +1,12 @@
+{
+  "name": "legacy-necromancer",
+  "description": "Tools for reviving abandoned Node.js projects.",
+  "owner": { "name": "Maksym Radko", "url": "https://github.com/tttmaximttt" },
+  "plugins": [
+    {
+      "name": "necromancer",
+      "source": "./plugin",
+      "description": "Revive abandoned Node.js projects from Claude Code."
+    }
+  ]
+}

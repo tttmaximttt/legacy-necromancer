@@ -3,10 +3,13 @@ import { existsSync } from 'node:fs';
 import { mkdir, writeFile } from 'node:fs/promises';
 import type { AddressInfo } from 'node:net';
 import { createRequire } from 'node:module';
+import { fileURLToPath } from 'node:url';
 import path from 'node:path';
+import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { Command } from 'commander';
 import { ReportStore, slugFor, type ReportKind } from '@necromancer/core';
 import { exhume } from '@necromancer/excavate';
+import { createServer as createMcpServer } from '@necromancer/mcp';
 import { graveyard } from '@necromancer/graveyard';
 import { ClaudeModel, DEFAULT_MODEL, hasCredentials, type Effort, type StructuredModel } from '@necromancer/llm';
 import { DEFAULT_LIMITS, DEFAULT_MAX_ITERATIONS, DEFAULT_TOKEN_BUDGET, DockerSandbox, FixCache, resurrect, type Sandbox } from '@necromancer/resurrect';
@@ -33,7 +36,7 @@ const EFFORTS: readonly Effort[] = ['low', 'medium', 'high', 'xhigh', 'max'];
 export function createProgram(deps: ProgramDeps = {}): Command {
   const program = new Command('necromancer')
     .description('An AI archaeologist for abandoned JavaScript/TypeScript projects.')
-    .version('0.0.0');
+    .version(packageVersion());
 
   const withOutput = (cmd: Command) =>
     cmd
@@ -318,6 +321,15 @@ BLOCKED: ${report.blockedReason}
     );
 
   program
+    .command('mcp')
+    .description('Run the MCP server on stdio, for Claude Code or any other MCP client.')
+    .option('-w, --workdir <dir>', 'where to clone remote repos', process.env.NECROMANCER_WORKDIR)
+    .action(async (opts: { workdir?: string }) => {
+      // stdout carries the MCP protocol, so nothing else may write to it.
+      await createMcpServer({ workdir: opts.workdir }).connect(new StdioServerTransport());
+    });
+
+  program
     .command('ui')
     .description('Browse saved reports: interactive architecture map and dependency graveyard.')
     .option('-p, --port <n>', 'port (falls back to the next free one)', (v) => Number.parseInt(v, 10), 4173)
@@ -347,8 +359,16 @@ async function emit(kind: ReportKind, report: Parameters<ReportStore['save']>[1]
   else if (!opts.save) process.stdout.write(json);
 }
 
+/** The version of the package this file was installed from: the npm package once bundled, else the workspace's. */
+function packageVersion(): string {
+  return (createRequire(import.meta.url)('../package.json') as { version: string }).version;
+}
+
 /** Built UI assets shipped by @necromancer/ui, or null if it hasn't been built. */
 export function uiDistDir(): string | null {
+  // The npm package bundles the CLI into one file with the UI copied next to it.
+  const bundled = path.join(path.dirname(fileURLToPath(import.meta.url)), 'ui');
+  if (existsSync(path.join(bundled, 'index.html'))) return bundled;
   try {
     const pkg = createRequire(import.meta.url).resolve('@necromancer/ui/package.json');
     const dist = path.join(path.dirname(pkg), 'dist');

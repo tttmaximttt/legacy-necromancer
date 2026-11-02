@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "necromancer": {
+      "command": "npx",
+      "args": ["-y", "legacy-necromancer@0.1.0", "mcp"]
+    }
+  }
+}

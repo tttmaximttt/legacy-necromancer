@@ -1,0 +1,11 @@
+{
+  "name": "necromancer",
+  "displayName": "Legacy Necromancer",
+  "version": "0.1.0",
+  "description": "Revive abandoned Node.js projects: map the code, date the dependencies, rebuild it in Docker on its era's Node, and snapshot its behaviour.",
+  "author": { "name": "Maksym Radko", "url": "https://github.com/tttmaximttt" },
+  "homepage": "https://github.com/tttmaximttt/legacy-necromancer#readme",
+  "repository": "https://github.com/tttmaximttt/legacy-necromancer",
+  "license": "MIT",
+  "keywords": ["legacy-code", "nodejs", "docker", "dependencies", "code-archaeology"]
+}

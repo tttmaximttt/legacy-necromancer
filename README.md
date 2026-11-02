@@ -1,19 +1,67 @@
 # ☠ Necromancer
 
-An AI archaeologist for abandoned JavaScript and TypeScript projects.
+Revive abandoned JavaScript and TypeScript projects.
 
-Point it at an old repository. It reconstructs the architecture, finds the
-files everything else leans on, audits what would run on `npm install`, and
-(in later phases) works out what it takes to bring the project back to life
-and how to modernise it safely.
+Point it at an old repo and it maps the code, tells you which dependencies
+are dead, asks what the project was for, rebuilds and starts it in Docker on
+the Node version from its time, and records how its routes behave so you can
+upgrade it without breaking anything.
 
-```sh
-pnpm install
-pnpm build
-pnpm necromancer autopsy https://github.com/tttmaximttt/node-orm2 --open
+## Getting started
+
+You need Node 22+ and git. `resurrect` and `witness` also need Docker running.
+Set `ANTHROPIC_API_KEY` if you want Claude to write fixes and test inputs;
+everything else works without it.
+
+### In Claude Code (plugin)
+
+```text
+/plugin marketplace add tttmaximttt/legacy-necromancer
+/plugin install necromancer@legacy-necromancer
 ```
 
-`autopsy` runs both analyses, saves the reports and opens the UI:
+Restart Claude Code, then try:
+
+```text
+/necromancer:autopsy https://github.com/tttmaximttt/node-orm2
+/necromancer:interview https://github.com/tttmaximttt/node-orm2
+/necromancer:resurrect https://github.com/tttmaximttt/node-orm2
+/necromancer:witness https://github.com/tttmaximttt/node-orm2
+```
+
+Or just ask in plain words: "exhume this repo and tell me if it's worth
+reviving". The plugin starts the MCP server with `npx`, so the first call
+takes a few seconds while it downloads.
+
+### In Claude Code (MCP server only)
+
+```sh
+claude mcp add necromancer -- npx -y legacy-necromancer mcp
+```
+
+Claude Desktop and other clients are covered in the
+[MCP README](packages/mcp/README.md).
+
+### From the terminal
+
+```sh
+npx legacy-necromancer autopsy https://github.com/tttmaximttt/node-orm2 --open
+```
+
+or install it once with `npm install -g legacy-necromancer` and run
+`necromancer <command>`. A typical session:
+
+```sh
+necromancer autopsy <repo> --open   # map + dependency graveyard, opens the UI
+necromancer interview <repo>        # confirm what the project is for
+necromancer resurrect <repo>        # get it running in Docker
+necromancer witness <repo>          # record how it behaves
+# ...upgrade something...
+necromancer witness <repo> --check  # did the behaviour change?
+```
+
+Reports are saved in `~/.necromancer/reports`, and `necromancer ui` browses
+them. `autopsy` opens it straight away:
 
 ![Architecture map of node-orm2](docs/screenshots/architecture.png)
 
@@ -35,16 +83,6 @@ the model call is tested against a scripted model, so no API key is needed.
 | 6. Witness | [`witness`](packages/witness) | deterministic, inputs from one LLM call | **working** |
 | Stretch: Operate | [`surgeon`](packages/surgeon) | agent | stub |
 
-## Use it from Claude
-
-[`packages/mcp`](packages/mcp) is an MCP server that exposes each stage as a
-tool, so Claude Code or Claude Desktop can run Necromancer as part of a
-conversation. In Claude Code, inside this repo, run `pnpm build` and it's
-picked up from `.mcp.json`. Then ask "exhume
-https://github.com/tttmaximttt/node-orm2 and tell me if it's worth reviving".
-Setup for Claude Desktop and other directories is in the
-[package README](packages/mcp/README.md).
-
 Shared code lives in [`core`](packages/core) (report types, seeded RNG) and
 [`llm`](packages/llm) (structured-output Claude client, plus a scripted
 model for tests). The command line is
@@ -64,6 +102,7 @@ dead repo is and what's rotting in it".
 | `resurrect <repo>` | Phase 5: builds and boots it in Docker on its era's Node, fixing failures until it runs or is `BLOCKED` |
 | `witness <repo> [--check]` | Phase 6: calls every route on the revived app and records normalized golden snapshots, runs its tests; `--check` compares a new run |
 | `ui [--open]` | Serves the UI over saved reports on localhost |
+| `mcp` | Runs the MCP server on stdio, for Claude Code or any MCP client |
 
 ## `necromancer exhume <git-url | path>`
 
@@ -213,3 +252,19 @@ pnpm build        # tsc -b across all packages
 pnpm test         # vitest
 pnpm necromancer  # run the built CLI
 ```
+
+Inside this repo, Claude Code picks up the local MCP server from `.mcp.json`
+after `pnpm build`.
+
+### Releasing
+
+The npm package is [`packages/legacy-necromancer`](packages/legacy-necromancer):
+the CLI and MCP server bundled into one file. To release:
+
+1. Bump `version` in `packages/legacy-necromancer/package.json`,
+   `plugin/.claude-plugin/plugin.json` and the `npx` pin in
+   `plugin/.mcp.json` (the build fails if they differ).
+2. Commit, then tag and push: `git tag v0.1.1 && git push origin v0.1.1`.
+
+The release workflow builds, tests and publishes to npm. It needs an
+`NPM_TOKEN` repository secret.

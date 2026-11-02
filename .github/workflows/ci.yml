@@ -17,3 +17,5 @@ jobs:
       - run: pnpm build
       - run: pnpm typecheck
       - run: pnpm test
+      - run: pnpm --filter legacy-necromancer build
+      - run: node packages/legacy-necromancer/dist/cli.js --version
