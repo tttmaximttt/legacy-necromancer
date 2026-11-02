@@ -1,6 +1,6 @@
 import Anthropic from '@anthropic-ai/sdk';
 import { betaZodOutputFormat } from '@anthropic-ai/sdk/helpers/beta/zod';
-import { fileSettings, usable } from '@necromancer/core';
+import { errorMessage, fileSettings, usable } from '@necromancer/core';
 import type { z } from 'zod';
 
 /**
@@ -163,7 +163,7 @@ function createClient(credentials: Credentials | null): Anthropic {
 
 function translate(err: unknown, credentials: Credentials | null = null): LlmError {
   if (err instanceof LlmError) return err;
-  const detail = err instanceof Error ? err.message : String(err);
+  const detail = errorMessage(err);
   if (err instanceof Anthropic.AuthenticationError || err instanceof Anthropic.PermissionDeniedError) {
     const which = credentials ? `the key from ${credentials.from}` : 'the key';
     return new LlmError('credentials', `the Anthropic API rejected ${which}. To change it, ${credentialsHint()} (${detail})`, { cause: err });

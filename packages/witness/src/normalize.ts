@@ -109,8 +109,9 @@ export function blank(value: unknown, paths: string[]): unknown {
       continue;
     }
     const parts = p.split('/').slice(1);
-    let node = out as Record<string, unknown> | unknown[];
-    for (const part of parts.slice(0, -1)) node = (node as Record<string, unknown>)[part] as Record<string, unknown>;
+    // A path may not exist in this value: compareWitness applies the golden run's paths to a new body.
+    let node: unknown = out;
+    for (const part of parts.slice(0, -1)) node = node && typeof node === 'object' ? (node as Record<string, unknown>)[part] : undefined;
     if (node && typeof node === 'object') (node as Record<string, unknown>)[parts.at(-1)!] = '<volatile>';
   }
   return out;

@@ -205,7 +205,6 @@ async function readMains(root: string, files: string[]): Promise<Record<string, 
 }
 
 function countLines(text: string): number {
-  if (!text) return 0;
   return text.split('\n').filter((l) => l.trim()).length;
 }
 

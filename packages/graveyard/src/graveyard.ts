@@ -11,6 +11,7 @@ import type {
   Tombstone,
   TombstoneStatus,
 } from '@necromancer/core';
+import { errorMessage } from '@necromancer/core';
 import { auditManifests, checkout, headCommit, listRepoFiles, readHistory } from '@necromancer/excavate';
 import { key, NpmAdvisories, OsvAdvisories, type AdvisorySource } from './advisories.js';
 import { dateRemains } from './era.js';
@@ -68,7 +69,7 @@ export async function digGraveyard(input: DigInput, clients: Clients): Promise<G
     try {
       packuments.set(d.registryName, await clients.registry.packument(d.registryName));
     } catch (err) {
-      registryErrors.push(`${d.registryName}: ${message(err)}`);
+      registryErrors.push(`${d.registryName}: ${errorMessage(err)}`);
     }
   });
   const registryFailures = registryErrors.length;
@@ -99,7 +100,7 @@ export async function digGraveyard(input: DigInput, clients: Clients): Promise<G
       advisories = await clients.advisories.lookup(queries);
     } catch (err) {
       advisoryStatus = 'failed';
-      warnings.push(`${clients.advisories.name} advisory lookup failed: ${message(err)}`);
+      warnings.push(`${clients.advisories.name} advisory lookup failed: ${errorMessage(err)}`);
     }
   }
 
@@ -125,7 +126,7 @@ export async function digGraveyard(input: DigInput, clients: Clients): Promise<G
         const repo = await github.repo(slug);
         archived.set(d.name, repo ? repo.archived : null);
       } catch (err) {
-        if (failures++ === 0) warnings.push(`GitHub lookup failed (${message(err)}); archived flags may be missing`);
+        if (failures++ === 0) warnings.push(`GitHub lookup failed (${errorMessage(err)}); archived flags may be missing`);
       }
     });
     if (failures) githubStatus = failures === candidates.length ? 'failed' : 'partial';
@@ -137,10 +138,11 @@ export async function digGraveyard(input: DigInput, clients: Clients): Promise<G
   tombstones.sort((a, b) => ORDER[a.status] - ORDER[b.status] || a.name.localeCompare(b.name));
 
   const root = input.manifests.find((m) => m.manifest === 'package.json') ?? input.manifests[0];
+  const rootDeps = { ...root?.devDependencies, ...root?.dependencies };
   const era = dateRemains({
     history: input.history,
-    dependencies: { ...root?.devDependencies, ...root?.dependencies },
-    packuments: new Map([...packuments].filter(([name]) => name in { ...root?.devDependencies, ...root?.dependencies })),
+    dependencies: rootDeps,
+    packuments: new Map([...packuments].filter(([name]) => name in rootDeps)),
     nodeRange: root?.engines.node ?? null,
   });
 
@@ -251,11 +253,8 @@ function resolveVersion(
   lock: Map<string, string> | undefined,
   died: string | null,
 ): { version: string; from: Tombstone['resolvedFrom'] } | null {
-  if (!pkg) {
-    const locked = lock?.get(d.name);
-    return locked && semver.valid(locked) ? { version: locked, from: 'lockfile' } : null;
-  }
   const locked = lock?.get(d.name);
+  if (!pkg) return locked && semver.valid(locked) ? { version: locked, from: 'lockfile' } : null;
   if (locked && pkg.versions.includes(locked)) return { version: locked, from: 'lockfile' };
 
   const range = d.range;
@@ -374,15 +373,9 @@ function epitaph(name: string, version: string | null, status: TombstoneStatus, 
         return c.detail.length > 90 ? `deprecated: "${c.detail.slice(0, 87)}…"` : `deprecated: "${c.detail}"`;
       case 'archived':
         return 'source archived';
-      case 'abandoned':
-        return c.detail;
       default:
         return c.detail;
     }
   });
   return `${who}: ${short.join('; ')}.${successor ? ` Successor: ${successor}.` : ''}`;
-}
-
-function message(err: unknown): string {
-  return err instanceof Error ? err.message : String(err);
 }

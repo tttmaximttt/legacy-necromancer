@@ -12,12 +12,12 @@ import type {
   ResurrectReport,
   SandboxLimits,
 } from '@necromancer/core';
-import { slugFor } from '@necromancer/core';
+import { errorMessage } from '@necromancer/core';
 import { checkout, headCommit, listRepoFiles, readHistory } from '@necromancer/excavate';
 import type { StructuredModel } from '@necromancer/llm';
 import { proposeFix } from './agent.js';
 import { DEFAULT_LIMITS, renderCompose } from './compose.js';
-import { chooseNode, detectServices, initialRecipe, readFacts, SERVICES, serviceEnv, type ProjectFacts } from './detect.js';
+import { bootServices, chooseNode, detectServices, imageRepoFor, initialRecipe, readFacts, type ProjectFacts } from './detect.js';
 import type { Sandbox, StepResult } from './docker.js';
 import { errorSignature, findKnownFix, FixCache, tail } from './fixes.js';
 import { applyOps, changesRecipe, patchManifest, renderDockerfile } from './recipe.js';
@@ -109,8 +109,10 @@ export async function resurrect(source: string, options: ResurrectOptions): Prom
 
     // The sandbox gets a copy of the repo; the checkout is never modified.
     const manifest = facts.manifest;
+    const dependencies = { ...asRecord(manifest.devDependencies), ...asRecord(manifest.dependencies) };
+    const devOnly = new Set(Object.keys(asRecord(manifest.devDependencies)).filter((d) => !(d in asRecord(manifest.dependencies))));
     const build = await BuildContext.copy(repo.root, context, manifest);
-    const tagBase = `necromancer/${slugFor(source).toLowerCase().replace(/[^a-z0-9_.-]/g, '-')}`;
+    const tagBase = imageRepoFor(source);
 
     let pendingLlmFix: { signature: string; fix: AppliedFix } | null = null;
     const seen = new Map<string, number>();
@@ -139,7 +141,7 @@ export async function resurrect(source: string, options: ResurrectOptions): Prom
               command: recipe.startCommand,
               env: recipe.env,
               port: recipe.port,
-              services: services.map((s) => ({ image: s.image, port: SERVICES[s.kind].port, env: serviceEnv(s.kind) })),
+              services: bootServices(services),
               limits,
             });
             step = boot;
@@ -188,8 +190,8 @@ export async function resurrect(source: string, options: ResurrectOptions): Prom
           phase,
           log: tail(step.log, 120),
           recipe,
-          dependencies: { ...asRecord(manifest.devDependencies), ...asRecord(manifest.dependencies) },
-          devOnly: new Set(Object.keys(asRecord(manifest.devDependencies)).filter((d) => !(d in asRecord(manifest.dependencies)))),
+          dependencies,
+          devOnly,
         };
         let fix: AppliedFix | null = null;
         const known = findKnownFix(ctx);
@@ -220,7 +222,7 @@ export async function resurrect(source: string, options: ResurrectOptions): Prom
                 rejected,
               });
             } catch (err) {
-              blockedReason = `could not ask ${options.model.name} for a fix (${err instanceof Error ? err.message : String(err)}); last error at ${phase}: ${firstError(step.log)}`;
+              blockedReason = `could not ask ${options.model.name} for a fix (${errorMessage(err)}); last error at ${phase}: ${firstError(step.log)}`;
               break;
             }
             const { proposal, tokens: used } = answer;
@@ -236,7 +238,7 @@ export async function resurrect(source: string, options: ResurrectOptions): Prom
               }
               fix = { source: 'llm', id: `llm:${signature}`, description: proposal.diagnosis, ops: proposal.ops };
             } catch (err) {
-              rejected = err instanceof Error ? err.message : String(err);
+              rejected = errorMessage(err);
               warnings.push(`attempt ${n}: rejected a proposed fix (${rejected})`);
             }
           }
@@ -313,4 +315,3 @@ export function firstError(log: string): string {
   return hit.trim().slice(0, 240);
 }
 
-export type { ProjectFacts };

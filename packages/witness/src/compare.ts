@@ -1,5 +1,5 @@
 import type { WitnessReport } from '@necromancer/core';
-import { differingPaths } from './normalize.js';
+import { blank, differingPaths } from './normalize.js';
 
 export interface WitnessDifference {
   case: string;
@@ -27,7 +27,7 @@ export function compareWitness(golden: WitnessReport, current: WitnessReport): W
     if (g.response.status !== c.response.status) out.push({ case: k, what: 'status', detail: `${g.response.status} → ${c.response.status}` });
     const headers = differingPaths(g.response.headers, c.response.headers);
     if (headers.length) out.push({ case: k, what: 'headers', detail: `changed: ${headers.map((p) => p.slice(1)).join(', ')}` });
-    const body = differingPaths(g.response.body, blankLike(c.response.body, g.volatile));
+    const body = differingPaths(g.response.body, blank(c.response.body, g.volatile));
     if (body.length) out.push({ case: k, what: 'body', detail: `changed at ${body.slice(0, 5).join(', ')}${body.length > 5 ? ` and ${body.length - 5} more` : ''}` });
   }
   for (const k of now.keys()) out.push({ case: k, what: 'new', detail: 'not in the golden snapshots' });
@@ -35,18 +35,4 @@ export function compareWitness(golden: WitnessReport, current: WitnessReport): W
     out.push({ case: golden.tests.command, what: 'tests', detail: `${golden.tests.ok ? 'passed' : 'failed'} → ${current.tests.ok ? 'passed' : 'failed'} (${current.tests.summary ?? 'no summary'})` });
   }
   return out;
-}
-
-/** Applies the golden run's volatile paths to a new body, so a field that was random then may be random now. */
-function blankLike(body: unknown, paths: string[]): unknown {
-  if (!paths.length) return body;
-  const copy = structuredClone(body);
-  for (const p of paths) {
-    if (p === '/') return '<volatile>';
-    const parts = p.split('/').slice(1);
-    let node: unknown = copy;
-    for (const part of parts.slice(0, -1)) node = node && typeof node === 'object' ? (node as Record<string, unknown>)[part] : undefined;
-    if (node && typeof node === 'object') (node as Record<string, unknown>)[parts.at(-1)!] = '<volatile>';
-  }
-  return copy;
 }

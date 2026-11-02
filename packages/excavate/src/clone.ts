@@ -2,6 +2,7 @@ import { mkdir, mkdtemp, rm, stat } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { simpleGit } from 'simple-git';
+import { errorMessage } from '@necromancer/core';
 
 export interface Checkout {
   root: string;
@@ -33,7 +34,7 @@ export async function checkout(source: string, options: { workdir?: string } = {
       await git.clone(source, root, base);
     } catch (err) {
       await rm(root, { recursive: true, force: true });
-      const detail = (err instanceof Error ? err.message : String(err)).trim().split('\n').at(-1);
+      const detail = errorMessage(err).trim().split('\n').at(-1);
       throw new Error(`could not clone ${source}; is it public and spelled correctly? (${detail})`);
     }
   }
