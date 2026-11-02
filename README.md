@@ -93,7 +93,7 @@ Necromancer takes the first key it finds here:
 
 1. `NECROMANCER_ANTHROPIC_API_KEY` in its environment (the plugin setting
    ends up here)
-2. `ANTHROPIC_API_KEY` in its environment
+2. `ANTHROPIC_API_KEY`, then `ANTHROPIC_AUTH_TOKEN`, in its environment
 3. the same variables in the file `~/.necromancer/.env`
 
 Only that one key is used. `ANTHROPIC_BASE_URL` is read from the same place

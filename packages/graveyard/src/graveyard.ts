@@ -1,6 +1,6 @@
-import { setting } from '@necromancer/core';
 import path from 'node:path';
 import semver from 'semver';
+import { setting } from '@necromancer/core';
 import type {
   Advisory,
   Cause,
