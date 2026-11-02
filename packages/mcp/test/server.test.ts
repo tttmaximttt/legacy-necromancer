@@ -4,7 +4,7 @@ import path from 'node:path';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import { describe, expect, it } from 'vitest';
-import { ReportStore, type ExhumeReport, type GraveyardReport, type Tombstone } from '@necromancer/core';
+import { ReportStore, slugFor, type ExhumeReport, type GraveyardReport, type Tombstone } from '@necromancer/core';
 import { ScriptedModel } from '@necromancer/llm';
 import { createServer, summarize, type ServerOptions } from '@necromancer/mcp';
 import { fixtureRepo, goodProposal } from '../../interview/test/fixtures.js';
@@ -34,7 +34,7 @@ describe('necromancer MCP server', () => {
   it('lists the tools and the autopsy prompt', async () => {
     const client = await connect();
     const { tools } = await client.listTools();
-    expect(tools.map((t) => t.name)).toEqual(['exhume', 'graveyard', 'interview', 'record_interview', 'resurrect', 'witness']);
+    expect(tools.map((t) => t.name)).toEqual(['exhume', 'graveyard', 'interview', 'record_interview', 'resurrect', 'witness', 'plan']);
     expect(tools.slice(0, 2).every((t) => t.annotations?.readOnlyHint)).toBe(true);
     expect(Object.keys(tools[1]!.inputSchema.properties ?? {})).toEqual(['source', 'advisories', 'github', 'detail', 'save']);
     expect(Object.keys(tools[0]!.inputSchema.properties ?? {})).toEqual(['source', 'top', 'includeTests', 'detail', 'save']);
@@ -232,7 +232,7 @@ describe('necromancer MCP resurrect', () => {
     const root = await deadApp(expressMongoApp);
     const sandbox = new FakeSandbox({ install: [{ ok: false, log: NODE_GYP_LOG }] });
     const client = await connect({ sandbox });
-    const result = await client.callTool({ name: 'resurrect', arguments: { source: root, tokenBudget: 0 } });
+    const result = await client.callTool({ name: 'resurrect', arguments: { source: root, tokenBudget: 0, approvals: 'all' } });
     expect(result.isError).toBeFalsy();
     const body = JSON.parse(text(result));
     expect(body.outcome).toBe('RESURRECTED');
@@ -247,6 +247,95 @@ describe('necromancer MCP resurrect', () => {
     const body = JSON.parse(text(await client.callTool({ name: 'resurrect', arguments: { source: root, tokenBudget: 0, save: false } })));
     expect(body.outcome).toMatch(/^BLOCKED: boot failed and no known fix matches/);
     expect(body.savedTo).toBeUndefined();
+  });
+
+  it('pauses on a risky fix so the host can ask, then resumes with the answer', async () => {
+    const root = await deadApp(expressMongoApp);
+    const paused = await connect({ sandbox: new FakeSandbox({ install: [{ ok: false, log: NODE_GYP_LOG }] }) });
+    const body = JSON.parse(text(await paused.callTool({ name: 'resurrect', arguments: { source: root, tokenBudget: 0, save: false } })));
+    expect(body.outcome).toBe('NEEDS YOU');
+    expect(body.pending).toEqual({
+      kind: 'approval',
+      fix: { source: 'known', id: 'node-gyp-python', description: expect.any(String) },
+      risks: ['installs Debian packages: python, make, g++'],
+    });
+    expect(body.next).toMatch(/ask whether to apply it.*resume: true and approve: true/);
+    expect(body.savedTo).toBe(path.join(storeDir, path.basename(root), 'resurrect.json'));
+
+    const client = await connect({ sandbox: new FakeSandbox({}) });
+    const missing = await client.callTool({ name: 'resurrect', arguments: { source: root, tokenBudget: 0, resume: true } });
+    expect(missing.isError).toBe(true);
+    expect(text(missing)).toContain('resuming needs a decision on the pending fix');
+    const resumed = JSON.parse(
+      text(await client.callTool({ name: 'resurrect', arguments: { source: root, tokenBudget: 0, resume: true, approve: true, save: false } })),
+    );
+    expect(resumed.outcome).toBe('RESURRECTED');
+    // Even with save: false, the resumed run replaces the stale needs-you report.
+    expect(resumed.savedTo).toBe(path.join(storeDir, path.basename(root), 'resurrect.json'));
+    expect((await new ReportStore(storeDir).load(path.basename(root)))?.resurrect?.outcome).toBe('resurrected');
+    expect(resumed.decisions).toMatchObject([{ kind: 'approval', subject: 'node-gyp-python', answer: 'approved' }]);
+    expect(resumed.pending).toBeUndefined();
+  });
+
+  it('pauses on a question and passes the answer on when resumed', async () => {
+    const root = await deadApp(expressMongoApp);
+    // A store of its own, so the model fix it learns stays out of the shared fix cache.
+    const store = new ReportStore(path.join(await mkdtemp(path.join(os.tmpdir(), 'necro-mcp-')), 'reports'));
+    const question = {
+      diagnosis: '@acme/core is not on the public registry',
+      decision: 'ask',
+      ops: [],
+      blockedReason: null,
+      question: 'Is there a public replacement for @acme/core?',
+      choices: ['stub it', 'drop the feature'],
+    };
+    const asking = await connect({
+      store,
+      sandbox: new FakeSandbox({ install: [{ ok: false, log: 'npm ERR! 404 Not Found: @acme/core@1.2.0' }] }),
+      model: new ScriptedModel(question),
+    });
+    const body = JSON.parse(text(await asking.callTool({ name: 'resurrect', arguments: { source: root, approvals: 'all' } })));
+    expect(body.outcome).toBe('NEEDS YOU');
+    expect(body.pending).toEqual({ kind: 'question', question: question.question, context: expect.any(String), choices: question.choices });
+    expect(body.next).toMatch(/resume: true and answer/);
+    expect(body.next).toContain('do not ask them for passwords, keys or other secrets');
+
+    const model = new ScriptedModel({ diagnosis: 'stub it', decision: 'fix', ops: [{ op: 'setEnv', name: 'ACME_STUB', value: '1' }], blockedReason: null, question: null, choices: [] });
+    const client = await connect({ store, sandbox: new FakeSandbox({}), model });
+    const resumed = JSON.parse(text(await client.callTool({ name: 'resurrect', arguments: { source: root, resume: true, answer: 'stub it' } })));
+    expect(resumed.outcome).toBe('RESURRECTED');
+    expect(model.requests[0]!.prompt).toContain('The owner answered your question: stub it');
+  });
+});
+
+describe('necromancer MCP plan', () => {
+  it('needs a saved graveyard report', async () => {
+    const root = await deadApp(expressMongoApp);
+    const result = await (await connect()).callTool({ name: 'plan', arguments: { source: root } });
+    expect(result.isError).toBe(true);
+    expect(text(result)).toContain('run the `graveyard` tool first');
+  });
+
+  it('returns the steps in a line each and saves plan.json and plan.md', async () => {
+    const source = 'https://example.com/plan-me.git';
+    await new ReportStore(storeDir).save('graveyard', { ...fakeGraveyard(), repo: { source, commit: null } });
+    const body = JSON.parse(text(await (await connect()).callTool({ name: 'plan', arguments: { source } })));
+    expect(body.target).toBe('Node 24');
+    expect(body.steps).toEqual([`1. Move to Node 24 (high) → necromancer resurrect ${source}`]);
+    expect(body.leftAlone).toBe(1);
+    expect(body.warnings).toContain(`No witness report: run \`necromancer witness ${source}\` first so each step can be checked against recorded behaviour.`);
+    expect(body.savedTo).toBe(path.join(storeDir, slugFor(source), 'plan.json'));
+    expect(await readFile(body.markdown, 'utf8')).toContain(`# Modernization plan for ${source}`);
+  });
+
+  it('caps the step lines and points at plan.md for the rest', async () => {
+    const source = 'https://example.com/plan-big.git';
+    const base = fakeGraveyard();
+    const tombstones = Array.from({ length: 40 }, (_, i) => ({ ...base.tombstones[0]!, name: `pkg-${String(i).padStart(2, '0')}`, latest: '4.18.0' }));
+    await new ReportStore(storeDir).save('graveyard', { ...base, tombstones, repo: { source, commit: null } });
+    const body = JSON.parse(text(await (await connect()).callTool({ name: 'plan', arguments: { source, save: false } })));
+    expect(body.steps).toHaveLength(31);
+    expect(body.steps.at(-1)).toBe('…and 11 more; see plan.md');
   });
 });
 

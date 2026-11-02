@@ -33,7 +33,7 @@ const declared = (m) => Object.assign({}, ...KINDS.map((kind) => m[kind] ?? {}))
 const runtime = declared(manifest);
 
 const used = new Map(); // name -> Map(range -> [workspace packages declaring it])
-for (const pkg of ['cli', 'core', 'excavate', 'graveyard', 'interview', 'llm', 'mcp', 'resurrect', 'witness']) {
+for (const pkg of ['cli', 'core', 'excavate', 'graveyard', 'interview', 'llm', 'mcp', 'plan', 'resurrect', 'witness']) {
   const deps = declared(JSON.parse(await readFile(path.join(root, 'packages', pkg, 'package.json'), 'utf8')));
   for (const [name, range] of Object.entries(deps)) {
     if (name.startsWith('@necromancer/') || TYPES_ONLY.has(name)) continue;

@@ -35,12 +35,49 @@ inside Docker, on the Node version of its era.
       signature that ignores paths, versions and numbers
       (`~/.necromancer/fix-cache.json`);
    3. the **model**: Claude gets the log tail, the recipe, what was already
-      tried and the interview's goals, and returns ops or `blocked` with a
-      reason.
+      tried, the interview's goals and the owner's decisions so far. It
+      returns ops to try, a question for the owner when only they can
+      settle it, or `blocked` with a reason when nothing anyone could say
+      would fix it.
 
    The loop stops with `BLOCKED: <reason>` when nothing applies, the model
    says so, the same error survives two fixes, the attempts run out
-   (default 10) or the token budget is spent (default 150,000).
+   (default 10), the token budget is spent (default 150,000), or three
+   rounds with the owner about one failure did not produce a fix.
+
+## The owner's part
+
+Some fixes change the project rather than the sandbox, so they wait for the
+owner's OK, whichever source they came from. These are risky:
+
+- moving to another Node major;
+- installing Debian packages, or a package globally;
+- changing `package.json` (setting or removing a dependency) or dropping the
+  lockfile;
+- install flags that skip safety checks or change where packages come from:
+  `--ignore-scripts`, `--force`/`-f`, `--registry`, `--unsafe-perm`;
+- variables that change how packages are installed or how Node runs:
+  `npm_config_*`, `yarn_*`, `NODE_TLS_REJECT_UNAUTHORIZED`, `NODE_OPTIONS`;
+- running a command before install, or changing or skipping the build or
+  start command.
+
+Other variables, the port, the Debian archive mirrors, a different image of
+the same Node major and flags that only relax resolution
+(`--legacy-peer-deps`, `--ignore-engines`) are applied without asking.
+
+When the owner declines a fix, the loop looks for another one and doesn't
+offer the declined one again. When the model asks a question, the owner's
+answer goes into the next request, and a fix built on that answer is kept
+out of the shared fix cache, since it is a choice about this project.
+
+With nobody to ask (no terminal, or the MCP host's turn ended), the run
+stops as `needs-you` and the report holds the pending fix or question and
+the state to carry on from. `resurrect --resume` with an approval, a
+rejection or an answer continues with the next attempt, keeping the attempt
+count, the token spend and the fixes already declined. Answering a question
+needs a model, so a resume with an answer and no model fails before
+anything runs. If the repo moved to another commit since the pause, the
+report warns that the saved recipe was worked out against the old one.
 
 ## Sandbox
 

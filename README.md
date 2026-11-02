@@ -4,8 +4,8 @@ Revive abandoned JavaScript and TypeScript projects.
 
 Point it at an old repo and it maps the code, tells you which dependencies
 are dead, asks what the project was for, rebuilds and starts it in Docker on
-the Node version from its time, and records how its routes behave so you can
-upgrade it without breaking anything.
+the Node version from its time, records how its routes behave, and writes a
+step-by-step plan so you can upgrade it without breaking anything.
 
 ## Getting started
 
@@ -62,7 +62,8 @@ necromancer autopsy <repo> --open   # map + dependency graveyard, opens the UI
 necromancer interview <repo>        # confirm what the project is for
 necromancer resurrect <repo>        # get it running in Docker
 necromancer witness <repo>          # record how it behaves
-# ...upgrade something...
+necromancer plan <repo>             # ordered upgrade steps, each with a check
+# ...do a step...
 necromancer witness <repo> --check  # did the behaviour change?
 ```
 
@@ -196,6 +197,7 @@ providers, such as Bedrock, Vertex or OpenAI, aren't supported yet.
 | `interview <repo>` | Claude proposes what the repo is for, with file:line evidence; you confirm or correct it and pick goals |
 | `resurrect <repo>` | Builds and boots it in Docker on its era's Node, fixing failures until it runs or is `BLOCKED` |
 | `witness <repo> [--check]` | Calls every route on the revived app and records normalized golden snapshots, runs its tests; `--check` compares a new run |
+| `plan <repo>` | Turns the saved reports into ordered upgrade steps, each followed by a check; saves `plan.md` |
 | `ui [--open]` | Serves the UI over saved reports on localhost |
 | `mcp` | Runs the MCP server on stdio, for Claude Code or any MCP client |
 
@@ -305,6 +307,31 @@ yourself. Without `ANTHROPIC_API_KEY` only known fixes are tried
 (`--no-llm` forces that). The exit code is 2 when blocked. Details,
 including the sandbox, are in the [package README](packages/resurrect/README.md).
 
+Some fixes change the project rather than the sandbox: a dependency
+version, the Node major, system packages, where and how packages are
+installed (a registry, npm settings), or the build or start command.
+Those wait for your OK. In a terminal you see the fix, what it would
+change and the error it is for, and answer `y` to apply it, `n` to look
+for another fix, or `p` to stop. When Claude needs something only you
+know, such as what to do about a private package, it asks, with numbered
+suggestions; type a number or your own answer, or press Enter to stop.
+`--yes` applies every fix without asking.
+
+Without a terminal to ask on (in CI, or piped), the run stops at the first
+such fix or question with `NEEDS YOU`, saves where it got to, prints the
+command to carry on, and exits with code 3:
+
+```sh
+necromancer resurrect <repo> --resume --approve        # apply the fix it stopped on
+necromancer resurrect <repo> --resume --reject         # look for another fix
+necromancer resurrect <repo> --resume --answer "stub it"
+```
+
+Claude turns your answer into a fix, so `--answer` needs an API key.
+
+Through MCP, the agent you're talking to asks you instead and carries on
+with your answer.
+
 ## `necromancer witness <git-url | path>`
 
 Boots the app the way `resurrect` got it running and calls every route that
@@ -324,6 +351,26 @@ necromancer witness https://github.com/owner/old-app --check
 `--check` re-sends the saved requests, prints what changed (status, headers,
 body, tests), exits 1 on any difference, and keeps the golden snapshots.
 Details are in the [package README](packages/witness/README.md).
+
+## `necromancer plan <git-url | path>`
+
+Reads the reports saved for the repo and writes a modernization plan: one
+step at a time, lowest risk first. Fix imports that break on Linux, remove
+dead packages nothing imports, upgrades within the same major, replace dead
+packages with their successors, then major upgrades, and the move to a
+current Node release last. Each step says why (deprecations, advisories,
+what `resurrect` had to pin), which of your interview goals it serves, and
+the check to run after it: `witness --check` when there are golden
+snapshots, otherwise the project's tests or another `resurrect`.
+
+```sh
+necromancer plan https://github.com/owner/old-app          # prints the plan as Markdown
+necromancer plan https://github.com/owner/old-app --json   # or as JSON
+```
+
+It needs a saved `graveyard` report (`autopsy` saves one); the more of the
+other reports there are, the better the plan. It saves `plan.md` and
+`plan.json` next to them. No API key or network is needed.
 
 ## Safety
 

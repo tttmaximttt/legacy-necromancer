@@ -41,6 +41,9 @@ importers:
       '@necromancer/mcp':
         specifier: workspace:*
         version: link:../mcp
+      '@necromancer/plan':
+        specifier: workspace:*
+        version: link:../plan
       '@necromancer/resurrect':
         specifier: workspace:*
         version: link:../resurrect
@@ -198,6 +201,9 @@ importers:
       '@necromancer/llm':
         specifier: workspace:*
         version: link:../llm
+      '@necromancer/plan':
+        specifier: workspace:*
+        version: link:../plan
       '@necromancer/resurrect':
         specifier: workspace:*
         version: link:../resurrect
@@ -207,6 +213,12 @@ importers:
       zod:
         specifier: ^4.6.7
         version: 4.6.7
+
+  packages/plan:
+    dependencies:
+      '@necromancer/core':
+        specifier: workspace:*
+        version: link:../core
 
   packages/resurrect:
     dependencies:

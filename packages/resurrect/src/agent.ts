@@ -1,16 +1,29 @@
-import type { BuildRecipe, InterviewReport, RecipeOp, ResurrectAttempt, ResurrectPhase } from '@necromancer/core';
+import type { BuildRecipe, InterviewReport, OwnerDecision, RecipeOp, ResurrectAttempt, ResurrectPhase } from '@necromancer/core';
 import type { StructuredModel } from '@necromancer/llm';
 import { z } from 'zod';
 import { RecipeOpSchema } from './recipe.js';
 
 export const FixProposalSchema = z.object({
   diagnosis: z.string().describe('What went wrong, in one or two sentences, quoting the decisive log line'),
-  decision: z.enum(['fix', 'blocked']),
-  ops: z.array(RecipeOpSchema).describe('The recipe changes to try next; empty when blocked'),
+  decision: z
+    .enum(['fix', 'ask', 'blocked'])
+    .describe(
+      '"fix" to try recipe changes; "ask" only when the owner has information or a choice that would unblock it; "blocked" when nothing anyone could say would fix it',
+    ),
+  ops: z.array(RecipeOpSchema).describe('The recipe changes to try next; empty when asking or blocked'),
   blockedReason: z
     .string()
     .nullable()
-    .describe('When blocked: why no recipe change can fix this, specific enough to act on, e.g. "needs a private npm registry (@acme/*)"'),
+    .describe('When blocked: why no recipe change can fix this, specific enough to act on, e.g. "the code calls a binary that no longer exists anywhere". null otherwise'),
+  question: z
+    .string()
+    .nullable()
+    .describe(
+      'When asking: one question the owner can answer without reading the log, e.g. "@acme/core is private and not on npm. Replace it with a stub, or drop the feature that uses it?". Never ask for credentials, tokens or other secrets. null when fixing',
+    ),
+  choices: z
+    .array(z.string())
+    .describe('When asking: two to four short, concrete answers to pick from, e.g. ["stub @acme/core", "drop the export feature"]; empty when fixing'),
 });
 
 export type FixProposal = z.infer<typeof FixProposalSchema>;
@@ -30,7 +43,11 @@ You cannot edit the project's source code or the Dockerfile directly. You change
 
 Only the install step has network access. The build script and the app run with no network, next to any databases the project uses on localhost.
 
-Make the smallest change that addresses the actual error in the log, not a guess at the next one. Do not repeat a fix that was already tried. If no recipe change can fix it (the code itself is broken, it needs a private registry or a paid service, a required binary no longer exists anywhere), answer "blocked" with a reason someone can act on.`;
+Make the smallest change that addresses the actual error in the log, not a guess at the next one. Do not repeat a fix that was already tried, or one the owner declined.
+
+Answer "blocked" when nothing anyone could say would fix it: the code itself is broken, a required binary no longer exists anywhere, it needs a paid service. Give a reason someone can act on.
+
+Answer "ask" only when the owner has information or a choice that would unblock it and no recipe change can get past the error without it: which replacement to use for a private or vanished package, whether dropping a feature or a dependency is acceptable, which of two incompatible setups the project really used. Ask one specific question with a few concrete choices. Never ask for credentials, tokens or other secrets; none can enter the sandbox. Use the owner's earlier answers instead of asking again.`;
 
 export interface ProposeInput {
   phase: ResurrectPhase;
@@ -42,12 +59,21 @@ export interface ProposeInput {
   interview: InterviewReport | null;
   /** Why the previous proposal was rejected, when asking again in the same attempt. */
   rejected?: string;
+  /** The owner's approvals and answers so far in this run. */
+  decisions?: OwnerDecision[];
+  /** The owner's answer to the question the model asked about this failure. */
+  answer?: string;
 }
 
 export function buildFixPrompt(input: ProposeInput): string {
   const tried = input.history
     .filter((a) => a.fix)
     .map((a) => `- attempt ${a.n} failed at ${a.phase}; applied ${a.fix!.id} (${a.fix!.source}): ${a.fix!.description}`);
+  const decisions = (input.decisions ?? []).map((d) =>
+    d.kind === 'question'
+      ? `- attempt ${d.attempt}: asked "${d.subject}"; the owner answered: ${d.answer}`
+      : `- attempt ${d.attempt}: the owner ${d.answer} fix ${d.subject.startsWith('llm:') && d.description ? `"${d.description}"` : d.subject}`,
+  );
   const goals = input.interview
     ? `\nWhat the project is for: ${input.interview.intent}${input.interview.goals.length ? `\nOwner's goals: ${input.interview.goals.map((g) => g.text).join('; ')}` : ''}\n`
     : '';
@@ -55,6 +81,8 @@ export function buildFixPrompt(input: ProposeInput): string {
     goals,
     `Failed step: ${input.phase}`,
     tried.length ? `Already tried:\n${tried.join('\n')}` : 'Nothing tried yet.',
+    decisions.length ? `\nThe owner's decisions so far:\n${decisions.join('\n')}` : '',
+    input.answer ? `\nThe owner answered your question: ${input.answer}` : '',
     input.rejected ? `\nYour previous proposal was rejected: ${input.rejected}. Propose something else.` : '',
     `\nCurrent recipe:\n${JSON.stringify(input.recipe, null, 2)}`,
     `\nDockerfile rendered from it:\n${input.dockerfile}`,

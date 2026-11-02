@@ -8,7 +8,7 @@ import { deadApp, expressMongoApp, FakeSandbox, NODE_GYP_LOG } from './helpers.j
 
 const UNKNOWN = 'Error: Cannot find module \'./config/local.json\'\n    at Function.Module._resolveFilename (module.js:470:15)';
 
-const fix = (ops: FixProposal['ops'], diagnosis = 'config file is gitignored'): FixProposal => ({ diagnosis, decision: 'fix', ops, blockedReason: null });
+const fix = (ops: FixProposal['ops'], diagnosis = 'config file is gitignored'): FixProposal => ({ diagnosis, decision: 'fix', ops, blockedReason: null, question: null, choices: [] });
 
 /** Like ScriptedModel, but reports token usage so the budget can be tested. */
 class MeteredModel implements StructuredModel {
@@ -115,10 +115,19 @@ describe('resurrect loop', () => {
       expect(report.blockedReason).toBe("boot failed and no known fix matches (no model configured): Error: Cannot find module './config/local.json'");
     });
 
-    it('when the model says so', async () => {
-      const model = new ScriptedModel({ diagnosis: 'needs @acme/* packages', decision: 'blocked', ops: [], blockedReason: 'needs the private registry for @acme/* packages' });
-      const report = await resurrect(await deadApp(expressMongoApp), { sandbox: new FakeSandbox({ install: [{ ok: false, log: 'npm ERR! 404 Not Found: @acme/core@1.2.0' }] }), model });
-      expect(report.blockedReason).toBe('needs the private registry for @acme/* packages');
+    it('when the model says nothing anyone could say would fix it', async () => {
+      const model = new ScriptedModel({
+        diagnosis: 'the build calls phantomjs',
+        decision: 'blocked',
+        ops: [],
+        blockedReason: 'needs phantomjs, which is no longer distributed',
+        question: null,
+        choices: [],
+      });
+      const report = await resurrect(await deadApp(expressMongoApp), { sandbox: new FakeSandbox({ boot: [{ ok: false, log: UNKNOWN }] }), model });
+      expect(report.outcome).toBe('blocked');
+      expect(report.blockedReason).toBe('needs phantomjs, which is no longer distributed');
+      expect(report.pending).toBeNull();
     });
 
     it('when the model call fails', async () => {
@@ -163,6 +172,28 @@ describe('resurrect loop', () => {
       expect(report.blockedReason).toMatch(/no package.json/);
       expect(sandbox.calls).toHaveLength(0);
     });
+  });
+
+  it('stops for the owner when the model asks a question', async () => {
+    const model = new ScriptedModel({
+      diagnosis: 'needs @acme/* packages',
+      decision: 'ask',
+      ops: [],
+      blockedReason: null,
+      question: 'Is there a public replacement for @acme/core?',
+      choices: ['stub it', 'drop it'],
+    });
+    const sandbox = new FakeSandbox({ install: [{ ok: false, log: 'npm ERR! 404 Not Found: @acme/core@1.2.0' }] });
+    const report = await resurrect(await deadApp(expressMongoApp), { sandbox, model });
+    expect(report.outcome).toBe('needs-you');
+    expect(report.blockedReason).toBeNull();
+    expect(report.pending).toEqual({
+      kind: 'question',
+      question: 'Is there a public replacement for @acme/core?',
+      context: 'needs @acme/* packages Failing line: npm ERR! 404 Not Found: @acme/core@1.2.0',
+      choices: ['stub it', 'drop it'],
+    });
+    expect(sandbox.cleaned).toBe(1);
   });
 
   it('re-asks once when the model proposes something the sandbox rejects', async () => {

@@ -6,16 +6,23 @@ import type {
   BuildRecipe,
   ExhumeReport,
   GraveyardReport,
+  FixRisk,
   InterviewReport,
+  OwnerDecision,
+  PendingDecision,
+  PendingQuestion,
+  RecipeOp,
   ResurrectAttempt,
   ResurrectPhase,
   ResurrectReport,
+  ResurrectRunState,
   SandboxLimits,
 } from '@necromancer/core';
 import { errorMessage } from '@necromancer/core';
 import { checkout, headCommit, listRepoFiles, readHistory } from '@necromancer/excavate';
 import type { StructuredModel } from '@necromancer/llm';
 import { proposeFix } from './agent.js';
+import { fixRisks } from './approval.js';
 import { DEFAULT_LIMITS, renderCompose } from './compose.js';
 import { bootServices, chooseNode, detectServices, imageRepoFor, initialRecipe, readFacts, type ProjectFacts } from './detect.js';
 import type { Sandbox, StepResult } from './docker.js';
@@ -24,11 +31,38 @@ import { applyOps, changesRecipe, patchManifest, renderDockerfile } from './reci
 
 export const DEFAULT_MAX_ITERATIONS = 10;
 export const DEFAULT_TOKEN_BUDGET = 150_000;
+/** Questions answered plus fixes declined for one failure before the run gives up on it. */
+export const MAX_OWNER_ROUNDS = 3;
+
+/** What the owner is shown before a risky fix is applied. */
+export interface ApprovalRequest {
+  attempt: number;
+  phase: ResurrectPhase;
+  fix: AppliedFix;
+  risks: FixRisk[];
+  /** The last lines of the failing step's log. */
+  errorExcerpt: string;
+}
+
+export type ApprovalAnswer = 'approve' | 'reject' | 'pause';
+
+/** A question the model asked about a failure, with the attempt that failed. */
+export type OwnerQuestion = PendingQuestion & { attempt: number };
+
+/** Carry on from a needs-you report, with the owner's answer to its pending decision. */
+export interface ResumeInput {
+  from: ResurrectReport;
+  /** For a pending approval: apply the fix, or decline it and look for another. */
+  approve?: boolean;
+  /** For a pending question: the owner's answer. */
+  answer?: string;
+}
 
 export interface ResurrectOptions {
   sandbox: Sandbox;
   /** Asked for a fix when the known-fix table and the cache have none. null runs table-only. */
   model?: StructuredModel | null;
+  /** Attempts in total, counting those made before a pause when resuming. */
   maxIterations?: number;
   /** Input plus output tokens the model may spend across the whole run. */
   tokenBudget?: number;
@@ -45,20 +79,58 @@ export interface ResurrectOptions {
   /** Keep the images, e.g. to run the result yourself. */
   keepImages?: boolean;
   onProgress?: (message: string) => void;
+  /**
+   * Asked before applying a fix that `fixRisks` flags, whatever its source. 'reject' looks for another fix,
+   * 'pause' ends the run as needs-you. Without it every fix is applied.
+   */
+  approve?: (request: ApprovalRequest) => Promise<ApprovalAnswer>;
+  /** Asked when the model needs the owner's answer to go on. null, or no callback, ends the run as needs-you. */
+  ask?: (question: OwnerQuestion) => Promise<string | null>;
+  resume?: ResumeInput;
 }
 
 const LOCKFILES = ['package-lock.json', 'npm-shrinkwrap.json', 'yarn.lock', 'pnpm-lock.yaml'];
 
+/** A failed attempt that needs a fix. `log` is the tail the fix is chosen from. */
+interface Failure {
+  attempt: ResurrectAttempt;
+  phase: ResurrectPhase;
+  signature: string;
+  log: string;
+}
+
+/** What is known while looking for a fix for one failure. */
+interface Turn {
+  /** Known/cache fix ids and model op lists the owner declined. */
+  skip: Set<string>;
+  rejected?: string;
+  answer?: string;
+  /** The fixes the owner declined, for the blocked message. */
+  declined: string[];
+  /** Questions answered and fixes declined so far. */
+  rounds: number;
+}
+
+type Settled =
+  | { kind: 'apply'; fix: AppliedFix; answered: boolean }
+  | { kind: 'blocked'; reason: string }
+  | { kind: 'pause'; pending: PendingDecision; turn: Turn };
+
+const opsKey = (ops: RecipeOp[]) => `ops:${JSON.stringify(ops)}`;
+
 /**
  * Phase 5: the build-fix loop. Each attempt installs (the only step with network), runs the build script and
  * boots the app in the sandbox. After a failure, the next change comes from the known-fix table, then the fix
- * cache, then the model; with none, or out of attempts or tokens, the run ends "BLOCKED: <reason>".
+ * cache, then the model; with none, or out of attempts or tokens, the run ends "BLOCKED: <reason>". A risky fix
+ * waits for `approve`, and a question from the model for `ask`; without an answer the run ends needs-you, and
+ * `resume` carries on from that report.
  */
 export async function resurrect(source: string, options: ResurrectOptions): Promise<ResurrectReport> {
+  const budget = options.tokenBudget ?? DEFAULT_TOKEN_BUDGET;
+  const resumed = options.resume ? checkResume(options.resume, options.model ?? null, budget) : null;
   const log = options.onProgress ?? (() => {});
   const limits: SandboxLimits = { ...DEFAULT_LIMITS, ...options.limits };
   const maxIterations = options.maxIterations ?? DEFAULT_MAX_ITERATIONS;
-  const budget = options.tokenBudget ?? DEFAULT_TOKEN_BUDGET;
   const cache = options.fixCache ?? new FixCache(null);
   const sandbox = options.sandbox;
 
@@ -74,21 +146,33 @@ export async function resurrect(source: string, options: ResurrectOptions): Prom
       options.graveyard?.era.estimate ?? options.graveyard?.era.died ?? options.exhume?.history.lastCommit ?? (await readHistory(repo.root)).lastCommit;
     const node = chooseNode(facts, eraDate);
     const services = detectServices(facts, eraDate);
-    let recipe = initialRecipe(facts, node.tag, services);
+    let recipe = resumed ? structuredClone(resumed.from.recipe) : initialRecipe(facts, node.tag, services);
     log(`era ${eraDate?.slice(0, 7) ?? 'unknown'}: ${node.why}; services: ${services.map((s) => s.image).join(', ') || 'none'}`);
 
-    const attempts: ResurrectAttempt[] = [];
-    const warnings: string[] = [];
-    let tokens = 0;
-    let calls = 0;
+    const attempts: ResurrectAttempt[] = resumed ? structuredClone(resumed.from.attempts) : [];
+    const warnings: string[] = resumed ? [...resumed.from.warnings] : [];
+    const pausedAt = resumed?.from.repo.commit ?? null;
+    if (pausedAt && commit && pausedAt !== commit) {
+      warnings.push(
+        `the repo changed since the run paused (${pausedAt.slice(0, 7)} → ${commit.slice(0, 7)}); the saved recipe was diagnosed against the old commit`,
+      );
+    }
+    const decisions: OwnerDecision[] = resumed ? [...(resumed.from.decisions ?? [])] : [];
+    let tokens = resumed?.state.tokens ?? 0;
+    let calls = resumed?.state.calls ?? 0;
     let health: ResurrectReport['health'] = null;
     let blockedReason: string | null = null;
+    let pending = null as PendingDecision | null;
+    let runState: ResurrectRunState | null = null;
 
     const report = (): ResurrectReport => ({
       repo: { source, commit },
       generatedAt: new Date().toISOString(),
-      outcome: health ? 'resurrected' : 'blocked',
-      blockedReason: health ? null : blockedReason,
+      outcome: health ? 'resurrected' : pending ? 'needs-you' : 'blocked',
+      blockedReason: health || pending ? null : blockedReason,
+      pending,
+      resume: runState,
+      decisions,
       health,
       era: { date: eraDate?.slice(0, 10) ?? null, node: recipe.nodeImage, why: node.why },
       services,
@@ -114,11 +198,183 @@ export async function resurrect(source: string, options: ResurrectOptions): Prom
     const build = await BuildContext.copy(repo.root, context, manifest);
     const tagBase = imageRepoFor(source);
 
-    let pendingLlmFix: { signature: string; fix: AppliedFix } | null = null;
-    const seen = new Map<string, number>();
+    // A model fix waiting to be cached once it gets past its error.
+    let pendingLlmFix = null as { signature: string; fix: AppliedFix } | null;
+    const seen = new Map<string, number>(Object.entries(resumed?.state.seen ?? {}));
+
+    const decide = (attempt: number, kind: OwnerDecision['kind'], subject: string, answer: string, description?: string) =>
+      decisions.push({ attempt, kind, subject, answer, ...(description !== undefined && { description }), at: new Date().toISOString() });
+
+    /** One candidate fix for a failure: the known-fix table, then the cache, then the model. */
+    const propose = async (
+      f: Failure,
+      turn: Turn,
+    ): Promise<{ kind: 'fix'; fix: AppliedFix } | { kind: 'question'; question: PendingQuestion } | { kind: 'blocked'; reason: string }> => {
+      const n = f.attempt.n;
+      const lastError = firstError(f.log);
+      const ctx = { phase: f.phase, log: f.log, recipe, dependencies, devOnly };
+      const known = findKnownFix(ctx, turn.skip);
+      if (known) return { kind: 'fix', fix: { source: 'known', id: known.id, description: known.description, ops: known.ops(ctx) } };
+      const cacheId = `cache:${f.signature}`;
+      const cached = turn.skip.has(cacheId) ? null : await cache.get(f.signature);
+      if (cached && changesRecipe(recipe, cached.ops)) return { kind: 'fix', fix: { source: 'cache', id: cacheId, ...cached } };
+      if (!options.model) {
+        const reason = turn.declined.length
+          ? `the owner declined ${turn.declined.at(-1)} and there is no other fix for: ${lastError}`
+          : `${f.phase} failed and no known fix matches (no model configured): ${lastError}`;
+        return { kind: 'blocked', reason };
+      }
+      let rejected = turn.rejected;
+      for (let ask = 0; ask < 2; ask++) {
+        if (tokens >= budget) return { kind: 'blocked', reason: `token budget of ${budget} spent; last error at ${f.phase}: ${lastError}` };
+        log(`attempt ${n}: ${turn.answer ? 'passing the owner’s answer to' : 'no known fix, asking'} ${options.model.name}`);
+        calls++;
+        let answer: Awaited<ReturnType<typeof proposeFix>>;
+        try {
+          answer = await proposeFix(options.model, {
+            phase: f.phase,
+            errorTail: f.log,
+            recipe,
+            dockerfile: renderDockerfile(recipe),
+            dependencies,
+            history: attempts,
+            interview: options.interview ?? null,
+            rejected,
+            decisions,
+            answer: turn.answer,
+          });
+        } catch (err) {
+          return { kind: 'blocked', reason: `could not ask ${options.model.name} for a fix (${errorMessage(err)}); last error at ${f.phase}: ${lastError}` };
+        }
+        const { proposal, tokens: used } = answer;
+        tokens += used;
+        try {
+          if (proposal.decision === 'blocked') return { kind: 'blocked', reason: proposal.blockedReason?.trim() || proposal.diagnosis.trim() };
+          if (proposal.decision === 'ask') {
+            const question = proposal.question?.trim();
+            if (!question) throw new Error('it asked the owner without a question');
+            const context = `${proposal.diagnosis.trim()} Failing line: ${lastError}`;
+            return { kind: 'question', question: { kind: 'question', question, context, choices: proposal.choices } };
+          }
+          if (turn.skip.has(opsKey(proposal.ops))) throw new Error('the owner already declined that fix');
+          if (!changesRecipe(recipe, proposal.ops)) {
+            applyOps(recipe, proposal.ops); // surfaces validation errors
+            throw new Error('it changes nothing that was not already tried');
+          }
+          return { kind: 'fix', fix: { source: 'llm', id: `llm:${f.signature}`, description: proposal.diagnosis, ops: proposal.ops } };
+        } catch (err) {
+          rejected = errorMessage(err);
+          warnings.push(`attempt ${n}: rejected a proposed fix (${rejected})`);
+        }
+      }
+      return { kind: 'blocked', reason: `the model proposed no usable fix for: ${lastError}` };
+    };
+
+    const decline = (f: Failure, turn: Turn, fix: AppliedFix): Turn => {
+      log(`attempt ${f.attempt.n}: the owner declined ${fix.source} fix: ${fix.description}`);
+      return {
+        skip: new Set(turn.skip).add(fix.source === 'llm' ? opsKey(fix.ops) : fix.id),
+        rejected: `the owner declined it: ${fix.description}`,
+        answer: turn.answer,
+        declined: [...turn.declined, fix.source === 'llm' ? `"${fix.description}"` : fix.id],
+        rounds: turn.rounds + 1,
+      };
+    };
+
+    const outOfRounds = (f: Failure): Settled => ({
+      kind: 'blocked',
+      reason: `asked the owner ${MAX_OWNER_ROUNDS} times about this failure and still no fix: ${firstError(f.log)}`,
+    });
+
+    /** Finds the fix to apply for a failure, asking the owner where needed, or says why the run must stop. */
+    const settle = async (f: Failure, turn: Turn): Promise<Settled> => {
+      for (;;) {
+        const found = await propose(f, turn);
+        if (found.kind === 'blocked') return found;
+        if (found.kind === 'question') {
+          if (turn.rounds >= MAX_OWNER_ROUNDS) return outOfRounds(f);
+          const reply = options.ask ? await options.ask({ ...found.question, attempt: f.attempt.n }) : null;
+          if (!reply?.trim()) return { kind: 'pause', pending: found.question, turn };
+          decide(f.attempt.n, 'question', found.question.question, reply);
+          turn = { ...turn, rejected: undefined, answer: reply, rounds: turn.rounds + 1 };
+          continue;
+        }
+        const { fix } = found;
+        const answered = turn.answer !== undefined;
+        const risks = fixRisks(recipe, fix.ops);
+        if (!risks.length || !options.approve) return { kind: 'apply', fix, answered };
+        if (turn.rounds >= MAX_OWNER_ROUNDS) return outOfRounds(f);
+        const errorExcerpt = f.attempt.errorExcerpt ?? tail(f.log, 40);
+        const verdict = await options.approve({ attempt: f.attempt.n, phase: f.phase, fix, risks, errorExcerpt });
+        if (verdict === 'pause') return { kind: 'pause', pending: { kind: 'approval', fix, risks }, turn };
+        decide(f.attempt.n, 'approval', fix.id, verdict === 'approve' ? 'approved' : 'rejected', fix.description);
+        if (verdict === 'approve') return { kind: 'apply', fix, answered };
+        turn = decline(f, turn, fix);
+      }
+    };
+
+    /** Applies a settled fix, or records why the run stops. Returns whether to make another attempt. */
+    const conclude = (f: Failure, settled: Settled): boolean => {
+      if (settled.kind === 'blocked') {
+        blockedReason = settled.reason;
+        return false;
+      }
+      if (settled.kind === 'pause') {
+        const { turn } = settled;
+        pending = settled.pending;
+        runState = {
+          nextAttempt: f.attempt.n + 1,
+          failure: { attempt: f.attempt.n, phase: f.phase, signature: f.signature, log: f.log },
+          seen: Object.fromEntries(seen),
+          tokens,
+          calls,
+          skip: [...turn.skip],
+          declined: turn.declined,
+          answer: turn.answer ?? null,
+          rounds: turn.rounds,
+        };
+        return false;
+      }
+      const { fix } = settled;
+      log(`attempt ${f.attempt.n}: applying ${fix.source} fix: ${fix.description}`);
+      f.attempt.fix = fix;
+      recipe = applyOps(recipe, fix.ops);
+      // A fix built on the owner's answer is specific to this project, so it stays out of the shared cache.
+      if (fix.source === 'llm' && !settled.answered) pendingLlmFix = { signature: f.signature, fix };
+      return true;
+    };
 
     try {
-      for (let n = 1; n <= maxIterations; n++) {
+      let first = 1;
+      let go = true;
+      if (resumed) {
+        const { pending: waiting, state } = resumed;
+        const attempt = attempts.find((a) => a.n === state.failure.attempt);
+        if (!attempt) throw new Error(`the saved report has no attempt ${state.failure.attempt} to resume from`);
+        const f: Failure = { attempt, phase: state.failure.phase, signature: state.failure.signature, log: state.failure.log };
+        const turn: Turn = {
+          skip: new Set(state.skip ?? []),
+          declined: state.declined ?? [],
+          answer: state.answer ?? undefined,
+          rounds: state.rounds ?? 0,
+        };
+        log(`resuming after attempt ${attempt.n}`);
+        let settled: Settled;
+        if (waiting.kind === 'approval') {
+          decide(attempt.n, 'approval', waiting.fix.id, options.resume!.approve ? 'approved' : 'rejected', waiting.fix.description);
+          settled = options.resume!.approve
+            ? { kind: 'apply', fix: waiting.fix, answered: turn.answer !== undefined }
+            : await settle(f, decline(f, turn, waiting.fix));
+        } else {
+          const answer = options.resume!.answer!;
+          decide(attempt.n, 'question', waiting.question, answer);
+          settled = await settle(f, { ...turn, rejected: undefined, answer, rounds: turn.rounds + 1 });
+        }
+        go = conclude(f, settled);
+        first = state.nextAttempt;
+      }
+
+      for (let n = first; go && n <= maxIterations; n++) {
         await build.write(recipe, options.caFile);
         const started = Date.now();
         const tag = `${tagBase}:attempt-${n}`;
@@ -185,85 +441,45 @@ export async function resurrect(source: string, options: ResurrectOptions): Prom
           blockedReason = `still failing after ${maxIterations} attempts; last error at ${phase}: ${firstError(step.log)}`;
           break;
         }
-
-        const ctx = {
-          phase,
-          log: tail(step.log, 120),
-          recipe,
-          dependencies,
-          devOnly,
-        };
-        let fix: AppliedFix | null = null;
-        const known = findKnownFix(ctx);
-        if (known) fix = { source: 'known', id: known.id, description: known.description, ops: known.ops(ctx) };
-        if (!fix) {
-          const cached = await cache.get(signature);
-          if (cached && changesRecipe(recipe, cached.ops)) fix = { source: 'cache', id: `cache:${signature}`, ...cached };
-        }
-        if (!fix && options.model) {
-          let rejected: string | undefined;
-          for (let ask = 0; ask < 2 && !fix && !blockedReason; ask++) {
-            if (tokens >= budget) {
-              blockedReason = `token budget of ${budget} spent; last error at ${phase}: ${firstError(step.log)}`;
-              break;
-            }
-            log(`attempt ${n}: no known fix, asking ${options.model.name}`);
-            calls++;
-            let answer: Awaited<ReturnType<typeof proposeFix>>;
-            try {
-              answer = await proposeFix(options.model, {
-                phase,
-                errorTail: ctx.log,
-                recipe,
-                dockerfile: renderDockerfile(recipe),
-                dependencies: ctx.dependencies,
-                history: attempts,
-                interview: options.interview ?? null,
-                rejected,
-              });
-            } catch (err) {
-              blockedReason = `could not ask ${options.model.name} for a fix (${errorMessage(err)}); last error at ${phase}: ${firstError(step.log)}`;
-              break;
-            }
-            const { proposal, tokens: used } = answer;
-            tokens += used;
-            if (proposal.decision === 'blocked') {
-              blockedReason = proposal.blockedReason?.trim() || proposal.diagnosis;
-              break;
-            }
-            try {
-              if (!changesRecipe(recipe, proposal.ops)) {
-                applyOps(recipe, proposal.ops); // surfaces validation errors
-                throw new Error('it changes nothing that was not already tried');
-              }
-              fix = { source: 'llm', id: `llm:${signature}`, description: proposal.diagnosis, ops: proposal.ops };
-            } catch (err) {
-              rejected = errorMessage(err);
-              warnings.push(`attempt ${n}: rejected a proposed fix (${rejected})`);
-            }
-          }
-          if (!fix && !blockedReason) blockedReason = `the model proposed no usable fix for: ${firstError(step.log)}`;
-        }
-        if (blockedReason) break;
-        if (!fix) {
-          blockedReason = `${phase} failed and no known fix matches${options.model ? '' : ' (no model configured)'}: ${firstError(step.log)}`;
-          break;
-        }
-        log(`attempt ${n}: applying ${fix.source} fix: ${fix.description}`);
-        attempt.fix = fix;
-        recipe = applyOps(recipe, fix.ops);
-        if (fix.source === 'llm') pendingLlmFix = { signature, fix };
+        const failure: Failure = { attempt, phase, signature, log: tail(step.log, 120) };
+        if (!conclude(failure, await settle(failure, { skip: new Set(), declined: [], rounds: 0 }))) break;
       }
     } finally {
       if (!options.keepImages) await sandbox.cleanup();
     }
-    if (!health && !blockedReason) blockedReason = 'no attempts were made';
-    if (!health) log(`BLOCKED: ${blockedReason}`);
+    if (!health && !blockedReason && !pending) {
+      blockedReason = attempts.length ? `out of attempts: ${maxIterations} allowed, ${attempts.length} made` : 'no attempts were made';
+    }
+    if (pending) log(`NEEDS YOU: ${pending.kind === 'question' ? pending.question : `approve ${pending.fix.description}`}`);
+    else if (!health) log(`BLOCKED: ${blockedReason}`);
     return report();
   } finally {
     await rm(context, { recursive: true, force: true });
     await repo.cleanup();
   }
+}
+
+/** Checks that a resume has a paused run to carry on and the answer its pending decision needs. */
+function checkResume(
+  resume: ResumeInput,
+  model: StructuredModel | null,
+  budget: number,
+): { from: ResurrectReport; pending: PendingDecision; state: ResurrectRunState } {
+  const { from } = resume;
+  if (from.outcome !== 'needs-you' || !from.pending || !from.resume) {
+    throw new Error(`only a run that is waiting on the owner (needs-you) can be resumed; this one ended ${from.outcome}`);
+  }
+  if (from.pending.kind === 'approval' && typeof resume.approve !== 'boolean') {
+    throw new Error(`resuming needs a decision on the pending fix: approve or reject ${from.pending.fix.id} (${from.pending.fix.description})`);
+  }
+  if (from.pending.kind === 'question') {
+    if (!resume.answer?.trim()) throw new Error(`resuming needs an answer to the pending question: ${from.pending.question}`);
+    if (!model) throw new Error('answering the pending question needs a model to turn the answer into a fix, and none is available (no API key, --no-llm, or a token budget of 0)');
+    if (budget <= from.resume.tokens) {
+      throw new Error(`answering the pending question needs a model, but the token budget of ${budget} is already spent (${from.resume.tokens} used); raise it`);
+    }
+  }
+  return { from, pending: from.pending, state: from.resume };
 }
 
 /** The sandbox's copy of the repo: everything but .git and node_modules, with the recipe's manifest and Dockerfile. */

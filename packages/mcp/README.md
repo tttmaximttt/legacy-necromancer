@@ -16,6 +16,7 @@ The server uses stdio and runs on your machine. It needs `git` on `PATH`.
 | `record_interview` | Phase 4, step 2: records the user's confirmation or correction and their goals, for later stages. |
 | `resurrect` | Phase 5: builds and boots the repo in Docker on its era's Node, fixing failures until it runs or is `BLOCKED`. Needs Docker where the server runs. |
 | `witness` | Phase 6: calls every route on the revived app and saves normalized golden snapshots, then runs its tests. With `check`, compares a new run against them. Needs a prior `resurrect`. |
+| `plan` | Turns the saved reports into ordered upgrade steps, lowest risk first, each followed by its check. Saves `plan.json` and `plan.md`. Needs a saved `graveyard` report. |
 
 `graveyard` takes `source`, `advisories` (`npm`, `osv` or `none`), `github`
 (default true) and `detail`. In `summary` mode, healthy dependencies are
@@ -40,9 +41,16 @@ calling `record_interview`, which takes `confirm`, `correction`,
 the agent's `proposal`, whose citations are checked against the repo.
 
 `resurrect` takes `source`, `maxIterations` (up to 10), `tokenBudget` (0
-for known fixes only) and `save`. It takes minutes and sends progress
-notifications. Claude proposes fixes only if the server has an
-API key.
+for known fixes only), `approvals` and `save`. It takes minutes and sends
+progress notifications. Claude proposes fixes only if the server has an
+API key. With `approvals: "ask"` (the default), a fix that changes
+dependencies, the Node version, system packages or what runs stops the run
+with outcome `NEEDS YOU`, and so does a question only you can answer. The
+agent asks you, then calls `resurrect` again with `resume: true` and
+`approve` (true or false) or `answer`. `approvals: "all"` applies every fix.
+
+`plan` takes `source` and `save`, and returns each step (up to 30) as one
+line with its risk and check command; the full plan is in `plan.md`.
 
 `witness` takes `source`, `check`, `runTests` (default true) and `save`.
 Claude writes the requests if the server has an API key;

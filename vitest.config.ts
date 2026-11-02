@@ -21,6 +21,7 @@ export default defineConfig({
       '@necromancer/interview': pkg('interview'),
       '@necromancer/resurrect': pkg('resurrect'),
       '@necromancer/witness': pkg('witness'),
+      '@necromancer/plan': pkg('plan'),
     },
   },
   test: {

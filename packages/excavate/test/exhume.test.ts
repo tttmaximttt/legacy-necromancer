@@ -86,11 +86,11 @@ describe('exhume', () => {
       { from: 'models/user.js', specifier: '../lib/Util', line: 2, target: 'lib/util.js' },
     ]);
     expect(report.externalPackages).toEqual([
-      { name: 'express', importedBy: 1 },
-      { name: 'mongodb', importedBy: 1 },
-      { name: 'should', importedBy: 1 },
+      { name: 'express', importedBy: 1, importers: ['server.js'] },
+      { name: 'mongodb', importedBy: 1, importers: ['lib/db.js'] },
+      { name: 'should', importedBy: 1, importers: ['test/users.test.js'] },
     ]);
-    expect(report.manifests[0]).toMatchObject({ name: 'old-app', engines: { node: '0.10.x' } });
+    expect(report.manifests[0]).toMatchObject({ name: 'old-app', engines: { node: '0.10.x' }, scripts: { postinstall: expect.any(String) } });
     expect(report.graph.edges).toContainEqual(['routes/users.js', 'lib/db.js']);
     expect(report.graph.nodes.find((n) => n.id === 'test/users.test.js')).toMatchObject({ isTest: true, cluster: -1, score: null });
     expect(report.graph.nodes.find((n) => n.id === 'lib/db.js')).toMatchObject({ fanIn: 3, churn: 3, blastRadius: 4 });

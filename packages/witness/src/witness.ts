@@ -2,7 +2,7 @@ import { mkdtemp, readFile, rm } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import type { ExhumeReport, HttpRoute, InterviewReport, ResurrectReport, SandboxLimits, WitnessCase, WitnessReport, WitnessSnapshot, WitnessTestRun } from '@necromancer/core';
-import { errorMessage } from '@necromancer/core';
+import { errorMessage, shellArg } from '@necromancer/core';
 import { checkout, exhume as runExhume, headCommit } from '@necromancer/excavate';
 import type { StructuredModel } from '@necromancer/llm';
 import { BuildContext, bootServices, DEFAULT_LIMITS, firstError, imageRepoFor, tail, type Sandbox } from '@necromancer/resurrect';
@@ -38,6 +38,13 @@ export interface WitnessOptions {
 export async function witness(source: string, options: WitnessOptions): Promise<WitnessReport> {
   const log = options.onProgress ?? (() => {});
   const { sandbox, resurrect } = options;
+  if (resurrect.outcome === 'needs-you') {
+    const waiting = resurrect.pending?.kind === 'question' ? resurrect.pending.question : `approve ${resurrect.pending?.fix.description ?? 'a fix'}`;
+    throw new Error(
+      `Resurrect is paused, waiting on the owner (${waiting}); continue it with \`necromancer resurrect ${shellArg(source)} --resume\` ` +
+        '(or the resurrect tool with resume: true), then witness',
+    );
+  }
   if (resurrect.outcome !== 'resurrected') throw new Error(`Resurrect did not get this project running (BLOCKED: ${resurrect.blockedReason}); nothing to witness`);
   const limits: SandboxLimits = { ...DEFAULT_LIMITS, ...resurrect.limits, ...options.limits };
   const recipe = resurrect.recipe;

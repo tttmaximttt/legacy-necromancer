@@ -10,6 +10,9 @@ import { auditManifests } from './install-scripts.js';
 import { ImportParser, joinRoute, languageFor } from './parser.js';
 import { ImportResolver } from './resolve.js';
 
+/** Importing files listed per external package; `importedBy` has the full count. */
+const MAX_IMPORTERS = 20;
+
 export interface ExhumeOptions {
   /** Where remote repos are cloned. Defaults to the OS temp dir. */
   workdir?: string;
@@ -120,7 +123,7 @@ export async function exhume(source: string, options: ExhumeOptions = {}): Promi
       loadBearing: analysis.loadBearing,
       orphans: analysis.orphans,
       externalPackages: [...external]
-        .map(([name, importers]) => ({ name, importedBy: importers.size }))
+        .map(([name, importers]) => ({ name, importedBy: importers.size, importers: [...importers].sort().slice(0, MAX_IMPORTERS) }))
         .sort((a, b) => b.importedBy - a.importedBy || a.name.localeCompare(b.name)),
       caseMismatches,
       manifests,
