@@ -8,11 +8,8 @@ export function defaultEnvFile(): string {
   return path.join(os.homedir(), '.necromancer', '.env');
 }
 
-/** The ways to give the Anthropic SDK credentials. One set in the environment means the file's are not used. */
-const CREDENTIALS = ['NECROMANCER_ANTHROPIC_API_KEY', 'ANTHROPIC_API_KEY', 'ANTHROPIC_AUTH_TOKEN'];
-
-/** A non-empty value, ignoring an unexpanded `${...}` that older Claude Code versions pass through literally. */
-function usable(value: string | undefined): string | undefined {
+/** A non-empty value, ignoring blanks and an unexpanded `${...}` that older Claude Code versions pass through. */
+export function usable(value: string | undefined): string | undefined {
   const v = value?.trim();
   return v && !/^\$\{[^}]*\}$/.test(v) ? v : undefined;
 }
@@ -28,25 +25,29 @@ export function readEnvFile(file: string = defaultEnvFile()): Record<string, str
   }
   if (text.includes('\u0000')) throw new Error(`can't read ${file}: save it as UTF-8`);
   const vars: Record<string, string> = {};
-  for (const [name, value] of Object.entries(parseEnv(text.replace(/^﻿/, '')))) if (value !== undefined) vars[name] = value;
+  for (const [name, value] of Object.entries(parseEnv(text.replace(/^\uFEFF/, '')))) if (value !== undefined) vars[name] = value;
   return vars;
 }
 
+let cached: Record<string, string> | undefined;
+
 /**
- * Sets up this process's settings. The key is the first of: NECROMANCER_ANTHROPIC_API_KEY (which the Claude Code
- * plugin sets from its own settings), ANTHROPIC_API_KEY or ANTHROPIC_AUTH_TOKEN from the environment, then the same
- * names from ~/.necromancer/.env. Other variables in the file fill in only what the environment leaves unset.
- *
- * A separate name lets you keep the key away from Claude Code itself, which bills to ANTHROPIC_API_KEY when it finds
- * one in its environment.
+ * The variables in ~/.necromancer/.env, read once per process. They are never copied into process.env, so child
+ * processes don't inherit them. An unreadable file is reported once on stderr and treated as empty.
  */
-export function loadSettings(env: NodeJS.ProcessEnv = process.env, file: string = defaultEnvFile()): void {
-  const fromFile = readEnvFile(file);
-  const envHasKey = CREDENTIALS.some((name) => usable(env[name]));
-  for (const [name, value] of Object.entries(fromFile)) {
-    if (CREDENTIALS.includes(name) ? envHasKey : usable(env[name])) continue;
-    env[name] = value;
+export function fileSettings(): Record<string, string> {
+  if (!cached) {
+    try {
+      cached = readEnvFile();
+    } catch (err) {
+      process.stderr.write(`necromancer: ignoring settings file: ${err instanceof Error ? err.message : String(err)}\n`);
+      cached = {};
+    }
   }
-  const own = usable(env.NECROMANCER_ANTHROPIC_API_KEY);
-  if (own) env.ANTHROPIC_API_KEY = own;
+  return cached;
+}
+
+/** A setting from the environment, or else from ~/.necromancer/.env. */
+export function setting(name: string, env: NodeJS.ProcessEnv = process.env, file: Record<string, string> = fileSettings()): string | undefined {
+  return usable(env[name]) ?? usable(file[name]);
 }

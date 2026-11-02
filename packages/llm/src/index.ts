@@ -1,5 +1,6 @@
 import Anthropic from '@anthropic-ai/sdk';
 import { betaZodOutputFormat } from '@anthropic-ai/sdk/helpers/beta/zod';
+import { fileSettings, usable } from '@necromancer/core';
 import type { z } from 'zod';
 
 /**
@@ -47,7 +48,7 @@ export class LlmError extends Error {
 }
 
 export interface ClaudeModelOptions {
-  /** Injected in tests or to point at a proxy; defaults to `new Anthropic()`, which reads ANTHROPIC_API_KEY. */
+  /** Injected in tests or to point at a proxy; defaults to a client built from findCredentials(). */
   client?: Anthropic;
   model?: string;
   /** Re-run a declined request on Anthropic's recommended fallback model, server-side. On by default. */
@@ -66,7 +67,8 @@ export class ClaudeModel implements StructuredModel {
   }
 
   async generate<T>({ system, prompt, schema, effort = 'medium', maxTokens = 16_000 }: StructuredRequest<T>): Promise<StructuredResult<T>> {
-    const client = this.client ?? createClient();
+    const credentials = this.client ? null : findCredentials();
+    const client = this.client ?? createClient(credentials);
     let message;
     try {
       message = await client.beta.messages.create({
@@ -79,7 +81,7 @@ export class ClaudeModel implements StructuredModel {
         ...(this.fallbacks && { betas: ['server-side-fallback-2026-07-01'], fallbacks: 'default' as const }),
       });
     } catch (err) {
-      throw translate(err);
+      throw translate(err, credentials);
     }
 
     if (message.stop_reason === 'refusal') {
@@ -108,36 +110,69 @@ export class ClaudeModel implements StructuredModel {
   }
 }
 
-function createClient(): Anthropic {
-  try {
-    return new Anthropic();
-  } catch (err) {
-    throw translate(err);
+/** Where an Anthropic key can come from, in the order they are tried. */
+const KEY_VARIABLES = ['NECROMANCER_ANTHROPIC_API_KEY', 'ANTHROPIC_API_KEY', 'ANTHROPIC_AUTH_TOKEN'] as const;
+
+export interface Credentials {
+  apiKey?: string;
+  authToken?: string;
+  /** From the same place as the key, so a key is never sent to a gateway it wasn't set up for. */
+  baseURL: string;
+  /** Where the key came from, for error messages. */
+  from: string;
+}
+
+/**
+ * The first of NECROMANCER_ANTHROPIC_API_KEY (the Claude Code plugin's setting), ANTHROPIC_API_KEY and
+ * ANTHROPIC_AUTH_TOKEN set in the environment, or else in ~/.necromancer/.env. Only that one credential is used.
+ */
+export function findCredentials(env: NodeJS.ProcessEnv = process.env, file: Record<string, string> = fileSettings()): Credentials | null {
+  const places: Array<[Record<string, string | undefined>, string]> = [
+    [env, 'the environment'],
+    [file, '~/.necromancer/.env'],
+  ];
+  for (const [vars, place] of places) {
+    const name = KEY_VARIABLES.find((n) => usable(vars[n]));
+    if (!name) continue;
+    const value = usable(vars[name])!;
+    const baseURL = usable(vars.ANTHROPIC_BASE_URL) ?? 'https://api.anthropic.com';
+    const from = `${name} in ${place}${name === 'NECROMANCER_ANTHROPIC_API_KEY' && place === 'the environment' ? ' (the plugin setting, if you use the plugin)' : ''}`;
+    return name === 'ANTHROPIC_AUTH_TOKEN' ? { authToken: value, baseURL, from } : { apiKey: value, baseURL, from };
   }
+  return null;
 }
 
+/** True when a key or token is set somewhere Necromancer looks, so a call is worth attempting. */
+export function hasCredentials(env: NodeJS.ProcessEnv = process.env, file: Record<string, string> = fileSettings()): boolean {
+  return findCredentials(env, file) !== null;
+}
+
+/** How to give Necromancer a key. Shared by every message about a missing or rejected key. */
 export function credentialsHint(): string {
-  return 'no Anthropic credentials: set ANTHROPIC_API_KEY, or put it in ~/.necromancer/.env (https://platform.claude.com/settings/keys)';
+  return (
+    'run /plugin configure necromancer@legacy-necromancer in Claude Code, put ANTHROPIC_API_KEY=... in ~/.necromancer/.env, ' +
+    `or set one of ${KEY_VARIABLES.join(', ')} (https://platform.claude.com/settings/keys)`
+  );
 }
 
-/** True when an API key or token is in the environment, so a call is worth attempting. */
-export function hasCredentials(env: NodeJS.ProcessEnv = process.env): boolean {
-  return Boolean(env.ANTHROPIC_API_KEY || env.ANTHROPIC_AUTH_TOKEN);
+function createClient(credentials: Credentials | null): Anthropic {
+  if (!credentials) throw new LlmError('credentials', `no Anthropic API key: ${credentialsHint()}`);
+  const { apiKey, authToken, baseURL } = credentials;
+  return new Anthropic(apiKey ? { apiKey, baseURL } : { authToken, baseURL });
 }
 
-function translate(err: unknown): LlmError {
+function translate(err: unknown, credentials: Credentials | null = null): LlmError {
   if (err instanceof LlmError) return err;
   const detail = err instanceof Error ? err.message : String(err);
   if (err instanceof Anthropic.AuthenticationError || err instanceof Anthropic.PermissionDeniedError) {
-    return new LlmError('credentials', `the Anthropic API rejected the key. Necromancer uses the first one set of: NECROMANCER_ANTHROPIC_API_KEY (the plugin setting, /plugin configure necromancer@legacy-necromancer), ANTHROPIC_API_KEY or ANTHROPIC_AUTH_TOKEN, then ~/.necromancer/.env (${detail})`, {
-      cause: err,
-    });
+    const which = credentials ? `the key from ${credentials.from}` : 'the key';
+    return new LlmError('credentials', `the Anthropic API rejected ${which}. To change it, ${credentialsHint()} (${detail})`, { cause: err });
   }
   if (err instanceof Anthropic.RateLimitError) return new LlmError('rate_limit', `rate limited; try again shortly (${detail})`, { cause: err });
   if (err instanceof Anthropic.InternalServerError) return new LlmError('overloaded', `the API is overloaded or failing (${detail})`, { cause: err });
   if (err instanceof Anthropic.APIError) return new LlmError('api', detail, { cause: err });
   // The SDK throws a plain Error when it can't find any credentials.
-  if (/api[_ ]?key|auth/i.test(detail)) return new LlmError('credentials', `${credentialsHint()} (${detail})`, { cause: err });
+  if (/api[_ ]?key|auth/i.test(detail)) return new LlmError('credentials', `no usable Anthropic API key: ${credentialsHint()} (${detail})`, { cause: err });
   return new LlmError('api', detail, { cause: err });
 }
 

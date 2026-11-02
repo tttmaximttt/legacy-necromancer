@@ -96,6 +96,10 @@ Necromancer takes the first key it finds here:
 2. `ANTHROPIC_API_KEY` in its environment
 3. the same variables in the file `~/.necromancer/.env`
 
+Only that one key is used. `ANTHROPIC_BASE_URL` is read from the same place
+as the key, so a key from your shell is never sent to a gateway set in the
+file, or the other way round.
+
 ### One file for everything
 
 The file works the same way for the terminal, the plugin, the MCP server and
@@ -176,7 +180,7 @@ on `ubuntu-latest`, which has Docker:
 
 If your company sends Anthropic traffic through its own gateway, set
 `ANTHROPIC_BASE_URL` to it, plus `ANTHROPIC_AUTH_TOKEN` if it expects a
-bearer token instead of a key. Put them in `~/.necromancer/.env` rather than
+bearer token instead of a key. Put both in `~/.necromancer/.env` rather than
 the shell you start Claude Code from, which would point Claude Code at the
 gateway too. The gateway has to pass requests to Anthropic unchanged,
 including beta headers and the model name `claude-opus-5-5`. Other

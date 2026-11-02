@@ -9,7 +9,7 @@ import { ReportStore, slugFor, type ExhumeReport, type GraveyardReport, type Int
 import { exhume as runExhume, type ExhumeOptions } from '@necromancer/excavate';
 import { graveyard as runGraveyard, type GraveyardOptions } from '@necromancer/graveyard';
 import { answerInterview, interviewBrief, proposeIntent, ProposalSchema, recordProposal } from '@necromancer/interview';
-import { ClaudeModel, hasCredentials, type StructuredModel } from '@necromancer/llm';
+import { ClaudeModel, credentialsHint, hasCredentials, type StructuredModel } from '@necromancer/llm';
 import { DEFAULT_MAX_ITERATIONS, DEFAULT_TOKEN_BUDGET, DockerSandbox, FixCache, resurrect, type Sandbox } from '@necromancer/resurrect';
 import { compareWitness, witness } from '@necromancer/witness';
 
@@ -21,7 +21,7 @@ export interface ServerOptions {
   workdir?: string;
   /** Where reports are saved for `necromancer ui`. Defaults to ~/.necromancer/reports. */
   store?: ReportStore;
-  /** Model for the interview, Resurrect's fixes and Witness inputs. Defaults to Claude when ANTHROPIC_API_KEY is set. */
+  /** Model for the interview, Resurrect's fixes and Witness inputs. Defaults to Claude when an Anthropic API key is set. */
   model?: StructuredModel;
   /** Where Resurrect runs containers. Defaults to the local Docker daemon. */
   sandbox?: Sandbox;
@@ -232,7 +232,7 @@ export function createServer(options: ServerOptions = {}): McpServer {
       description:
         'Phase 5. Builds the project in Docker on the Node version of its era, with its databases (Mongo, Redis, Postgres, ' +
         'MySQL…) as sidecars, and boots it until a port answers. Failures are fixed from a table of known fixes, then by ' +
-        'Claude if ANTHROPIC_API_KEY is set, for at most maxIterations attempts and tokenBudget tokens; otherwise it ends ' +
+        'Claude if an Anthropic API key is set, for at most maxIterations attempts and tokenBudget tokens; otherwise it ends ' +
         'with BLOCKED and a reason. Sandbox: network only while installing dependencies, no host mounts, no credentials, ' +
         'CPU/memory/process/time limits. Takes minutes. Needs Docker on the machine running this server.',
       inputSchema: {
@@ -272,7 +272,7 @@ export function createServer(options: ServerOptions = {}): McpServer {
           warnings: report.warnings,
           dockerfile: report.dockerfile,
           compose: report.compose,
-          ...(!model && tokenBudget > 0 && { note: 'No ANTHROPIC_API_KEY in the server environment or ~/.necromancer/.env, so only known fixes were tried.' }),
+          ...(!model && tokenBudget > 0 && { note: `No Anthropic API key, so only known fixes were tried. To add one, ${credentialsHint()}.` }),
           ...(save && (await saveNote('resurrect', report))),
         });
       } catch (err) {
@@ -287,7 +287,7 @@ export function createServer(options: ServerOptions = {}): McpServer {
       title: 'Record how the revived app behaves',
       description:
         'Phase 6. Boots the app the way `resurrect` got it running, sends every route Exhume found one to three requests ' +
-        '(written by Claude from the handler code when ANTHROPIC_API_KEY is set, placeholders otherwise), and records the ' +
+        '(written by Claude from the handler code when an Anthropic API key is set, placeholders otherwise), and records the ' +
         "responses as golden snapshots with timestamps, IDs, tokens and other volatile values blanked. Runs the project's " +
         'own tests next to it. With check: true, re-sends the saved golden requests and reports what changed instead of ' +
         'saving. Needs a prior `resurrect` and Docker; takes minutes.',
@@ -335,7 +335,7 @@ export function createServer(options: ServerOptions = {}): McpServer {
             error: s.response.error,
             body: truncate(JSON.stringify(s.response.body) ?? 'null', 400),
           })),
-          ...(!model && { note: 'No ANTHROPIC_API_KEY in the server environment or ~/.necromancer/.env, so each route got one placeholder request.' }),
+          ...(!model && { note: `No Anthropic API key, so each route got one placeholder request. To add one, ${credentialsHint()}.` }),
           ...(save && (await saveNote('witness', report))),
         });
       } catch (err) {

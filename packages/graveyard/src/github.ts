@@ -1,3 +1,4 @@
+import { setting } from '@necromancer/core';
 import { getJson, HttpError, type Fetch } from './http.js';
 
 export interface RepoStatus {
@@ -23,7 +24,7 @@ export class GitHubClient {
 
   constructor(
     private readonly fetch: Fetch = globalThis.fetch,
-    private readonly token: string | undefined = process.env.GITHUB_TOKEN ?? process.env.GH_TOKEN,
+    private readonly token: string | undefined = setting('GITHUB_TOKEN') ?? setting('GH_TOKEN'),
     private readonly base = 'https://api.github.com',
   ) {}
 

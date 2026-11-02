@@ -129,5 +129,5 @@ example `"env": { "HTTPS_PROXY": "http://proxy:3128", "NODE_USE_ENV_PROXY": "1" 
 | `NECROMANCER_WORKDIR` | OS temp dir | Where remote repos are cloned (deleted after each call) |
 | `GITHUB_TOKEN` / `GH_TOKEN` | unset | GitHub API token for the archived check; without one only quiet packages are checked |
 
-Any of these can also go in `~/.necromancer/.env`. Values set in the server's
-environment win.
+The key variables and `GITHUB_TOKEN` can also go in `~/.necromancer/.env`.
+Values set in the server's environment win.
