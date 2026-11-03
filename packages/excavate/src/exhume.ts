@@ -10,6 +10,9 @@ import { auditManifests } from './install-scripts.js';
 import { ImportParser, joinRoute, languageFor } from './parser.js';
 import { ImportResolver } from './resolve.js';
 
+/** Importing (or naming) files listed per external package; `importedBy` (`referenceCount`) has the full count. */
+const MAX_IMPORTERS = 20;
+
 export interface ExhumeOptions {
   /** Where remote repos are cloned. Defaults to the OS temp dir. */
   workdir?: string;
@@ -33,11 +36,17 @@ export async function exhume(source: string, options: ExhumeOptions = {}): Promi
   try {
     const allFiles = await listRepoFiles(repo.root);
     const sourcePaths = allFiles.filter((f) => languageFor(f));
-    log(`parsing ${sourcePaths.length} source files`);
 
+    log('auditing install scripts');
+    const { findings, manifests } = await auditManifests(repo.root, allFiles);
+    // Packages loaded by name rather than imported: `app.set('view engine', 'jade')`, `require.resolve('x')`.
+    const declared = new Set(manifests.flatMap((m) => [...Object.keys(m.dependencies), ...Object.keys(m.devDependencies)]));
+
+    log(`parsing ${sourcePaths.length} source files`);
     const parser = await ImportParser.create();
     const resolver = new ImportResolver(allFiles, await readMains(repo.root, allFiles));
     const files: SourceFile[] = [];
+    const namesByFile = new Map<string, string[]>();
     const routesByFile = new Map<string, RawRoute[]>();
     const mountsByFile = new Map<string, Array<RawMount & { target: string }>>();
     try {
@@ -55,6 +64,8 @@ export async function exhume(source: string, options: ExhumeOptions = {}): Promi
           isTest: isTestFile(rel),
           imports: parsed.imports.map((imp) => resolver.resolve(rel, imp)),
         });
+        const named = parsed.names.filter((n) => declared.has(n));
+        if (named.length) namesByFile.set(rel, named);
         if (parsed.routes.length && !isTestFile(rel)) routesByFile.set(rel, parsed.routes);
         const mounts = parsed.mounts.flatMap((m) => {
           const r = resolver.resolve(rel, { specifier: m.specifier, kind: 'require', line: m.line });
@@ -78,9 +89,6 @@ export async function exhume(source: string, options: ExhumeOptions = {}): Promi
       includeTests: options.includeTests,
     });
 
-    log('auditing install scripts');
-    const { findings, manifests } = await auditManifests(repo.root, allFiles);
-
     const external = new Map<string, Set<string>>();
     const caseMismatches: ExhumeReport['caseMismatches'] = [];
     let unresolved = 0;
@@ -97,6 +105,16 @@ export async function exhume(source: string, options: ExhumeOptions = {}): Promi
       }
     }
 
+    const referenced = new Map<string, Set<string>>();
+    for (const [file, names] of namesByFile) {
+      for (const name of names) {
+        let files = referenced.get(name);
+        if (!files) referenced.set(name, (files = new Set()));
+        files.add(file);
+      }
+    }
+    const packageNames = [...new Set([...external.keys(), ...referenced.keys()])];
+
     const { files: _perFile, ...historySummary } = history;
     const report: ExhumeReport & { root?: string } = {
       repo: {
@@ -108,7 +126,7 @@ export async function exhume(source: string, options: ExhumeOptions = {}): Promi
         files: files.length,
         loc: files.reduce((n, f) => n + f.loc, 0),
         internalEdges: graph.size,
-        externalPackages: external.size,
+        externalPackages: packageNames.length,
         unresolvedImports: unresolved,
         caseMismatchedImports: caseMismatches.length,
         testFiles: files.filter((f) => f.isTest).length,
@@ -119,8 +137,17 @@ export async function exhume(source: string, options: ExhumeOptions = {}): Promi
       clusters: analysis.clusters,
       loadBearing: analysis.loadBearing,
       orphans: analysis.orphans,
-      externalPackages: [...external]
-        .map(([name, importers]) => ({ name, importedBy: importers.size }))
+      externalPackages: packageNames
+        .map((name) => {
+          const importers = external.get(name) ?? new Set<string>();
+          const refs = referenced.get(name);
+          return {
+            name,
+            importedBy: importers.size,
+            importers: [...importers].sort().slice(0, MAX_IMPORTERS),
+            ...(refs ? { referencedBy: [...refs].sort().slice(0, MAX_IMPORTERS), referenceCount: refs.size } : {}),
+          };
+        })
         .sort((a, b) => b.importedBy - a.importedBy || a.name.localeCompare(b.name)),
       caseMismatches,
       manifests,

@@ -1,0 +1,22 @@
+{
+  "name": "@necromancer/plan",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Turn the saved reports into an ordered modernization plan, each step followed by a behaviour check.",
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -b"
+  },
+  "dependencies": {
+    "@necromancer/core": "workspace:*"
+  }
+}

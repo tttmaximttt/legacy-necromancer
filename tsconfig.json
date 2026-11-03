@@ -17,6 +17,9 @@
       "path": "packages/witness"
     },
     {
+      "path": "packages/plan"
+    },
+    {
       "path": "packages/surgeon"
     },
     {

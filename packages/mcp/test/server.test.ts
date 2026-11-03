@@ -3,13 +3,20 @@ import os from 'node:os';
 import path from 'node:path';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
-import { describe, expect, it } from 'vitest';
-import { ReportStore, type ExhumeReport, type GraveyardReport, type Tombstone } from '@necromancer/core';
+import { describe, expect, it, vi } from 'vitest';
+import { ReportStore, slugFor, type ExhumeReport, type GraveyardReport, type Tombstone } from '@necromancer/core';
 import { ScriptedModel } from '@necromancer/llm';
 import { createServer, summarize, type ServerOptions } from '@necromancer/mcp';
+import { errorSignature, resurrect } from '@necromancer/resurrect';
 import { fixtureRepo, goodProposal } from '../../interview/test/fixtures.js';
 import { deadApp, expressMongoApp, FakeSandbox, NODE_GYP_LOG } from '../../resurrect/test/helpers.js';
 import { answering } from '../../witness/test/helpers.js';
+
+// The real resurrect, wrapped so a test can see the options the server passed.
+vi.mock('@necromancer/resurrect', async (importOriginal) => {
+  const original = await importOriginal<typeof import('@necromancer/resurrect')>();
+  return { ...original, resurrect: vi.fn(original.resurrect) };
+});
 
 const storeDir = await mkdtemp(path.join(os.tmpdir(), 'necro-store-'));
 
@@ -20,6 +27,21 @@ async function connect(options?: ServerOptions): Promise<Client> {
   await client.connect(clientTransport);
   return client;
 }
+
+const UNKNOWN = "Error: Cannot find module './config/local.json'\n    at Function.Module._resolveFilename (module.js:470:15)";
+const CACHE_FIX = `cache:${errorSignature('boot', UNKNOWN)}`;
+
+/**
+ * A store in a fresh directory, with a risky fix for UNKNOWN in the fix cache the server keeps next to it: known fixes
+ * apply without asking, but a cached one waits for the owner.
+ */
+async function storeWithRiskyCache(): Promise<ReportStore> {
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'necro-mcp-'));
+  const fix = { description: 'add the config package', ops: [{ op: 'setDependency', name: 'config', version: '^1.0.0' }], hits: 1 };
+  await writeFile(path.join(dir, 'fix-cache.json'), JSON.stringify({ [errorSignature('boot', UNKNOWN)]: fix }));
+  return new ReportStore(path.join(dir, 'reports'));
+}
+const pausing = () => new FakeSandbox({ boot: [{ ok: false, log: UNKNOWN }] });
 
 const text = (result: Awaited<ReturnType<Client['callTool']>>) =>
   (result.content as Array<{ type: string; text: string }>)[0]!.text;
@@ -34,7 +56,7 @@ describe('necromancer MCP server', () => {
   it('lists the tools and the autopsy prompt', async () => {
     const client = await connect();
     const { tools } = await client.listTools();
-    expect(tools.map((t) => t.name)).toEqual(['exhume', 'graveyard', 'interview', 'record_interview', 'resurrect', 'witness']);
+    expect(tools.map((t) => t.name)).toEqual(['exhume', 'graveyard', 'interview', 'record_interview', 'resurrect', 'witness', 'plan']);
     expect(tools.slice(0, 2).every((t) => t.annotations?.readOnlyHint)).toBe(true);
     expect(Object.keys(tools[1]!.inputSchema.properties ?? {})).toEqual(['source', 'advisories', 'github', 'detail', 'save']);
     expect(Object.keys(tools[0]!.inputSchema.properties ?? {})).toEqual(['source', 'top', 'includeTests', 'detail', 'save']);
@@ -133,6 +155,10 @@ describe('summarize', () => {
     expect(summary.truncated).toMatchObject({ infoInstallScripts: 10 });
     expect(summary.manifests[0]).toMatchObject({ dependencies: 2, devDependencies: 0 });
     expect(summary).not.toHaveProperty('graph');
+    expect(summary.externalPackages).toEqual([
+      { name: 'a', importedBy: 20 },
+      { name: 'b', importedBy: 0, referenceCount: 3 },
+    ]);
   });
 });
 
@@ -145,7 +171,10 @@ function fakeReport(n: number): ExhumeReport {
     clusters: [{ id: 0, label: 'src', size: n, files, cohesion: 1 }],
     loadBearing: [],
     orphans: [...files, ...files],
-    externalPackages: [],
+    externalPackages: [
+      { name: 'a', importedBy: n, importers: files },
+      { name: 'b', importedBy: 0, importers: [], referencedBy: files.slice(0, 3), referenceCount: 3 },
+    ],
     caseMismatches: [],
     manifests: [{ manifest: 'package.json', name: 'x', engines: {}, dependencies: { a: '1', b: '2' }, devDependencies: {} }],
     graph: { nodes: [], edges: [] },
@@ -232,7 +261,7 @@ describe('necromancer MCP resurrect', () => {
     const root = await deadApp(expressMongoApp);
     const sandbox = new FakeSandbox({ install: [{ ok: false, log: NODE_GYP_LOG }] });
     const client = await connect({ sandbox });
-    const result = await client.callTool({ name: 'resurrect', arguments: { source: root, tokenBudget: 0 } });
+    const result = await client.callTool({ name: 'resurrect', arguments: { source: root, tokenBudget: 0, approvals: 'all' } });
     expect(result.isError).toBeFalsy();
     const body = JSON.parse(text(result));
     expect(body.outcome).toBe('RESURRECTED');
@@ -247,6 +276,231 @@ describe('necromancer MCP resurrect', () => {
     const body = JSON.parse(text(await client.callTool({ name: 'resurrect', arguments: { source: root, tokenBudget: 0, save: false } })));
     expect(body.outcome).toMatch(/^BLOCKED: boot failed and no known fix matches/);
     expect(body.savedTo).toBeUndefined();
+  });
+
+  it('pauses on a risky fix so the host can ask, then resumes with the answer', async () => {
+    const root = await deadApp(expressMongoApp);
+    const store = await storeWithRiskyCache();
+    const paused = await connect({ store, sandbox: pausing() });
+    const body = JSON.parse(text(await paused.callTool({ name: 'resurrect', arguments: { source: root, tokenBudget: 0, save: false } })));
+    expect(body.outcome).toBe('NEEDS YOU');
+    expect(body.pending).toEqual({
+      kind: 'approval',
+      fix: { source: 'cache', id: CACHE_FIX, description: 'add the config package' },
+      risks: ['changes package.json: sets config to ^1.0.0'],
+    });
+    expect(body.next).toMatch(/ask whether to apply it.*resume: true and approve: true/);
+    expect(body.savedTo).toBe(path.join(store.dir, path.basename(root), 'resurrect.json'));
+
+    const client = await connect({ store, sandbox: new FakeSandbox({}) });
+    const missing = await client.callTool({ name: 'resurrect', arguments: { source: root, tokenBudget: 0, resume: true } });
+    expect(missing.isError).toBe(true);
+    expect(text(missing)).toContain('resuming needs a decision on the pending fix');
+    // approvals: "all" covers fixes found later, never the pending one, as the CLI's --yes.
+    const all = await client.callTool({ name: 'resurrect', arguments: { source: root, tokenBudget: 0, resume: true, approvals: 'all' } });
+    expect(all.isError).toBe(true);
+    expect(text(all)).toContain('resuming needs a decision on the pending fix');
+    expect(text(all)).toContain('then call again with approve: true or false; approvals: "all" does not answer it.');
+    const resumed = JSON.parse(
+      text(await client.callTool({ name: 'resurrect', arguments: { source: root, tokenBudget: 0, resume: true, approve: true, save: false } })),
+    );
+    expect(resumed.outcome).toBe('RESURRECTED');
+    // Even with save: false, the resumed run replaces the stale needs-you report.
+    expect(resumed.savedTo).toBe(path.join(store.dir, path.basename(root), 'resurrect.json'));
+    expect((await store.load(path.basename(root)))?.resurrect?.outcome).toBe('resurrected');
+    // Risks are trimmed to their reasons.
+    expect(resumed.decisions).toMatchObject([
+      { kind: 'approval', subject: CACHE_FIX, answer: 'approved', by: 'owner', risks: ['changes package.json: sets config to ^1.0.0'] },
+    ]);
+    expect(resumed.pending).toBeUndefined();
+  });
+
+  it('applies a risky cached fix with approvals "all" and records it as approved automatically', async () => {
+    const root = await deadApp(expressMongoApp);
+    const client = await connect({ store: await storeWithRiskyCache(), sandbox: pausing() });
+    const body = JSON.parse(text(await client.callTool({ name: 'resurrect', arguments: { source: root, tokenBudget: 0, approvals: 'all', save: false } })));
+    expect(body.outcome).toBe('RESURRECTED');
+    expect(body.decisions).toMatchObject([{ kind: 'approval', subject: CACHE_FIX, answer: 'approved', by: 'auto' }]);
+  });
+
+  it('replaces a paused run with a fresh one even with save: false, so resume cannot carry on the stale run', async () => {
+    const root = await deadApp(expressMongoApp);
+    const store = await storeWithRiskyCache();
+    await (await connect({ store, sandbox: pausing() })).callTool({ name: 'resurrect', arguments: { source: root, tokenBudget: 0 } });
+    expect((await store.load(path.basename(root)))!.resurrect!.outcome).toBe('needs-you');
+
+    const fresh = await connect({ store, sandbox: new FakeSandbox({ boot: [{ ok: false, log: 'Error: Cannot find module ./secret' }] }) });
+    const body = JSON.parse(text(await fresh.callTool({ name: 'resurrect', arguments: { source: root, tokenBudget: 0, save: false } })));
+    expect(body.outcome).toMatch(/^BLOCKED/);
+    expect(body.savedTo).toBe(path.join(store.dir, path.basename(root), 'resurrect.json'));
+    expect((await store.load(path.basename(root)))!.resurrect!.outcome).toBe('blocked');
+    const resumed = await fresh.callTool({ name: 'resurrect', arguments: { source: root, resume: true, approve: true } });
+    expect(resumed.isError).toBe(true);
+    expect(text(resumed)).toMatch(/this one ended blocked/);
+  });
+
+  it('refuses approve or answer without resume, and both together, leaving the paused run as it was', async () => {
+    const root = await deadApp(expressMongoApp);
+    const store = await storeWithRiskyCache();
+    await (await connect({ store, sandbox: pausing() })).callTool({
+      name: 'resurrect',
+      arguments: { source: root, tokenBudget: 0 },
+    });
+    const client = await connect({ store, sandbox: new FakeSandbox({}) });
+    for (const args of [{ approve: true }, { approve: false }, { answer: 'stub it' }]) {
+      const result = await client.callTool({ name: 'resurrect', arguments: { source: root, tokenBudget: 0, ...args } });
+      expect(result.isError).toBe(true);
+      expect(text(result)).toContain('approve and answer go with resume: true');
+    }
+    const both = await client.callTool({ name: 'resurrect', arguments: { source: root, resume: true, approve: true, answer: 'stub it' } });
+    expect(both.isError).toBe(true);
+    expect(text(both)).toContain('not both');
+    expect((await store.load(path.basename(root)))!.resurrect!.outcome).toBe('needs-you');
+  });
+
+  it('keeps the paused run\'s limits on resume unless the caller gives new ones', async () => {
+    const root = await deadApp(expressMongoApp);
+    const store = await storeWithRiskyCache();
+    const lastResume = () => vi.mocked(resurrect).mock.calls.at(-1)![1].resume!;
+    const pause = async () =>
+      (await connect({ store, sandbox: pausing() })).callTool({
+        name: 'resurrect',
+        arguments: { source: root, maxIterations: 4, tokenBudget: 0 },
+      });
+
+    await pause();
+    const client = await connect({ store, sandbox: new FakeSandbox({}) });
+    expect(JSON.parse(text(await client.callTool({ name: 'resurrect', arguments: { source: root, resume: true, approve: true } }))).outcome).toBe('RESURRECTED');
+    expect(lastResume()).toMatchObject({ approve: true, run: { settings: { maxIterations: 4, tokenBudget: 0 } } });
+    // A resume runs on the paused run's settings, so none of the fresh-run options is passed.
+    expect(Object.keys(vi.mocked(resurrect).mock.calls.at(-1)![1]).sort()).toEqual(['approve', 'fixCache', 'model', 'onProgress', 'resume', 'sandbox']);
+
+    await pause();
+    await client.callTool({ name: 'resurrect', arguments: { source: root, resume: true, approve: true, maxIterations: 6, tokenBudget: 0 } });
+    expect(lastResume()).toMatchObject({ approve: true, run: { settings: { maxIterations: 6, tokenBudget: 0 } } });
+  });
+
+  it('asks the paused run\'s model on resume, and none when it asked none', async () => {
+    const root = await deadApp(expressMongoApp);
+    const store = await storeWithRiskyCache();
+    const last = () => vi.mocked(resurrect).mock.calls.at(-1)![1];
+    const pause = async (args: Record<string, unknown>, model?: ScriptedModel) =>
+      (await connect({ store, model, sandbox: pausing() })).callTool({
+        name: 'resurrect',
+        arguments: { source: root, ...args },
+      });
+    const client = await connect({ store, model: new ScriptedModel(), sandbox: new FakeSandbox({}) });
+
+    // Paused without a model: a larger budget alone does not bring one in.
+    await pause({ tokenBudget: 0 }, new ScriptedModel());
+    await client.callTool({ name: 'resurrect', arguments: { source: root, resume: true, approve: true, tokenBudget: 1000 } });
+    expect(last().model).toBeNull();
+
+    await pause({}, new ScriptedModel());
+    expect(JSON.parse(text(await client.callTool({ name: 'resurrect', arguments: { source: root, resume: true, approve: true } }))).outcome).toBe('RESURRECTED');
+    expect(last().model).toBeInstanceOf(ScriptedModel);
+
+    // Paused with a model, resumed where there is no key: say how to add one, or to go on without.
+    await pause({}, new ScriptedModel());
+    const keyless = await connect({ store, sandbox: new FakeSandbox({}) });
+    const refused = await keyless.callTool({ name: 'resurrect', arguments: { source: root, resume: true, approve: true } });
+    expect(refused.isError).toBe(true);
+    expect(text(refused)).toMatch(/the paused run asked scripted for fixes, and there is no Anthropic API key; to add one, .*, or call again with tokenBudget: 0/);
+    expect((await store.load(path.basename(root)))!.resurrect!.outcome).toBe('needs-you');
+    const known = JSON.parse(text(await keyless.callTool({ name: 'resurrect', arguments: { source: root, resume: true, approve: true, tokenBudget: 0 } })));
+    expect(known.outcome).toBe('RESURRECTED');
+    expect(last().model).toBeNull();
+  });
+
+  it('pauses on a question and passes the answer on when resumed', async () => {
+    const root = await deadApp(expressMongoApp);
+    // A store of its own, so the model fix it learns stays out of the shared fix cache.
+    const store = new ReportStore(path.join(await mkdtemp(path.join(os.tmpdir(), 'necro-mcp-')), 'reports'));
+    const question = {
+      diagnosis: '@acme/core is not on the public registry',
+      decision: 'ask',
+      ops: [],
+      blockedReason: null,
+      question: 'Is there a public replacement for @acme/core?',
+      choices: ['stub it', 'drop the feature'],
+    };
+    const asking = await connect({
+      store,
+      sandbox: new FakeSandbox({ install: [{ ok: false, log: 'npm ERR! 404 Not Found: @acme/core@1.2.0' }] }),
+      model: new ScriptedModel(question),
+    });
+    const body = JSON.parse(text(await asking.callTool({ name: 'resurrect', arguments: { source: root, approvals: 'all' } })));
+    expect(body.outcome).toBe('NEEDS YOU');
+    expect(body.pending).toEqual({ kind: 'question', question: question.question, context: expect.any(String), choices: question.choices });
+    expect(body.next).toMatch(/resume: true and answer/);
+    // The choices are listed unnumbered, so the answer is the choice's text, never a number standing for it.
+    expect(body.next).toContain('for a choice, its text, not its number');
+    expect(body.next).toContain('do not ask them for passwords, keys or other secrets');
+
+    const model = new ScriptedModel({ diagnosis: 'stub it', decision: 'fix', ops: [{ op: 'setEnv', name: 'CI', value: 'true' }], blockedReason: null, question: null, choices: [] });
+    const client = await connect({ store, sandbox: new FakeSandbox({}), model });
+    for (const blank of ['', '  ']) {
+      const empty = await client.callTool({ name: 'resurrect', arguments: { source: root, resume: true, answer: blank } });
+      expect(empty.isError).toBe(true);
+      expect(text(empty)).toContain('answer is empty');
+    }
+    expect((await store.load(path.basename(root)))!.resurrect!.outcome).toBe('needs-you');
+    const resumed = JSON.parse(text(await client.callTool({ name: 'resurrect', arguments: { source: root, resume: true, answer: 'stub it' } })));
+    expect(resumed.outcome).toBe('RESURRECTED');
+    expect(model.requests[0]!.prompt).toContain('The owner answered your question: stub it');
+  });
+});
+
+describe('necromancer MCP plan', () => {
+  it('needs a saved graveyard report', async () => {
+    const root = await deadApp(expressMongoApp);
+    const result = await (await connect()).callTool({ name: 'plan', arguments: { source: root } });
+    expect(result.isError).toBe(true);
+    expect(text(result)).toContain('run the `graveyard` tool first');
+  });
+
+  it('returns the steps in a line each and saves plan.json and plan.md', async () => {
+    const source = 'https://example.com/plan-me.git';
+    await new ReportStore(storeDir).save('graveyard', { ...fakeGraveyard(), repo: { source, commit: null } });
+    const body = JSON.parse(text(await (await connect()).callTool({ name: 'plan', arguments: { source } })));
+    expect(body.target).toBe('Node 24');
+    expect(body.steps).toEqual([`1. Move to Node 24 (high) → necromancer resurrect ${source}`]);
+    expect(body.leftAlone).toBe(1);
+    expect(body.warnings).toContain(`No witness report: run \`necromancer witness ${source}\` first so each step can be checked against recorded behaviour.`);
+    expect(body.savedTo).toBe(path.join(storeDir, slugFor(source), 'plan.json'));
+    expect(await readFile(body.markdown, 'utf8')).toContain(`# Modernization plan for ${source}`);
+  });
+
+  it('caps the step lines and points at plan.md for the rest', async () => {
+    const source = 'https://example.com/plan-big.git';
+    const base = fakeGraveyard();
+    const tombstones = Array.from({ length: 40 }, (_, i) => ({ ...base.tombstones[0]!, name: `pkg-${String(i).padStart(2, '0')}`, latest: '4.18.0' }));
+    await new ReportStore(storeDir).save('graveyard', { ...base, tombstones, repo: { source, commit: null } });
+    const body = JSON.parse(text(await (await connect()).callTool({ name: 'plan', arguments: { source, save: false } })));
+    expect(body.steps).toHaveLength(31);
+    expect(body.steps.at(-1)).toBe('…and 11 more; call plan with save: true to write them all to plan.md');
+    const saved = JSON.parse(text(await (await connect()).callTool({ name: 'plan', arguments: { source } })));
+    expect(saved.steps.at(-1)).toBe(`…and 11 more; see ${path.join(storeDir, slugFor(source), 'plan.md')}`);
+  });
+
+  it('reports a plan.md that could not be saved instead of pointing at it', async () => {
+    const source = 'https://example.com/plan-unsaved.git';
+    const base = fakeGraveyard();
+    const tombstones = Array.from({ length: 40 }, (_, i) => ({ ...base.tombstones[0]!, name: `pkg-${String(i).padStart(2, '0')}`, latest: '4.18.0' }));
+    class NoFiles extends ReportStore {
+      override async saveFile(source: string, name: string, text: string): Promise<string> {
+        if (name === 'plan.md') throw new Error('EACCES: permission denied');
+        return super.saveFile(source, name, text);
+      }
+    }
+    const store = new NoFiles(storeDir);
+    await store.save('graveyard', { ...base, tombstones, repo: { source, commit: null } });
+    const body = JSON.parse(text(await (await connect({ store })).callTool({ name: 'plan', arguments: { source } })));
+    expect(body.savedTo).toBe(path.join(storeDir, slugFor(source), 'plan.json'));
+    expect(body.markdown).toBeNull();
+    expect(body.markdownError).toContain('EACCES: permission denied');
+    expect(body.steps.at(-1)).not.toContain('see ');
+    expect(body.steps.at(-1)).toContain('could not be saved');
   });
 });
 

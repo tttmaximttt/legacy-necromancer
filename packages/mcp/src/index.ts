@@ -5,12 +5,35 @@ import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import type { RequestHandlerExtra } from '@modelcontextprotocol/sdk/shared/protocol.js';
 import type { ServerNotification, ServerRequest } from '@modelcontextprotocol/sdk/types.js';
 import { z } from 'zod';
-import { errorMessage, ReportStore, slugFor, type ExhumeReport, type GraveyardReport, type InterviewReport, type ReportKind } from '@necromancer/core';
+import {
+  errorMessage,
+  ReportStore,
+  slugFor,
+  type ExhumeReport,
+  type GraveyardReport,
+  type InterviewReport,
+  type PendingDecision,
+  type ReportKind,
+  type ResurrectReport,
+} from '@necromancer/core';
 import { exhume as runExhume, type ExhumeOptions } from '@necromancer/excavate';
 import { graveyard as runGraveyard, type GraveyardOptions } from '@necromancer/graveyard';
+import { buildPlan, renderPlanMarkdown } from '@necromancer/plan';
 import { answerInterview, interviewBrief, proposeIntent, ProposalSchema, recordProposal } from '@necromancer/interview';
 import { ClaudeModel, credentialsHint, hasCredentials, type StructuredModel } from '@necromancer/llm';
-import { DEFAULT_MAX_ITERATIONS, DEFAULT_TOKEN_BUDGET, DockerSandbox, FixCache, resurrect, type Sandbox } from '@necromancer/resurrect';
+import {
+  DEFAULT_MAX_ITERATIONS,
+  DEFAULT_TOKEN_BUDGET,
+  DockerSandbox,
+  FixCache,
+  prepareResume,
+  ResumeError,
+  resumeSettings,
+  resurrect,
+  type ResumeInput,
+  type ResurrectOptions,
+  type Sandbox,
+} from '@necromancer/resurrect';
 import { compareWitness, witness } from '@necromancer/witness';
 
 export interface ServerOptions {
@@ -32,6 +55,7 @@ const SUMMARY_FILES_PER_CLUSTER = 8;
 const SUMMARY_INFO_FINDINGS = 10;
 const SUMMARY_ORPHANS = 20;
 const SUMMARY_EXTERNAL_PACKAGES = 30;
+const MAX_PLAN_STEPS = 30;
 
 export function createServer(options: ServerOptions = {}): McpServer {
   const exhume = options.exhume ?? runExhume;
@@ -47,7 +71,7 @@ export function createServer(options: ServerOptions = {}): McpServer {
   /** Earlier reports for this source, or null when there are none or the store can't be read. */
   const loadSaved = (source: string) => store.load(slugFor(source)).catch(() => null);
   const defaultSandbox = () => options.sandbox ?? new DockerSandbox();
-  const defaultModel = () => options.model ?? (hasCredentials() ? new ClaudeModel() : null);
+  const defaultModel = (name?: string) => options.model ?? (hasCredentials() ? new ClaudeModel({ model: name }) : null);
   const server = new McpServer({ name: 'necromancer', version: serverVersion() });
 
   server.registerTool(
@@ -239,34 +263,109 @@ export function createServer(options: ServerOptions = {}): McpServer {
         'Phase 5. Builds the project in Docker on the Node version of its era, with its databases (Mongo, Redis, Postgres, ' +
         'MySQL…) as sidecars, and boots it until a port answers. Failures are fixed from a table of known fixes, then by ' +
         'Claude if an Anthropic API key is set, for at most maxIterations attempts and tokenBudget tokens; otherwise it ends ' +
-        'with BLOCKED and a reason. Sandbox: network only while installing dependencies, no host mounts, no credentials, ' +
-        'CPU/memory/process/time limits. Takes minutes. Needs Docker on the machine running this server.',
+        'with BLOCKED and a reason. Built-in known fixes apply without asking and are listed in decisions. With approvals ' +
+        '"ask", a cache or Claude fix that changes dependencies, the Node version or base image, system packages, install ' +
+        'flags or environment variables (beyond a short allow-list of harmless ones), or what runs pauses the run with ' +
+        'outcome NEEDS YOU, and so does a question only the user can answer: ask the user, ' +
+        'then call resurrect again with resume: true and approve or answer. A paused run is always saved, since resume reads it, ' +
+        'and so is any run that replaces a paused one (even with save: false), so resume never carries on a superseded run. ' +
+        'Sandbox: network only while installing dependencies, no host mounts, no credentials, CPU/memory/process/time ' +
+        'limits. Takes minutes. Needs Docker on the machine running this server.',
       inputSchema: {
         source: z.string().min(1).describe('Git URL (https or ssh) or a local directory path'),
-        maxIterations: z.number().int().min(1).max(DEFAULT_MAX_ITERATIONS).default(DEFAULT_MAX_ITERATIONS),
-        tokenBudget: z.number().int().min(0).default(DEFAULT_TOKEN_BUDGET).describe('Tokens Claude may spend on fixes; 0 for known fixes only'),
-        save: z.boolean().default(true).describe('Save the report so the user can browse it with `necromancer ui`'),
+        maxIterations: z
+          .number()
+          .int()
+          .min(1)
+          .max(DEFAULT_MAX_ITERATIONS)
+          .optional()
+          .describe(`Build attempts in total; default ${DEFAULT_MAX_ITERATIONS}, or the paused run's limit with resume`),
+        tokenBudget: z
+          .number()
+          .int()
+          .min(0)
+          .optional()
+          .describe(`Tokens Claude may spend on fixes, 0 for known fixes only; default ${DEFAULT_TOKEN_BUDGET}, or the paused run's budget with resume`),
+        approvals: z
+          .enum(['ask', 'all'])
+          .default('ask')
+          .describe('"ask" pauses on risky cache and Claude fixes so you can ask the user (built-in known fixes never wait); "all" applies them without asking, except that with resume the pending fix still needs approve'),
+        resume: z.boolean().default(false).describe('Carry on from the saved run that ended NEEDS YOU, with approve or answer'),
+        approve: z.boolean().optional().describe('With resume, for a pending fix: true applies it, false declines it and looks for another'),
+        answer: z.string().optional().describe("With resume, for a pending question: the user's answer"),
+        save: z
+          .boolean()
+          .default(true)
+          .describe('Save the report so the user can browse it with `necromancer ui`; a run that pauses, resumes or replaces a paused run is saved regardless'),
       },
       annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: true },
     },
-    async ({ source, maxIterations, tokenBudget, save }, extra) => {
+    async ({ source, maxIterations, tokenBudget, approvals, resume, approve, answer, save }, extra) => {
       try {
+        // Without resume the run would start over and replace the paused one the decision was meant for.
+        if ((approve !== undefined || answer !== undefined) && !resume) throw new Error('approve and answer go with resume: true; without it the paused run would be replaced by a new one.');
+        if (approve !== undefined && answer !== undefined) throw new Error('pass approve for a pending fix or answer for a pending question, not both.');
         const saved = await loadSaved(source);
-        const model = tokenBudget > 0 ? defaultModel() : null;
-        const report = await resurrect(source, {
-          sandbox: defaultSandbox(),
-          model,
-          maxIterations,
-          tokenBudget,
-          exhume: saved?.exhume,
-          graveyard: saved?.graveyard,
-          interview: saved?.interview,
-          fixCache: new FixCache(path.join(path.dirname(store.dir), 'fix-cache.json')),
-          workdir: options.workdir,
-          onProgress: progressReporter(extra),
-        });
+        const fixCache = new FixCache(path.join(path.dirname(store.dir), 'fix-cache.json'));
+        const onProgress = progressReporter(extra);
+        const approveFix: ResurrectOptions['approve'] = approvals === 'all' ? async () => 'auto-approve' : async () => 'pause';
+        let report: ResurrectReport;
+        let model: StructuredModel | null;
+        // Whether a model was wanted and there is no key to build it, so only known fixes were tried.
+        let noKey = false;
+        if (resume) {
+          // A blank answer is an empty reply, not the user's answer: say so rather than pausing again.
+          if (answer !== undefined && !answer.trim()) throw new Error('answer is empty; pass what the user said, or ask them again.');
+          const from = saved?.resurrect;
+          if (!from) throw new Error('No resurrect report for this source; call `resurrect` without resume first.');
+          // A resumed run asks the model the paused run asked, or none when it asked none; limits the caller did not
+          // give stay as the paused run had them.
+          const overrides = { maxIterations, tokenBudget };
+          let input: ResumeInput;
+          try {
+            input = prepareResume(from, { model: (name) => defaultModel(name), overrides, approve, answer });
+          } catch (err) {
+            // Only on this error path: the model the paused run asked, which could not be built without a key.
+            const wanted = err instanceof ResumeError && err.code === 'model-null' ? resumeSettings(from, overrides).model : null;
+            if (!wanted) throw err;
+            throw new Error(
+              `the paused run asked ${wanted} for fixes, and there is no Anthropic API key; to add one, ${credentialsHint()}` +
+                (from.pending?.kind === 'approval' ? ', or call again with tokenBudget: 0 to carry on with known and cached fixes only.' : '.'),
+            );
+          }
+          model = input.run.model;
+          // A resume runs with the paused run's settings, so the fresh-run options are not passed; its sandbox is set
+          // up as the paused run's was.
+          report = await resurrect(source, {
+            sandbox: options.sandbox ?? new DockerSandbox(input.run.settings.sandbox ?? {}),
+            model,
+            fixCache,
+            onProgress,
+            approve: approveFix,
+            resume: input,
+          });
+        } else {
+          const wanted = (tokenBudget ?? DEFAULT_TOKEN_BUDGET) > 0;
+          model = wanted ? defaultModel() : null;
+          noKey = wanted && !model;
+          report = await resurrect(source, {
+            sandbox: defaultSandbox(),
+            model,
+            maxIterations: maxIterations ?? DEFAULT_MAX_ITERATIONS,
+            tokenBudget: tokenBudget ?? DEFAULT_TOKEN_BUDGET,
+            exhume: saved?.exhume,
+            graveyard: saved?.graveyard,
+            interview: saved?.interview,
+            fixCache,
+            workdir: options.workdir,
+            onProgress,
+            approve: approveFix,
+          });
+        }
+        const paused = report.outcome === 'needs-you' && report.pending;
         return text({
-          outcome: report.outcome === 'resurrected' ? 'RESURRECTED' : `BLOCKED: ${report.blockedReason}`,
+          outcome: report.outcome === 'resurrected' ? 'RESURRECTED' : paused ? 'NEEDS YOU' : `BLOCKED: ${report.blockedReason}`,
+          ...(paused && { pending: pendingSummary(report.pending!), next: nextStep(report.pending!) }),
           health: report.health,
           era: report.era,
           services: report.services,
@@ -274,15 +373,18 @@ export function createServer(options: ServerOptions = {}): McpServer {
             ...a,
             ...(errorExcerpt && { errorExcerpt: errorExcerpt.split('\n').slice(-12).join('\n') }),
           })),
+          decisions: (report.decisions ?? []).map(({ risks, ...d }) => ({ ...d, ...(risks && { risks: risks.map((r) => r.reason) }) })),
           llm: report.llm,
           warnings: report.warnings,
           dockerfile: report.dockerfile,
           compose: report.compose,
-          ...(!model && tokenBudget > 0 && { note: `No Anthropic API key, so only known fixes were tried. To add one, ${credentialsHint()}.` }),
-          ...(save && (await saveNote('resurrect', report))),
+          ...(noKey && { note: `No Anthropic API key, so only known fixes were tried. To add one, ${credentialsHint()}.` }),
+          // A resumed run, or a fresh one after a paused run, replaces the saved needs-you report, which resume would
+          // otherwise read again and carry on a run this one superseded.
+          ...((save || paused || resume || saved?.resurrect?.outcome === 'needs-you') && (await saveNote('resurrect', report))),
         });
       } catch (err) {
-        return failure('resurrect', err);
+        return failure('resurrect', err, err instanceof ResumeError ? resumeHint(err) : '');
       }
     },
   );
@@ -350,6 +452,56 @@ export function createServer(options: ServerOptions = {}): McpServer {
     },
   );
 
+  server.registerTool(
+    'plan',
+    {
+      title: 'Plan the modernization',
+      description:
+        'Turns the saved reports for a repository into an ordered modernization plan: code fixes, dependency removals, ' +
+        'replacements and upgrades, then the Node upgrade, lowest risk first, each followed by the check that proves ' +
+        'nothing broke (the witness replay when there are golden snapshots). Deterministic; no network, no model. Needs a ' +
+        'saved graveyard report; exhume, interview, resurrect and witness reports make it sharper. Saves plan.md next to ' +
+        'the reports for the full text; the result names it in markdown, or gives markdownError when it could not be saved.',
+      inputSchema: {
+        source: z.string().min(1).describe('Git URL (https or ssh) or a local directory path, as given to the earlier tools'),
+        save: z.boolean().default(true).describe('Save plan.json and plan.md next to the other reports'),
+      },
+      annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
+    },
+    async ({ source, save }) => {
+      try {
+        const saved = await loadSaved(source);
+        if (!saved?.graveyard) throw new Error('No graveyard report saved for this source; run the `graveyard` tool first.');
+        const plan = buildPlan(saved, { source });
+        let saveInfo = {};
+        let markdown: string | null = null;
+        let markdownError: string | undefined;
+        if (save) {
+          const note = await saveNote('plan', plan);
+          try {
+            markdown = await store.saveFile(source, 'plan.md', renderPlanMarkdown(plan));
+          } catch (err) {
+            markdownError = errorMessage(err);
+          }
+          saveInfo = { ...note, markdown, ...(markdownError && { markdownError }) };
+        }
+        const rest = plan.steps.length - MAX_PLAN_STEPS;
+        return text({
+          target: `Node ${plan.target.node}`,
+          steps: [
+            ...plan.steps.slice(0, MAX_PLAN_STEPS).map((s) => `${s.n}. ${s.title} (${s.risk}) → ${s.check.command}`),
+            ...(rest > 0 ? [`…and ${rest} more; ${markdown ? `see ${markdown}` : markdownError ? 'plan.md could not be saved, as markdownError says' : 'call plan with save: true to write them all to plan.md'}`] : []),
+          ],
+          leftAlone: plan.leftAlone.length,
+          warnings: plan.warnings,
+          ...saveInfo,
+        });
+      } catch (err) {
+        return failure('plan', err);
+      }
+    },
+  );
+
   server.registerPrompt(
     'autopsy',
     {
@@ -407,11 +559,51 @@ function progressReporter(extra: ToolExtra): ((message: string) => void) | undef
   };
 }
 
-function failure(tool: string, err: unknown) {
+/** What a paused run waits on, without the full fix ops' noise. */
+function pendingSummary(pending: PendingDecision) {
+  if (pending.kind === 'question') return { kind: pending.kind, question: pending.question, context: pending.context, choices: pending.choices };
+  const { fix, risks } = pending;
+  return { kind: pending.kind, fix: { source: fix.source, id: fix.id, description: fix.description }, risks: risks.map((r) => r.reason) };
+}
+
+function nextStep(pending: PendingDecision): string {
+  return pending.kind === 'question'
+    ? 'Ask the user this question in their own words, offering the choices but accepting any answer. Then call resurrect ' +
+        'again with the same source, resume: true and answer set to what they said (for a choice, its text, not its number). ' +
+        'Do not answer for them, and do not ' +
+        'ask them for passwords, keys or other secrets.'
+    : 'Show the user the fix and what it would change (risks), and ask whether to apply it. Then call resurrect again ' +
+        'with the same source, resume: true and approve: true to apply it, or approve: false to decline it and look for ' +
+        'another. Do not decide for them.';
+}
+
+function failure(tool: string, err: unknown, hint = '') {
   return {
     isError: true,
-    content: [{ type: 'text' as const, text: `${tool} failed: ${errorMessage(err)}` }],
+    content: [{ type: 'text' as const, text: `${tool} failed: ${errorMessage(err)}${hint && ` ${hint}`}` }],
   };
+}
+
+/** What the host can do about a refused resume, by the `ResumeError` code; empty where the message already says it. */
+function resumeHint(err: ResumeError): string {
+  switch (err.code) {
+    case 'not-paused':
+    case 'no-state':
+      return 'Call resurrect without resume to start a new run.';
+    case 'budget-spent':
+    case 'model-without-budget':
+      return 'Call again with a larger tokenBudget.';
+    case 'no-model':
+      return 'A pending question needs a model: call again with a tokenBudget above 0, or, if the paused run used no model, call resurrect without resume to start a new run.';
+    case 'needs-approve':
+      return 'Ask the user whether to apply the pending fix, then call again with approve: true or false; approvals: "all" does not answer it.';
+    case 'needs-answer':
+      return 'Ask the user the pending question, then call again with answer set to what they said.';
+    case 'wrong-kind':
+    case 'model-null':
+    case 'model-mismatch':
+      return '';
+  }
 }
 
 /** Healthy dependencies collapse to names; everything with a cause keeps its full tombstone. */
@@ -441,7 +633,10 @@ export function summarize({ graph: _graph, ...report }: ExhumeReport) {
       ...(files.length > SUMMARY_FILES_PER_CLUSTER && { moreFiles: files.length - SUMMARY_FILES_PER_CLUSTER }),
     })),
     orphans: report.orphans.slice(0, SUMMARY_ORPHANS),
-    externalPackages: report.externalPackages.slice(0, SUMMARY_EXTERNAL_PACKAGES),
+    // The file lists are for the plan, which reads the saved report; counts are enough here.
+    externalPackages: report.externalPackages
+      .slice(0, SUMMARY_EXTERNAL_PACKAGES)
+      .map(({ importers: _importers, referencedBy: _referencedBy, ...p }) => p),
     manifests: report.manifests.map(({ manifest, name, engines, dependencies, devDependencies }) => ({
       manifest,
       name,

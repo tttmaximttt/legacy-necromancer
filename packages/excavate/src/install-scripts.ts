@@ -79,15 +79,16 @@ export async function auditManifests(root: string, files: string[]): Promise<{
     const pkg = await readJson(path.join(root, manifest));
     if (!pkg) continue;
     const name = typeof pkg.name === 'string' ? pkg.name : null;
+    const scripts = stringRecord(pkg.scripts);
     manifests.push({
       manifest,
       name,
       engines: stringRecord(pkg.engines),
       dependencies: stringRecord(pkg.dependencies),
       devDependencies: stringRecord(pkg.devDependencies),
+      scripts,
     });
 
-    const scripts = stringRecord(pkg.scripts);
     for (const hook of INSTALL_HOOKS) {
       const command = scripts[hook];
       if (!command) continue;

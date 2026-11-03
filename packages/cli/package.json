@@ -26,7 +26,8 @@
     "@necromancer/llm": "workspace:*",
     "@necromancer/resurrect": "workspace:*",
     "@necromancer/witness": "workspace:*",
-    "@necromancer/mcp": "workspace:*"
+    "@necromancer/mcp": "workspace:*",
+    "@necromancer/plan": "workspace:*"
   },
   "bin": {
     "necromancer": "./dist/bin.js"

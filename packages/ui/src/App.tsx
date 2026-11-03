@@ -122,10 +122,20 @@ export function App() {
               )}
               {revived && (
                 <p className="intent">
-                  <span className="intent-label">{revived.outcome === 'resurrected' ? `${STATUS.alive.icon} Resurrected` : `${STATUS.dead.icon} Blocked`}</span>{' '}
+                  <span className="intent-label">
+                    {revived.outcome === 'resurrected'
+                      ? `${STATUS.alive.icon} Resurrected`
+                      : revived.outcome === 'needs-you'
+                        ? `${STATUS.ailing.icon} Needs you`
+                        : `${STATUS.dead.icon} Blocked`}
+                  </span>{' '}
                   {revived.outcome === 'resurrected'
                     ? `on ${revived.recipe.nodeImage}${revived.services.length ? ` with ${revived.services.map((s) => s.image).join(', ')}` : ''} after ${revived.attempts.length} attempt${revived.attempts.length === 1 ? '' : 's'}: ${revived.health?.detail}`
-                    : revived.blockedReason}
+                    : revived.outcome === 'needs-you'
+                      ? revived.pending?.kind === 'question'
+                        ? revived.pending.question
+                        : `approve the fix: ${revived.pending?.fix.description ?? 'unknown'}`
+                      : revived.blockedReason}
                 </p>
               )}
               {witnessed && (

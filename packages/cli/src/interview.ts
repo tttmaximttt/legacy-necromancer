@@ -152,15 +152,44 @@ export function formatProposal(report: InterviewReport): string {
   return `${parts.filter(Boolean).join('\n')}\n`;
 }
 
-export function terminalIo(): InterviewIo {
-  const interactive = Boolean(process.stdin.isTTY && process.stderr.isTTY);
+/** What `ask` rejects with once the input has ended (Ctrl-D, or a closed pipe): nobody is left to answer. */
+export class InputClosed extends Error {
+  constructor() {
+    super('the input ended before an answer was given');
+    this.name = 'InputClosed';
+  }
+}
+
+/**
+ * Asks on the terminal when stdin and stderr are TTYs; `streams` (for tests) count as one. Once the input ends, a
+ * pending question and every later one reject with `InputClosed`, where readline alone would never settle.
+ */
+export function terminalIo(streams?: { input: NodeJS.ReadableStream; output: NodeJS.WritableStream }): InterviewIo {
+  const interactive = streams !== undefined || Boolean(process.stdin.isTTY && process.stderr.isTTY);
+  const { input, output } = streams ?? { input: process.stdin, output: process.stderr };
   let rl: ReturnType<typeof createInterface> | null = null;
+  let closed = false;
   return {
     write: (t) => process.stderr.write(t),
     ask: interactive
       ? (q) => {
-          rl ??= createInterface({ input: process.stdin, output: process.stderr });
-          return rl.question(q);
+          if (closed) return Promise.reject(new InputClosed());
+          rl ??= createInterface({ input, output }).once('close', () => (closed = true));
+          const rli = rl;
+          return new Promise<string>((resolve, reject) => {
+            const onClose = () => reject(new InputClosed());
+            rli.once('close', onClose);
+            rli.question(q).then(
+              (answer) => {
+                rli.off('close', onClose);
+                resolve(answer);
+              },
+              (err: unknown) => {
+                rli.off('close', onClose);
+                reject(closed ? new InputClosed() : err);
+              },
+            );
+          });
         }
       : null,
     close: () => rl?.close(),

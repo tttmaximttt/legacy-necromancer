@@ -49,7 +49,12 @@ export interface ParsedSource {
   parseErrors: number;
   routes: RawRoute[];
   mounts: RawMount[];
+  /** String literals outside import specifiers that look like a package name, deduplicated, in source order. */
+  names: string[];
 }
+
+/** A string that could be an npm package name: `jade`, `@scope/pkg`. */
+const PACKAGE_NAME = /^(?:@[a-z0-9][\w.-]*\/)?[a-z0-9][\w.-]*$/i;
 
 /** Loads the tree-sitter grammars once and extracts imports from source text. */
 export class ImportParser {
@@ -69,21 +74,29 @@ export class ImportParser {
 
   parse(source: string, language: SourceLanguage): ParsedSource {
     const tree = this.parsers[language].parse(source);
-    if (!tree) return { imports: [], parseErrors: 1, routes: [], mounts: [] };
+    if (!tree) return { imports: [], parseErrors: 1, routes: [], mounts: [], names: [] };
     try {
       const imports: RawImport[] = [];
       const routes: Array<RawRoute & { receiver: string | null }> = [];
       const pendingMounts: Array<{ prefix: string; target: Node; line: number; receiver: string | null }> = [];
       /** Local names bound to a module: `const api = require('./api')`, `import api from './api'`. */
       const bindings = new Map<string, string>();
+      const names = new Set<string>();
+      /** Import specifier nodes, so their strings are not counted as names. Parents are visited before children. */
+      const specifierNodes = new Set<number>();
       let parseErrors = 0;
       walk(tree.rootNode, (node) => {
         if (node.isError || node.isMissing) parseErrors++;
+        if ((node.type === 'string' || node.type === 'template_string') && !specifierNodes.has(node.id)) {
+          const value = stringValue(node);
+          if (value && PACKAGE_NAME.test(value)) names.add(value);
+        }
         const found = importFrom(node);
         if (found) {
-          imports.push(found);
+          specifierNodes.add(found.node.id);
+          imports.push(found.raw);
           const name = boundName(node);
-          if (name) bindings.set(name, found.specifier);
+          if (name) bindings.set(name, found.raw.specifier);
         }
         if (node.type === 'call_expression') routesFrom(node, routes, pendingMounts);
       });
@@ -111,6 +124,7 @@ export class ImportParser {
         parseErrors,
         routes: routes.map(({ receiver, ...r }) => ({ ...r, path: joinRoute(prefixOf(receiver), r.path) })),
         mounts,
+        names: [...names],
       };
     } finally {
       tree.delete();
@@ -143,7 +157,7 @@ function walk(root: Node, visit: (node: Node) => void): void {
   }
 }
 
-function importFrom(node: Node): RawImport | null {
+function importFrom(node: Node): { raw: RawImport; node: Node } | null {
   switch (node.type) {
     case 'import_statement':
       return literal(node.childForFieldName('source'), 'import', node);
@@ -169,11 +183,11 @@ function importFrom(node: Node): RawImport | null {
   }
 }
 
-function literal(node: Node | null, kind: ImportKind, at: Node): RawImport | null {
+function literal(node: Node | null, kind: ImportKind, at: Node): { raw: RawImport; node: Node } | null {
   const specifier = stringValue(node);
   // Computed specifiers (`require(name)`) can't be resolved statically.
   if (!specifier) return null;
-  return { specifier, kind, line: at.startPosition.row + 1 };
+  return { raw: { specifier, kind, line: at.startPosition.row + 1 }, node: node! };
 }
 
 const HTTP_METHODS = new Set(['get', 'post', 'put', 'patch', 'delete', 'del', 'head', 'options', 'all']);

@@ -1,12 +1,13 @@
 import { mkdtemp } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { parse } from 'yaml';
 import type { BuildRecipe, RecipeOp } from '@necromancer/core';
 import {
   DEFAULT_LIMITS,
   FixCache,
+  KNOWN_FIXES,
   applyOps,
   chooseNode,
   detectServices,
@@ -210,15 +211,48 @@ describe('known fixes', () => {
     ['openssl-legacy', 'Error: error:0308010C:digital envelope routines::unsupported\n  code: \'ERR_OSSL_EVP_UNSUPPORTED\'', { phase: 'build' }],
     ['yarn-engines', 'error left-pad@1.3.0: The engine "node" is incompatible with this module.', { recipe: { ...base, packageManager: 'yarn' } }],
   ])('recognises %s', (id, log, over) => {
-    expect(findKnownFix(ctx(log, over))?.id).toBe(id);
+    expect(findKnownFix(ctx(log, over))?.fix.id).toBe(id);
+  });
+
+  it('classifies the base image by its Node line, including 0.x and registry-prefixed tags', () => {
+    const imageCtx = (nodeImage: string, log: string) => ctx(log, { recipe: { ...base, nodeImage } });
+    // python 2 below Node 16, python3 from 16 on.
+    for (const [image, python] of [['node:0.10-slim', 'python'], ['registry.example/node:8', 'python'], ['registry.example/node:16-slim', 'python3'], ['node:18', 'python3']] as const) {
+      expect(findKnownFix(imageCtx(image, NODE_GYP_LOG))?.ops, image).toEqual([{ op: 'aptInstall', packages: [python, 'make', 'g++'] }]);
+    }
+    // Old images need the Debian archive, new ones do not.
+    const archiveLog = 'W: Failed to fetch http://deb.debian.org/debian/dists/x/main/binary-amd64/Packages  404  Not Found\nE: Unable to locate package python';
+    for (const image of ['node:0.10', 'registry.example/node:6', 'registry.example/node:8-jessie']) {
+      expect(findKnownFix(imageCtx(image, archiveLog))?.fix.id, image).toBe('debian-archive');
+    }
+    expect(findKnownFix(imageCtx('registry.example/node:20', archiveLog))?.fix.id).not.toBe('debian-archive');
+    // fibers breaks from Node 16; a registry-prefixed tag counts, a 0.x tag does not.
+    const fibersLog = 'fibers@1.0.15 install: `node build.js || nodejs build.js`\nnpm ERR! errno 1';
+    expect(findKnownFix(imageCtx('registry.example/node:16', fibersLog))?.fix.id).toBe('fibers-node16');
+    expect(findKnownFix(imageCtx('node:0.10', fibersLog))?.fix.id).not.toBe('fibers-node16');
   });
 
   it('swaps node-sass for sass in the same dependency group', () => {
-    const fix = findKnownFix(ctx('npm ERR! node-sass@4.5.3 postinstall: `node scripts/build.js`'))!;
-    expect(fix.ops(ctx(''))).toEqual([
+    const found = findKnownFix(ctx('npm ERR! node-sass@4.5.3 postinstall: `node scripts/build.js`'))!;
+    expect(found.ops).toEqual([
       { op: 'removeDependency', name: 'node-sass' },
       { op: 'setDependency', name: 'sass', version: '^1.32.0', dev: true },
     ]);
+  });
+
+  it('builds a known fix’s ops once', () => {
+    const gyp = KNOWN_FIXES.find((f) => f.id === 'node-gyp-python')!;
+    const ops = vi.spyOn(gyp, 'ops');
+    try {
+      const skip = vi.fn(() => false);
+      const found = findKnownFix(ctx(NODE_GYP_LOG), skip)!;
+      expect(found.fix).toBe(gyp);
+      expect(found.ops).toEqual([{ op: 'aptInstall', packages: ['python', 'make', 'g++'] }]);
+      expect(skip).toHaveBeenCalledWith(gyp, found.ops);
+      expect(ops).toHaveBeenCalledTimes(1);
+    } finally {
+      ops.mockRestore();
+    }
   });
 
   it('does not offer a fix that was already applied', () => {

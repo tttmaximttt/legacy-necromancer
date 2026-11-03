@@ -1,11 +1,11 @@
 import { mkdir, readdir, readFile, stat, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
-import type { ExhumeReport, GraveyardReport, InterviewReport, ResurrectReport, WitnessReport } from './types.js';
+import type { ExhumeReport, GraveyardReport, InterviewReport, PlanReport, ResurrectReport, WitnessReport } from './types.js';
 
-export type ReportKind = 'exhume' | 'graveyard' | 'interview' | 'resurrect' | 'witness';
+export type ReportKind = 'exhume' | 'graveyard' | 'interview' | 'resurrect' | 'witness' | 'plan';
 
-export const REPORT_KINDS: readonly ReportKind[] = ['exhume', 'graveyard', 'interview', 'resurrect', 'witness'];
+export const REPORT_KINDS: readonly ReportKind[] = ['exhume', 'graveyard', 'interview', 'resurrect', 'witness', 'plan'];
 
 export interface StoredReports {
   exhume: ExhumeReport | null;
@@ -13,6 +13,7 @@ export interface StoredReports {
   interview: InterviewReport | null;
   resurrect: ResurrectReport | null;
   witness: WitnessReport | null;
+  plan: PlanReport | null;
 }
 
 export interface StoredRepo {
@@ -38,12 +39,17 @@ export function slugFor(source: string): string {
 export class ReportStore {
   constructor(readonly dir: string = defaultReportsDir()) {}
 
-  async save(kind: ReportKind, report: ExhumeReport | GraveyardReport | InterviewReport | ResurrectReport | WitnessReport): Promise<string> {
-    const slug = slugFor(report.repo.source);
-    const dir = path.join(this.dir, slug);
+  async save(kind: ReportKind, report: ExhumeReport | GraveyardReport | InterviewReport | ResurrectReport | WitnessReport | PlanReport): Promise<string> {
+    return this.saveFile(report.repo.source, `${kind}.json`, JSON.stringify(report));
+  }
+
+  /** Saves a companion file next to a repo's reports, e.g. the readable `plan.md`. */
+  async saveFile(source: string, name: string, text: string): Promise<string> {
+    if (name !== path.basename(name) || name.startsWith('.')) throw new Error(`not a plain file name: ${name}`);
+    const dir = path.join(this.dir, slugFor(source));
     await mkdir(dir, { recursive: true });
-    const file = path.join(dir, `${kind}.json`);
-    await writeFile(file, JSON.stringify(report));
+    const file = path.join(dir, name);
+    await writeFile(file, text);
     return file;
   }
 
@@ -78,14 +84,15 @@ export class ReportStore {
       const text = await readFile(path.join(this.dir, slug, `${kind}.json`), 'utf8').catch(() => null);
       return text ? (JSON.parse(text) as T) : null;
     };
-    const [exhume, graveyard, interview, resurrect, witness] = await Promise.all([
+    const [exhume, graveyard, interview, resurrect, witness, plan] = await Promise.all([
       read<ExhumeReport>('exhume'),
       read<GraveyardReport>('graveyard'),
       read<InterviewReport>('interview'),
       read<ResurrectReport>('resurrect'),
       read<WitnessReport>('witness'),
+      read<PlanReport>('plan'),
     ]);
-    return exhume || graveyard || interview || resurrect || witness ? { exhume, graveyard, interview, resurrect, witness } : null;
+    return exhume || graveyard || interview || resurrect || witness || plan ? { exhume, graveyard, interview, resurrect, witness, plan } : null;
   }
 
   private async readSource(file: string): Promise<string | null> {

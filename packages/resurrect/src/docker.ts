@@ -1,6 +1,6 @@
 import { spawn } from 'node:child_process';
 import Docker from 'dockerode';
-import { errorMessage, type SandboxLimits } from '@necromancer/core';
+import { errorMessage, type SandboxLimits, type SandboxSettings } from '@necromancer/core';
 import { serviceLimits } from './compose.js';
 
 export interface StepResult {
@@ -37,6 +37,8 @@ export interface BootResult extends StepResult {
  * scripted sandbox and nothing needs Docker.
  */
 export interface Sandbox {
+  /** How it was set up beyond the per-container limits, saved with a paused run so a resume can set one up the same way. */
+  readonly settings?: SandboxSettings;
   /** Throws a readable error when Docker isn't reachable. */
   ping(): Promise<void>;
   /** `docker build` of the context: the only step with network access, used to install dependencies. */
@@ -66,6 +68,9 @@ export interface DockerSandboxOptions {
   onLog?: (line: string) => void;
 }
 
+/** How long boot waits for a health signal unless told otherwise. */
+export const DEFAULT_HEALTH_TIMEOUT_SEC = 90;
+
 /** Log lines that mean "the server is up" in most Node apps of any era. */
 export const READY_LOG = /(listening (on|at)|server (is )?(running|started|listening)|started (on|at) (port|http)|running (on|at) (port|http)|ready on|express server|app(lication)? started|now listening)/i;
 
@@ -87,6 +92,10 @@ export class DockerSandbox implements Sandbox {
 
   constructor(private readonly options: DockerSandboxOptions = {}) {
     this.docker = options.docker ?? new Docker();
+  }
+
+  get settings(): SandboxSettings {
+    return { buildProxy: this.options.buildProxy ?? false, healthTimeoutSec: this.options.healthTimeoutSec ?? DEFAULT_HEALTH_TIMEOUT_SEC };
   }
 
   async ping(): Promise<void> {
@@ -163,7 +172,7 @@ export class DockerSandbox implements Sandbox {
 
   async boot(image: string, options: BootOptions): Promise<BootResult> {
     const started = Date.now();
-    const healthTimeoutSec = this.options.healthTimeoutSec ?? 90;
+    const healthTimeoutSec = this.options.healthTimeoutSec ?? DEFAULT_HEALTH_TIMEOUT_SEC;
     const deadline = started + healthTimeoutSec * 1000;
     const { limits } = options;
     // The first service owns the network namespace (loopback only); everything else joins it.

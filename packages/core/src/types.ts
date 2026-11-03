@@ -109,6 +109,8 @@ export interface DependencySummary {
   engines: Record<string, string>;
   dependencies: Record<string, string>;
   devDependencies: Record<string, string>;
+  /** The manifest's npm scripts. Missing in reports from before scripts were recorded. */
+  scripts?: Record<string, string>;
 }
 
 export interface ExhumeReport {
@@ -133,7 +135,13 @@ export interface ExhumeReport {
   loadBearing: LoadBearingFile[];
   /** Files with no internal imports in either direction: dead code, scripts, or entrypoints. */
   orphans: string[];
-  externalPackages: Array<{ name: string; importedBy: number }>;
+  /**
+   * `importers`: the files that import the package, sorted, at most 20. Missing in older reports.
+   * `referencedBy`/`referenceCount`: the files whose code names a declared dependency in a string literal outside an
+   * import (`app.set('view engine', 'jade')`), sorted, at most 20, and their full count. Set only when there are some.
+   * A declared dependency that is only named, never imported, is listed with `importedBy` 0.
+   */
+  externalPackages: Array<{ name: string; importedBy: number; importers?: string[]; referencedBy?: string[]; referenceCount?: number }>;
   /** Imports whose casing doesn't match the file on disk; they break on Linux. */
   caseMismatches: Array<{ from: string; specifier: string; line: number; target: string }>;
   manifests: DependencySummary[];
@@ -323,6 +331,14 @@ export interface SandboxLimits {
   stepTimeoutSec: number;
 }
 
+/** How the sandbox itself was set up, beyond the per-container limits; a resume rebuilds it the same way. */
+export interface SandboxSettings {
+  /** The host's HTTP(S)_PROXY was passed to the install step. */
+  buildProxy: boolean;
+  /** How long boot waited for a health signal. */
+  healthTimeoutSec: number;
+}
+
 /** One change to the build recipe. Fixes, known or proposed by the model, are lists of these. */
 export type RecipeOp =
   | { op: 'setNodeImage'; tag: string }
@@ -382,12 +398,113 @@ export interface ResurrectAttempt {
   fix: AppliedFix | null;
 }
 
+/** Why a fix waits for the owner's OK. Empty means the fix is safe to apply without asking. */
+export interface FixRisk {
+  op: RecipeOp['op'];
+  reason: string;
+}
+
+/** A fix the run stopped on because it needs the owner's approval. */
+export interface PendingApproval {
+  kind: 'approval';
+  fix: AppliedFix;
+  risks: FixRisk[];
+}
+
+/** A question the run stopped on because only the owner can answer it. */
+export interface PendingQuestion {
+  kind: 'question';
+  question: string;
+  /** Why it is asking: what was tried and what the model could not settle. */
+  context: string;
+  /** Suggested answers, possibly empty; any free-text answer is accepted. */
+  choices: string[];
+}
+
+export type PendingDecision = PendingApproval | PendingQuestion;
+
+/** A decision on a risky fix or a question during a run, kept so the history shows who chose what. */
+export interface OwnerDecision {
+  /** The attempt whose failure the decision was about. */
+  attempt: number;
+  kind: 'approval' | 'question';
+  /**
+   * "owner" when the owner answered; "auto" when a risky fix was applied without asking: a built-in known fix, a
+   * blanket approval such as `--yes`, or a run with nobody set up to approve. Reports from before this field are read as "owner".
+   */
+  by: 'owner' | 'auto';
+  /** For approvals: the fix id. For questions: the question. */
+  subject: string;
+  /** "approved", "rejected", or the owner's answer. */
+  answer: string;
+  /** For approvals: what the fix does. */
+  description?: string;
+  /** For approvals: why the fix needed an OK (`fixRisks`). Missing in reports from before this field. */
+  risks?: FixRisk[];
+  at: string;
+}
+
+/** Everything `resurrect --resume` needs to carry on where a paused run stopped. */
+export interface ResurrectRunState {
+  /** The attempt number the resumed run starts with. */
+  nextAttempt: number;
+  /** The failure the pending decision is about. */
+  failure: { attempt: number; phase: ResurrectPhase; signature: string; log: string };
+  /** How often each error signature has been seen, for loop detection. */
+  seen: Record<string, number>;
+  tokens: number;
+  calls: number;
+  /**
+   * Every fix the owner declined in this run, from any source, by `opsKey` of its ops; none is offered again. Reports
+   * from before this rule may also hold known-fix ids, which are ignored.
+   */
+  declinedFixes: string[];
+  /** The fixes declined for the pending failure, as shown in the blocked message. */
+  declined: string[];
+  /** The owner's latest answer about this failure. */
+  answer: string | null;
+  /** Questions the owner answered about this failure so far. */
+  questions: number;
+  /** Fixes the owner declined for this failure so far. */
+  declines: number;
+  /**
+   * What the model is told about the project, from the interview the run started with: its intent and the owner's goals,
+   * or null for none. A resume tells the model this, not what the resuming call's interview says.
+   */
+  interview: { intent: string; goals: string[] } | null;
+  /** Everything that defined the run; a resume restores all of it, and only overrides the caller gives explicitly change it. */
+  settings: ResurrectRunSettings;
+}
+
+/** The settings a paused run was started with. The sandbox limits are the report's own `limits`. */
+export interface ResurrectRunSettings {
+  maxIterations: number;
+  tokenBudget: number;
+  /** The model asked for fixes, or null when the run used known and cached fixes only (no key, no model, or a budget of 0). */
+  model: string | null;
+  /** The CA certificate the install step trusted, as an absolute path, or null for none. */
+  caFile: string | null;
+  /** How the sandbox was set up, or null when the sandbox did not say. */
+  sandbox: SandboxSettings | null;
+  /** Whether the built images were kept after the run. */
+  keepImages: boolean;
+  /** Where remote repos were cloned, or null for the default temp directory. */
+  workdir: string | null;
+}
+
 export interface ResurrectReport {
   repo: { source: string; commit: string | null };
   generatedAt: string;
-  outcome: 'resurrected' | 'blocked';
+  /** needs-you: paused on `pending`; continue with `resurrect --resume`. */
+  outcome: 'resurrected' | 'blocked' | 'needs-you';
   /** Set when blocked: the "BLOCKED: <reason>" line, without the prefix. */
   blockedReason: string | null;
+  /** Set when the outcome is needs-you. Missing in reports from before approvals existed. */
+  pending?: PendingDecision | null;
+  /** Set when the outcome is needs-you: the run state to resume from. */
+  resume?: ResurrectRunState | null;
+  /** Approvals and answers the owner gave during this run, oldest first. */
+  decisions?: OwnerDecision[];
   /** How it was judged alive: a port answering, a log line, or (for libraries) a clean install and build. */
   health: { kind: 'port' | 'log' | 'library'; detail: string } | null;
   era: { date: string | null; node: string; why: string };
@@ -455,5 +572,74 @@ export interface WitnessReport {
   inputs: { source: 'claude-api' | 'default' | 'replay'; model: string | null; tokens: number };
   snapshots: WitnessSnapshot[];
   tests: WitnessTestRun | null;
+  warnings: string[];
+}
+
+// ── Plan ─────────────────────────────────────────────────────────────────
+
+export type PlanStepKind =
+  /** Swap a dead or dying package for its successor. */
+  | 'replace-dependency'
+  /** Move a package to a newer version, usually to clear advisories or catch up majors. */
+  | 'upgrade-dependency'
+  /** Drop a package nothing imports, or one the platform now provides. */
+  | 'remove-dependency'
+  /** Move the app to a newer Node release. */
+  | 'upgrade-node'
+  /** Fix something in the code that breaks on modern platforms, e.g. case-mismatched imports. */
+  | 'code-fix';
+
+export interface PlanCheck {
+  /** witness: replay the golden snapshots. tests: the project's own test script. resurrect: it still installs and boots. */
+  kind: 'witness' | 'tests' | 'resurrect';
+  /** The command to run after the step, e.g. "necromancer witness <source> --check". */
+  command: string;
+  /** What passing means, in a sentence. */
+  passes: string;
+}
+
+export interface PlanStep {
+  /** 1-based order. Steps are meant to be done one at a time, in order. */
+  n: number;
+  /** Stable id, e.g. "replace:request" or "upgrade-node:18". */
+  id: string;
+  kind: PlanStepKind;
+  /** One line, imperative, e.g. "Replace request with node-fetch". */
+  title: string;
+  /** The change itself: packages and versions, or what to edit. */
+  change: Array<{ name: string; from: string | null; to: string | null }>;
+  /** Why this step, with evidence: tombstone causes, advisories, Resurrect fixes. */
+  why: string[];
+  /** Repo files that import or name the packages involved, so the change can be scoped. At most 20 per package. */
+  touches: string[];
+  /** How many files import or name the packages involved; more than `touches` lists when it is capped. Missing in older plans. */
+  touchCount?: number;
+  risk: 'low' | 'medium' | 'high';
+  /** The owner's goals (from the interview) this step serves. */
+  goals: string[];
+  /** Ids of steps that must be done first. */
+  after: string[];
+  /** Run after the step; the step is done only when it passes. */
+  check: PlanCheck;
+}
+
+/**
+ * The modernization plan: ordered dependency and runtime steps, each followed by a behaviour check, built from the
+ * saved reports for one repo. Meant to be followed one step at a time, by a person or a later agent.
+ */
+export interface PlanReport {
+  repo: { source: string; commit: string | null };
+  generatedAt: string;
+  /** Which saved reports the plan was built from. */
+  basedOn: Record<'exhume' | 'graveyard' | 'interview' | 'resurrect' | 'witness', boolean>;
+  intent: string | null;
+  goals: string[];
+  /** The Node release to end on, and why. */
+  target: { node: string; why: string };
+  /** The check used when a step does not need a more specific one. */
+  baseline: PlanCheck;
+  steps: PlanStep[];
+  /** Packages the plan leaves alone, and why. */
+  leftAlone: Array<{ name: string; reason: string }>;
   warnings: string[];
 }
