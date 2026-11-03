@@ -1,4 +1,8 @@
-/** Quotes a value for a POSIX shell command line, leaving plain words, paths and URLs as they are. */
+/**
+ * Quotes a source or path for a POSIX shell command line, leaving plain words, paths and URLs as they are.
+ * A value starting with `-` gets a `./` prefix, so a command's option parser does not read it as an option.
+ */
 export function shellArg(value: string): string {
-  return /^[\w@%+=:,./-][\w@%+=:,./~-]*$/.test(value) ? value : `'${value.replace(/'/g, `'\\''`)}'`;
+  const arg = value.startsWith('-') ? `./${value}` : value;
+  return /^[\w@%+=:,./-][\w@%+=:,./~-]*$/.test(arg) ? arg : `'${arg.replace(/'/g, `'\\''`)}'`;
 }

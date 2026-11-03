@@ -153,9 +153,17 @@ export const KNOWN_FIXES: KnownFix[] = [
   },
 ];
 
-/** The first known fix that matches the failure and changes the recipe, passing over any that `skip` turns down. */
-export function findKnownFix(ctx: FailureContext, skip?: (fix: KnownFix, ops: RecipeOp[]) => boolean): KnownFix | null {
-  return KNOWN_FIXES.find((f) => f.matches(ctx) && changesRecipe(ctx.recipe, f.ops(ctx)) && !skip?.(f, f.ops(ctx))) ?? null;
+/**
+ * The first known fix that matches the failure and changes the recipe, passing over any that `skip` turns down, with
+ * the ops it makes for this failure.
+ */
+export function findKnownFix(ctx: FailureContext, skip?: (fix: KnownFix, ops: RecipeOp[]) => boolean): { fix: KnownFix; ops: RecipeOp[] } | null {
+  for (const fix of KNOWN_FIXES) {
+    if (!fix.matches(ctx)) continue;
+    const ops = fix.ops(ctx);
+    if (changesRecipe(ctx.recipe, ops) && !skip?.(fix, ops)) return { fix, ops };
+  }
+  return null;
 }
 
 // eslint-disable-next-line no-control-regex

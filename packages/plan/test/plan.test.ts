@@ -177,7 +177,9 @@ describe('buildPlan', () => {
     expect(node.change).toEqual([{ name: 'node', from: '8', to: TARGET_NODE }]);
     expect(node.why.join(' ')).toContain(`jump of ${Number(TARGET_NODE) - 8} majors`);
     expect(node.risk).toBe('high');
-    expect(plan.target.node).toBe(TARGET_NODE);
+    // buildPlan always names a target, and its type says so.
+    const target: string = plan.target.node;
+    expect(target).toBe(TARGET_NODE);
   });
 
   it('keeps packages that a script names, and does not remove packages exhume never saw', () => {
@@ -186,6 +188,22 @@ describe('buildPlan', () => {
     expect(plan.leftAlone.find((l) => l.name === 'jshint')!.reason).toMatch(/^Used by the lint script\. /);
     expect(ids(plan)).not.toContain('remove:ghost');
     expect(plan.leftAlone.map((l) => l.name)).toContain('ghost');
+  });
+
+  it('removes an unused dead package even when it has a replacement, and names the replacement', () => {
+    const request = tomb('request', {
+      status: 'dead',
+      causes: [{ kind: 'deprecated', detail: 'Deprecated' }],
+      replacement: { name: 'undici', reason: 'request was deprecated in 2020', source: 'known' },
+    });
+    const manifest = { ...exhume.manifests[0]!, dependencies: { ...exhume.manifests[0]!.dependencies, request: '^2.88.0' } };
+    const plan = buildPlan(
+      { ...all, graveyard: { ...graveyard, tombstones: [...tombstones, request] }, exhume: { ...exhume, manifests: [manifest] } },
+      { now: NOW },
+    );
+    expect(ids(plan)).not.toContain('replace:request');
+    expect(step(plan, 'remove:request')).toMatchObject({ kind: 'remove-dependency', change: [{ name: 'request', from: '1.0.0', to: null }] });
+    expect(step(plan, 'remove:request').why).toContain('If something still needs it, undici replaces it (request was deprecated in 2020).');
   });
 
   it('says which Node Resurrect tried when it did not boot the app', () => {
@@ -272,6 +290,54 @@ describe('buildPlan', () => {
     // Without exhume nothing is known to be unused, so the dead package is left alone instead of removed.
     expect(ids(bare)).not.toContain('remove:left-pad');
     expect(bare.leftAlone.map((l) => l.name)).toContain('left-pad');
+  });
+
+  it('lists an alive package a major behind as left alone, and says so in the Node step', () => {
+    const plan = buildPlan({ ...all, graveyard: { ...graveyard, tombstones: [...tombstones, tomb('debug', { resolved: '3.2.7', latest: '4.4.0', majorsBehind: 1 })] } }, { now: NOW });
+    expect(ids(plan)).not.toContain('upgrade:debug');
+    expect(plan.leftAlone.find((l) => l.name === 'debug')!.reason).toBe('1 major behind; maintained, upgrade when convenient.');
+    const why = step(plan, `upgrade-node:${TARGET_NODE}`).why;
+    expect(why.join(' ')).not.toMatch(/every package/);
+    expect(why).toContain(`debug stays a major behind (see Left alone); check it supports Node ${TARGET_NODE} before this step.`);
+    expect(step(buildPlan(all, { now: NOW }), `upgrade-node:${TARGET_NODE}`).why.join(' ')).not.toMatch(/major behind/);
+  });
+
+  it('checks with the test script only when there is a real one, run by the project\'s package manager', () => {
+    const withTest = (test: string | undefined, packageManager = 'npm') =>
+      ({
+        ...exhume,
+        repo: { ...exhume.repo, packageManager },
+        manifests: [{ ...exhume.manifests[0]!, scripts: test === undefined ? { lint: 'jshint lib' } : { test } }],
+      }) as ExhumeReport;
+    const check = (ex: ExhumeReport, res: ResurrectReport | null = null) => buildPlan({ ...all, exhume: ex, resurrect: res, witness: null }, { now: NOW, source: 'my/repo' }).baseline;
+
+    // exhume saw test files, but there is no test script to run them.
+    expect(check(withTest(undefined))).toMatchObject({ kind: 'resurrect', command: 'necromancer resurrect my/repo' });
+    expect(check(withTest('echo "Error: no test specified" && exit 1'))).toMatchObject({ kind: 'resurrect' });
+    expect(check(withTest('mocha', 'pnpm'))).toEqual({ kind: 'tests', command: 'pnpm test', passes: "The project's own tests pass." });
+    const yarnRecipe = { ...resurrect, recipe: { ...resurrect.recipe, packageManager: 'yarn' } } as ResurrectReport;
+    expect(check(withTest('mocha', 'npm'), yarnRecipe)).toMatchObject({ kind: 'tests', command: 'yarn test' });
+    expect(check(withTest('mocha', 'bower'))).toMatchObject({ kind: 'tests', command: 'npm test' });
+  });
+
+  it('does not remove an unimported runtime dependency while a script runs a command no dependency is named after', () => {
+    const coffee = tomb('coffee-script', { status: 'dead', causes: [{ kind: 'deprecated', detail: 'Deprecated' }] });
+    const manifest = {
+      ...exhume.manifests[0]!,
+      dependencies: { ...exhume.manifests[0]!.dependencies, 'coffee-script': '^1.12.0' },
+      scripts: { ...exhume.manifests[0]!.scripts, start: 'NODE_ENV=production coffee server.coffee' },
+    };
+    const plan = buildPlan({ ...all, graveyard: { ...graveyard, tombstones: [...tombstones, coffee] }, exhume: { ...exhume, manifests: [manifest] } }, { now: NOW });
+    expect(ids(plan)).not.toContain('remove:coffee-script');
+    expect(ids(plan)).not.toContain('remove:left-pad');
+    expect(plan.leftAlone.find((l) => l.name === 'coffee-script')!.reason).toBe(
+      'Nothing imports it, but a script runs `coffee`, which may come from it; check before removing it.',
+    );
+
+    // Builtins, Node's tools, the repo's own files and commands named after a dependency explain themselves.
+    const plain = { ...manifest, scripts: { start: 'cd lib && NODE_ENV=x node server.js', build: './build.sh; rm -rf dist', lint: 'npx jshint lib' } };
+    const removed = buildPlan({ ...all, graveyard: { ...graveyard, tombstones: [...tombstones, coffee] }, exhume: { ...exhume, manifests: [plain] } }, { now: NOW });
+    expect(ids(removed)).toEqual(expect.arrayContaining(['remove:coffee-script', 'remove:left-pad']));
   });
 
   it('maps goals to steps by keyword and package name', () => {

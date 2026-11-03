@@ -23,7 +23,7 @@ const question = {
   question: 'Is there a public replacement for @acme/core?',
   choices: ['stub it', 'drop the feature'],
 };
-const setEnv = { diagnosis: 'stub the private package', decision: 'fix', ops: [{ op: 'setEnv', name: 'ACME_STUB', value: '1' }], blockedReason: null, question: null, choices: [] };
+const setEnv = { diagnosis: 'stub the private package', decision: 'fix', ops: [{ op: 'setEnv', name: 'CI', value: 'true' }], blockedReason: null, question: null, choices: [] };
 
 describe('necromancer resurrect', () => {
   afterEach(() => {
@@ -93,6 +93,40 @@ describe('necromancer resurrect', () => {
     await expect(cli(new FakeSandbox({}), '--resume', '--approve')).rejects.toThrow(/this one ended resurrected \(`necromancer resurrect .* without --resume starts a new run\)/);
   });
 
+  it('never answers the pending fix with --yes on --resume: --reject wins, and without --approve or --reject it asks or stays paused', async () => {
+    const root = await deadApp(expressMongoApp);
+    const reports = path.join(await mkdtemp(path.join(os.tmpdir(), 'necro-cli-res-')), 'reports');
+    const stderr = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+    const cli = (sandbox: FakeSandbox, prompt: ((q: string) => Promise<string>) | null, ...args: string[]) =>
+      createProgram({ sandbox, prompt }).parseAsync(['node', 'necromancer', 'resurrect', root, '--reports', reports, '--no-llm', '-q', ...args]);
+    const pause = () => cli(new FakeSandbox({ install: [{ ok: false, log: NODE_GYP_LOG }] }), null);
+    const lastResume = () => vi.mocked(resurrect).mock.calls.at(-1)![1].resume!;
+
+    await pause();
+    expect(process.exitCode).toBe(3);
+    await cli(new FakeSandbox({ install: [{ ok: false, log: NODE_GYP_LOG }] }), null, '--resume', '--reject', '--yes');
+    expect(lastResume().approve).toBe(false);
+    expect((await new ReportStore(reports).load(path.basename(root)))!.resurrect!.decisions).toMatchObject([{ subject: 'node-gyp-python', answer: 'rejected' }]);
+
+    // No terminal: --yes alone leaves the run paused.
+    await pause();
+    const calls = vi.mocked(resurrect).mock.calls.length;
+    stderr.mockClear();
+    process.exitCode = undefined;
+    await cli(new FakeSandbox({}), null, '--resume', '--yes');
+    expect(process.exitCode).toBe(3);
+    expect(stderr.mock.calls.map((c) => String(c[0])).join('')).toContain('NEEDS YOU: apply this fix?');
+    expect(vi.mocked(resurrect).mock.calls.length).toBe(calls);
+
+    // On a terminal: --yes alone still asks.
+    const asked: string[] = [];
+    process.exitCode = undefined;
+    await cli(new FakeSandbox({}), async (q) => (asked.push(q), 'n'), '--resume', '--yes');
+    expect(asked).toHaveLength(1);
+    expect(asked[0]).toMatch(/^Apply it\? \[y\]es/);
+    expect(lastResume().approve).toBe(false);
+  });
+
   it('asks about risky fixes on a terminal', async () => {
     const root = await deadApp(expressMongoApp);
     // Inside a fresh directory, so the fix cache next to it starts empty.
@@ -155,22 +189,57 @@ describe('necromancer resurrect', () => {
     expect(lastResume()).toMatchObject({ approve: true, maxIterations: 6, tokenBudget: 2000 });
   });
 
-  it('builds a model on --resume only if the budget the resumed run will have allows one', async () => {
+  it('builds the model the paused run used on --resume, unless --no-llm or -m is given again', async () => {
     const root = await deadApp(expressMongoApp);
     const reports = path.join(await mkdtemp(path.join(os.tmpdir(), 'necro-cli-res-')), 'reports');
     vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
     const cli = (sandbox: FakeSandbox, ...args: string[]) =>
       createProgram({ sandbox, model: new ScriptedModel(), prompt: null }).parseAsync(['node', 'necromancer', 'resurrect', root, '--reports', reports, '-q', ...args]);
-    const lastModel = () => vi.mocked(resurrect).mock.calls.at(-1)![1].model;
+    const last = () => vi.mocked(resurrect).mock.calls.at(-1)![1];
+    const pause = (...args: string[]) => cli(new FakeSandbox({ install: [{ ok: false, log: NODE_GYP_LOG }] }), ...args);
 
-    await cli(new FakeSandbox({ install: [{ ok: false, log: NODE_GYP_LOG }] }), '--token-budget', '0');
+    // A paused run without a model resumes without one, even with a budget, until a model is named.
+    await pause('--token-budget', '0');
     expect(process.exitCode).toBe(3);
     await cli(new FakeSandbox({}), '--resume', '--approve');
-    expect(lastModel()).toBeNull();
-
-    await cli(new FakeSandbox({ install: [{ ok: false, log: NODE_GYP_LOG }] }), '--token-budget', '0');
+    expect(last().model).toBeNull();
+    await pause('--token-budget', '0');
     await cli(new FakeSandbox({}), '--resume', '--approve', '--token-budget', '1000');
-    expect(lastModel()).toBeInstanceOf(ScriptedModel);
+    expect(last().model).toBeNull();
+    await pause('--token-budget', '0');
+    await cli(new FakeSandbox({}), '--resume', '--approve', '--token-budget', '1000', '-m', 'scripted');
+    expect(last().model).toBeInstanceOf(ScriptedModel);
+    expect(last().resume).toMatchObject({ tokenBudget: 1000, model: 'scripted' });
+
+    // A paused run with a model gets it back without -m, and --no-llm turns it off.
+    await pause();
+    await cli(new FakeSandbox({}), '--resume', '--approve');
+    expect(last().model).toBeInstanceOf(ScriptedModel);
+    expect(last().resume!.model).toBeUndefined();
+    await pause();
+    await cli(new FakeSandbox({}), '--resume', '--approve', '--no-llm');
+    expect(last().model).toBeNull();
+    expect(last().resume!.model).toBeNull();
+  });
+
+  it('keeps the paused run\'s --keep-images and --workdir on --resume unless given again', async () => {
+    const root = await deadApp(expressMongoApp);
+    const reports = path.join(await mkdtemp(path.join(os.tmpdir(), 'necro-cli-res-')), 'reports');
+    const workdir = await mkdtemp(path.join(os.tmpdir(), 'necro-cli-wd-'));
+    vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+    const cli = (sandbox: FakeSandbox, ...args: string[]) =>
+      createProgram({ sandbox, prompt: null }).parseAsync(['node', 'necromancer', 'resurrect', root, '--reports', reports, '-q', '--no-llm', ...args]);
+    const lastResume = () => vi.mocked(resurrect).mock.calls.at(-1)![1].resume!;
+    const pause = () => cli(new FakeSandbox({ install: [{ ok: false, log: NODE_GYP_LOG }] }), '--keep-images', '--workdir', workdir);
+
+    await pause();
+    expect((await new ReportStore(reports).load(path.basename(root)))!.resurrect!.resume!.settings).toMatchObject({ keepImages: true, workdir });
+    await cli(new FakeSandbox({}), '--resume', '--approve');
+    expect(lastResume()).toMatchObject({ approve: true, keepImages: undefined, workdir: undefined });
+    await pause();
+    const elsewhere = await mkdtemp(path.join(os.tmpdir(), 'necro-cli-wd-'));
+    await cli(new FakeSandbox({}), '--resume', '--approve', '--no-keep-images', '--workdir', path.relative(process.cwd(), elsewhere));
+    expect(lastResume()).toMatchObject({ keepImages: false, workdir: elsewhere });
   });
 
   it('checks the saved run can be resumed before asking anything', async () => {
@@ -223,7 +292,7 @@ describe('necromancer resurrect', () => {
     ]);
     const store = new ReportStore(reports);
     const paused = (await store.load(path.basename(root)))!.resurrect!;
-    await store.save('resurrect', { ...paused, resume: { ...paused.resume!, sandbox: { buildProxy: true, healthTimeoutSec: 30 } } });
+    await store.save('resurrect', { ...paused, resume: { ...paused.resume!, settings: { ...paused.resume!.settings, sandbox: { buildProxy: true, healthTimeoutSec: 30 } } } });
 
     // No injected sandbox, so the CLI builds a DockerSandbox; resurrect itself is stubbed so Docker is never reached.
     const resumeWith = async (...args: string[]) => {
@@ -232,8 +301,15 @@ describe('necromancer resurrect', () => {
       return vi.mocked(resurrect).mock.calls.at(-1)![1].sandbox.settings;
     };
     expect(await resumeWith()).toEqual({ buildProxy: true, healthTimeoutSec: 30 });
-    await store.save('resurrect', { ...paused, resume: { ...paused.resume!, sandbox: { buildProxy: true, healthTimeoutSec: 30 } } });
+    await store.save('resurrect', { ...paused, resume: { ...paused.resume!, settings: { ...paused.resume!.settings, sandbox: { buildProxy: true, healthTimeoutSec: 30 } } } });
     expect(await resumeWith('--health-timeout', '45')).toEqual({ buildProxy: true, healthTimeoutSec: 45 });
+    expect(vi.mocked(resurrect).mock.calls.at(-1)![1].resume!.sandbox).toEqual({ buildProxy: undefined, healthTimeoutSec: 45 });
+    await store.save('resurrect', { ...paused, resume: { ...paused.resume!, settings: { ...paused.resume!.settings, sandbox: { buildProxy: true, healthTimeoutSec: 30 } } } });
+    expect(await resumeWith('--no-build-proxy')).toEqual({ buildProxy: false, healthTimeoutSec: 30 });
+    expect(vi.mocked(resurrect).mock.calls.at(-1)![1].resume!.sandbox).toEqual({ buildProxy: false, healthTimeoutSec: undefined });
+    // A paused run that saved no sandbox settings resumes on the defaults, changed by what is typed again.
+    await store.save('resurrect', { ...paused, resume: { ...paused.resume!, settings: { ...paused.resume!.settings, sandbox: null } } });
+    expect(await resumeWith('--build-proxy')).toEqual({ buildProxy: true, healthTimeoutSec: 90 });
 
     await expect(
       createProgram({ sandbox: new FakeSandbox({}), prompt: null }).parseAsync([
@@ -255,13 +331,46 @@ describe('necromancer resurrect', () => {
     const prompt = async (q: string) => (asked.push(q), 'stub it');
     await expect(
       createProgram({ sandbox: new FakeSandbox({}), prompt }).parseAsync(['node', 'necromancer', 'resurrect', root, '--reports', reports, '--no-llm', '-q', '--resume']),
-    ).rejects.toThrow(/needs a model/);
+    ).rejects.toThrow(/needs a model.*; drop --no-llm, or pass -m /);
     await expect(
       createProgram({ sandbox: new FakeSandbox({}), model: new ScriptedModel(), prompt }).parseAsync([
         'node', 'necromancer', 'resurrect', root, '--reports', reports, '-q', '--resume', '--token-budget', '0',
       ]),
-    ).rejects.toThrow(/token budget of 0 is already spent/);
+    ).rejects.toThrow(/token budget of 0 is already spent.*; pass a larger --token-budget$/);
     expect(asked).toEqual([]);
+  });
+
+  it('says to add a key, or pass --no-llm, when the paused run used a model and there is no key', async () => {
+    const root = await deadApp(expressMongoApp);
+    const reports = path.join(await mkdtemp(path.join(os.tmpdir(), 'necro-cli-res-')), 'reports');
+    vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+    await createProgram({ sandbox: new FakeSandbox({ install: [{ ok: false, log: NODE_GYP_LOG }] }), model: new ScriptedModel(), prompt: null }).parseAsync([
+      'node', 'necromancer', 'resurrect', root, '--reports', reports, '-q',
+    ]);
+    expect(process.exitCode).toBe(3);
+    // No injected model and no key in the test environment.
+    const cli = (...args: string[]) =>
+      createProgram({ sandbox: new FakeSandbox({}), prompt: null }).parseAsync(['node', 'necromancer', 'resurrect', root, '--reports', reports, '-q', '--resume', '--approve', ...args]);
+    await expect(cli()).rejects.toThrow(/asks scripted for fixes, but was handed no model.*; to add an Anthropic API key, .*, or pass --no-llm to carry on with known and cached fixes only$/);
+    await cli('--no-llm');
+    expect(vi.mocked(resurrect).mock.calls.at(-1)![1].model).toBeNull();
+  });
+
+  it('hints at the flag that gets past each refused resume', async () => {
+    const root = await deadApp(expressMongoApp);
+    const reports = path.join(await mkdtemp(path.join(os.tmpdir(), 'necro-cli-res-')), 'reports');
+    vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+    await createProgram({ sandbox: new FakeSandbox({ install: [{ ok: false, log: NODE_GYP_LOG }] }), model: new ScriptedModel(), prompt: null }).parseAsync([
+      'node', 'necromancer', 'resurrect', root, '--reports', reports, '-q',
+    ]);
+    expect(process.exitCode).toBe(3);
+    const cli = (...args: string[]) =>
+      createProgram({ sandbox: new FakeSandbox({}), model: new ScriptedModel(), prompt: null }).parseAsync([
+        'node', 'necromancer', 'resurrect', root, '--reports', reports, '-q', '--resume', '--approve', ...args,
+      ]);
+    await expect(cli('-m', 'other', '--token-budget', '0')).rejects.toThrow(/token budget is 0.*; pass a larger --token-budget, or drop -m$/);
+    // The injected model is named scripted, so naming another is a mismatch.
+    await expect(cli('-m', 'other')).rejects.toThrow(/handed the model scripted.*; pass -m other \(or another model\)$/);
   });
 
   it('prints NEEDS YOU and exits 3 when a question is pending and there is no terminal or --answer', async () => {

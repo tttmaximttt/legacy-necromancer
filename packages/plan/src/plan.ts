@@ -80,6 +80,7 @@ export function buildPlan(reports: PlanInputs, options: PlanOptions = {}): PlanR
 
   const usage = usageOf(exhume);
   const evidence = resurrectEvidence(resurrect);
+  const scriptCommand = unexplainedScriptCommand(exhume, graveyard.tombstones);
   const drafts: Draft[] = [];
 
   if (exhume?.caseMismatches.length) {
@@ -101,7 +102,7 @@ export function buildPlan(reports: PlanInputs, options: PlanOptions = {}): PlanR
   }
 
   for (const t of [...graveyard.tombstones].sort((a, b) => compare(a.name, b.name))) {
-    const draft = draftFor(t, usage(t.name), evidence.get(t.name) ?? [], leftAlone);
+    const draft = draftFor(t, usage(t.name), evidence.get(t.name) ?? [], scriptCommand, leftAlone);
     if (draft) drafts.push(draft);
   }
   for (const dep of graveyard.nonRegistry) {
@@ -123,7 +124,13 @@ export function buildPlan(reports: PlanInputs, options: PlanOptions = {}): PlanR
           : `The project targets Node ${eraNode}; ${distance}.`,
     );
   }
-  nodeWhy.push('Last, so every package is already on a version that supports the new runtime.');
+  nodeWhy.push('Last, so the packages above are already on their new versions when the runtime changes.');
+  const behind = graveyard.tombstones.filter(majorBehindButAlive).map((t) => t.name).sort(compare);
+  if (behind.length) {
+    nodeWhy.push(
+      `${behind.join(', ')} ${behind.length === 1 ? 'stays' : 'stay'} a major behind (see Left alone); check ${behind.length === 1 ? 'it supports' : 'they support'} Node ${TARGET_NODE} before this step.`,
+    );
+  }
   if (eraNode === null || preFour || jump! > 0) {
     drafts.push({
       step: {
@@ -143,7 +150,7 @@ export function buildPlan(reports: PlanInputs, options: PlanOptions = {}): PlanR
 
   drafts.sort((a, b) => BUCKETS.indexOf(a.bucket) - BUCKETS.indexOf(b.bucket) || a.weight - b.weight || compare(a.step.id, b.step.id));
 
-  const baseline = checkFor(source, exhume, witness);
+  const baseline = checkFor(source, exhume, resurrect, witness);
   const goals = interview?.goals.map((g) => g.text) ?? [];
   const codeFixes = drafts.filter((d) => d.bucket === 'code-fix').map((d) => d.step.id);
   const steps: PlanStep[] = drafts.map((d, i) => ({
@@ -186,7 +193,12 @@ export function buildPlan(reports: PlanInputs, options: PlanOptions = {}): PlanR
   };
 }
 
-function draftFor(t: Tombstone, use: Usage, fixes: string[], leftAlone: PlanReport['leftAlone']): Draft | null {
+/** A maintained package with no advisories that is behind by a major: left alone rather than upgraded. */
+function majorBehindButAlive(t: Tombstone): boolean {
+  return t.status === 'alive' && t.advisories.length === 0 && (t.majorsBehind ?? 0) > 0;
+}
+
+function draftFor(t: Tombstone, use: Usage, fixes: string[], scriptCommand: string | null, leftAlone: PlanReport['leftAlone']): Draft | null {
   const current = t.resolved ?? t.declared;
   const why = [...t.causes.map((c) => c.detail), ...t.advisories.map(advisoryLine), ...fixes];
   const security = t.advisories.length > 0;
@@ -197,7 +209,37 @@ function draftFor(t: Tombstone, use: Usage, fixes: string[], leftAlone: PlanRepo
     leftAlone.push({ name: t.name, reason: 'Its status is unknown (the registry lookup gave nothing); check it by hand.' });
     return null;
   }
+  if (majorBehindButAlive(t)) {
+    const majors = t.majorsBehind!;
+    leftAlone.push({ name: t.name, reason: `${majors} major${majors === 1 ? '' : 's'} behind; maintained, upgrade when convenient.` });
+    return null;
+  }
   if (t.status === 'alive' && !security) return null;
+
+  if ((t.status === 'dead' || t.status === 'dying') && importedBy === 0 && !t.dev && !use.script) {
+    if (scriptCommand) {
+      leftAlone.push({ name: t.name, reason: `Nothing imports it, but a script runs \`${scriptCommand}\`, which may come from it; check before removing it.` });
+      return null;
+    }
+    return {
+      step: {
+        id: `remove:${t.name}`,
+        kind: 'remove-dependency',
+        title: `Remove ${t.name}`,
+        change: [{ name: t.name, from: current, to: null }],
+        why: [
+          ...why,
+          'Nothing imports it, but it may still be used from config files or the command line; search for its name before removing it.',
+          ...(t.replacement ? [`If something still needs it, ${t.replacement.name} replaces it (${t.replacement.reason}).`] : []),
+        ],
+        touches,
+        risk: 'medium',
+      },
+      bucket: 'remove',
+      weight: 0,
+      security,
+    };
+  }
 
   if ((t.status === 'dead' || t.status === 'dying') && t.replacement) {
     const r = t.replacement;
@@ -218,23 +260,6 @@ function draftFor(t: Tombstone, use: Usage, fixes: string[], leftAlone: PlanRepo
       },
       bucket: 'replace',
       weight: importedBy ?? Number.MAX_SAFE_INTEGER,
-      security,
-    };
-  }
-
-  if ((t.status === 'dead' || t.status === 'dying') && importedBy === 0 && !t.dev && !use.script) {
-    return {
-      step: {
-        id: `remove:${t.name}`,
-        kind: 'remove-dependency',
-        title: `Remove ${t.name}`,
-        change: [{ name: t.name, from: current, to: null }],
-        why: [...why, 'Nothing imports it, but it may still be used from config files or the command line; search for its name before removing it.'],
-        touches,
-        risk: 'medium',
-      },
-      bucket: 'remove',
-      weight: 0,
       security,
     };
   }
@@ -320,7 +345,44 @@ function usageOf(exhume: ExhumeReport | null): (name: string) => Usage {
   };
 }
 
-function checkFor(source: string, exhume: ExhumeReport | null, witness: WitnessReport | null): PlanCheck {
+/** Commands a script may run that need no package: shell builtins, common utilities, and Node's own tools. */
+const KNOWN_COMMANDS = new Set([
+  ...['cd', 'echo', 'exit', 'export', 'set', 'unset', 'true', 'false', 'test', '[', 'exec', 'source', '.', 'printf', 'sleep', 'env'],
+  ...['sh', 'bash', 'rm', 'cp', 'mv', 'mkdir', 'cat', 'ls', 'touch', 'chmod', 'ln', 'find', 'grep', 'sed', 'tar', 'git', 'make'],
+  ...['node', 'npm', 'yarn', 'pnpm', 'npx'],
+]);
+
+/**
+ * The first command a manifest script runs that is neither known (see KNOWN_COMMANDS) nor the name of a dependency,
+ * else null. No saved report records which binaries a package installs, so a command like `coffee` (from
+ * coffee-script) cannot be tied to its package. While such a command exists, any unimported runtime dependency may be
+ * the one providing it, so none is proposed for removal. Each `&&`, `||`, `;` or `|` part counts, after any
+ * `NAME=value` prefixes; `npx <cmd>` runs `<cmd>`, `node_modules/.bin/<cmd>` is `<cmd>`, and other paths are the
+ * repo's own files.
+ */
+function unexplainedScriptCommand(exhume: ExhumeReport | null, tombstones: Tombstone[]): string | null {
+  if (!exhume) return null;
+  const packages = new Set([
+    ...tombstones.map((t) => t.name),
+    ...exhume.manifests.flatMap((m) => [...Object.keys(m.dependencies), ...Object.keys(m.devDependencies)]),
+  ]);
+  for (const m of exhume.manifests) {
+    for (const command of Object.values(m.scripts ?? {})) {
+      for (const part of command.split(/&&|\|\||;|\|/)) {
+        const words = part.trim().split(/\s+/).filter((w) => w && !/^\w+=/.test(w));
+        let cmd = words[0] === 'npx' ? words.slice(1).find((w) => !w.startsWith('-')) : words[0];
+        if (cmd?.startsWith('node_modules/.bin/')) cmd = cmd.slice('node_modules/.bin/'.length);
+        if (cmd && !cmd.includes('/') && !KNOWN_COMMANDS.has(cmd) && !packages.has(cmd)) return cmd;
+      }
+    }
+  }
+  return null;
+}
+
+/** npm's placeholder for a package without tests, which always fails. */
+const NO_TEST_SCRIPT = 'echo "Error: no test specified" && exit 1';
+
+function checkFor(source: string, exhume: ExhumeReport | null, resurrect: ResurrectReport | null, witness: WitnessReport | null): PlanCheck {
   if (witness && witness.snapshots.length > 0) {
     return {
       kind: 'witness',
@@ -331,8 +393,11 @@ function checkFor(source: string, exhume: ExhumeReport | null, witness: WitnessR
   if (witness?.tests) {
     return { kind: 'tests', command: witness.tests.command, passes: 'The project\'s own tests pass, as they did when witnessed.' };
   }
-  if (exhume && exhume.stats.testFiles > 0) {
-    return { kind: 'tests', command: 'npm test', passes: 'The project\'s own tests pass.' };
+  // `<pm> test` runs the root manifest's script, so only that one counts.
+  const test = exhume?.manifests.find((m) => m.manifest === 'package.json')?.scripts?.test?.trim();
+  if (test && test !== NO_TEST_SCRIPT) {
+    const pm = resurrect?.recipe.packageManager ?? exhume!.repo.packageManager;
+    return { kind: 'tests', command: `${pm === 'yarn' || pm === 'pnpm' ? pm : 'npm'} test`, passes: 'The project\'s own tests pass.' };
   }
   return { kind: 'resurrect', command: `necromancer resurrect ${shellArg(source)}`, passes: 'The app still installs, builds and boots.' };
 }

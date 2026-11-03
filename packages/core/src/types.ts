@@ -442,31 +442,39 @@ export interface ResurrectRunState {
   seen: Record<string, number>;
   tokens: number;
   calls: number;
-  /**
-   * Every fix the owner declined in this run, from any source, by `opsKey` of its ops; none is offered again.
-   * Missing in older reports.
-   */
-  declinedFixes?: string[];
-  /** Before `declinedFixes`: what was declined for the pending failure only, as known/cache fix ids and op keys. Read from older reports only. */
-  skip?: string[];
+  /** Every fix the owner declined in this run, from any source, by `opsKey` of its ops; none is offered again. */
+  declinedFixes: string[];
   /** The fixes declined for the pending failure, as shown in the blocked message. */
-  declined?: string[];
+  declined: string[];
   /** The owner's latest answer about this failure. */
-  answer?: string | null;
+  answer: string | null;
   /** Questions the owner answered about this failure so far. */
-  questions?: number;
+  questions: number;
   /** Fixes the owner declined for this failure so far. */
-  declines?: number;
-  /** Before `questions` and `declines`: both counted together. Read from older reports only. */
-  rounds?: number;
-  /** The run's attempt limit; a resume keeps it unless told otherwise. Missing in older reports. */
-  maxIterations?: number;
-  /** The run's token budget; a resume keeps it unless told otherwise. Missing in older reports. */
-  tokenBudget?: number;
-  /** The CA certificate the install step trusted, or null for none; a resume uses it again. Missing in older reports. */
-  caFile?: string | null;
-  /** How the sandbox was set up, when it said; a resume should rebuild it the same way. Missing in older reports. */
-  sandbox?: SandboxSettings | null;
+  declines: number;
+  /**
+   * What the model is told about the project, from the interview the run started with: its intent and the owner's goals,
+   * or null for none. A resume tells the model this, not what the resuming call's interview says.
+   */
+  interview: { intent: string; goals: string[] } | null;
+  /** Everything that defined the run; a resume restores all of it, and only overrides the caller gives explicitly change it. */
+  settings: ResurrectRunSettings;
+}
+
+/** The settings a paused run was started with. The sandbox limits are the report's own `limits`. */
+export interface ResurrectRunSettings {
+  maxIterations: number;
+  tokenBudget: number;
+  /** The model asked for fixes, or null when the run used known and cached fixes only (no key, no model, or a budget of 0). */
+  model: string | null;
+  /** The CA certificate the install step trusted, as an absolute path, or null for none. */
+  caFile: string | null;
+  /** How the sandbox was set up, or null when the sandbox did not say. */
+  sandbox: SandboxSettings | null;
+  /** Whether the built images were kept after the run. */
+  keepImages: boolean;
+  /** Where remote repos were cloned, or null for the default temp directory. */
+  workdir: string | null;
 }
 
 export interface ResurrectReport {
@@ -610,7 +618,7 @@ export interface PlanReport {
   intent: string | null;
   goals: string[];
   /** The Node release to end on, and why. */
-  target: { node: string | null; why: string };
+  target: { node: string; why: string };
   /** The check used when a step does not need a more specific one. */
   baseline: PlanCheck;
   steps: PlanStep[];

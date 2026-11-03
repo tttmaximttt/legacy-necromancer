@@ -8,7 +8,7 @@ export function renderPlanMarkdown(plan: PlanReport): string {
   out.push(`Generated ${plan.generatedAt}${plan.repo.commit ? ` at commit ${plan.repo.commit.slice(0, 12)}` : ''}.`, '');
   if (plan.intent) out.push(`**What it is for:** ${plan.intent}`, '');
   if (plan.goals.length) out.push('**Goals:**', '', ...plan.goals.map((g) => `- ${g}`), '');
-  out.push(`**Target:** ${plan.target.node ? `Node ${plan.target.node}. ` : ''}${plan.target.why}`, '');
+  out.push(`**Target:** Node ${plan.target.node}. ${plan.target.why}`, '');
   out.push(`**Check after every step:** \`${plan.baseline.command}\`. ${plan.baseline.passes}`, '');
   out.push('Do the steps one at a time, in order. A step is done only when its check passes.', '');
 

@@ -273,6 +273,11 @@ describe('necromancer MCP resurrect', () => {
     const missing = await client.callTool({ name: 'resurrect', arguments: { source: root, tokenBudget: 0, resume: true } });
     expect(missing.isError).toBe(true);
     expect(text(missing)).toContain('resuming needs a decision on the pending fix');
+    // approvals: "all" covers fixes found later, never the pending one, as the CLI's --yes.
+    const all = await client.callTool({ name: 'resurrect', arguments: { source: root, tokenBudget: 0, resume: true, approvals: 'all' } });
+    expect(all.isError).toBe(true);
+    expect(text(all)).toContain('resuming needs a decision on the pending fix');
+    expect(text(all)).toContain('then call again with approve: true or false; approvals: "all" does not answer it.');
     const resumed = JSON.parse(
       text(await client.callTool({ name: 'resurrect', arguments: { source: root, tokenBudget: 0, resume: true, approve: true, save: false } })),
     );
@@ -282,6 +287,25 @@ describe('necromancer MCP resurrect', () => {
     expect((await new ReportStore(storeDir).load(path.basename(root)))?.resurrect?.outcome).toBe('resurrected');
     expect(resumed.decisions).toMatchObject([{ kind: 'approval', subject: 'node-gyp-python', answer: 'approved' }]);
     expect(resumed.pending).toBeUndefined();
+  });
+
+  it('refuses approve or answer without resume, and both together, leaving the paused run as it was', async () => {
+    const root = await deadApp(expressMongoApp);
+    const store = new ReportStore(path.join(await mkdtemp(path.join(os.tmpdir(), 'necro-mcp-')), 'reports'));
+    await (await connect({ store, sandbox: new FakeSandbox({ install: [{ ok: false, log: NODE_GYP_LOG }] }) })).callTool({
+      name: 'resurrect',
+      arguments: { source: root, tokenBudget: 0 },
+    });
+    const client = await connect({ store, sandbox: new FakeSandbox({}) });
+    for (const args of [{ approve: true }, { approve: false }, { answer: 'stub it' }]) {
+      const result = await client.callTool({ name: 'resurrect', arguments: { source: root, tokenBudget: 0, ...args } });
+      expect(result.isError).toBe(true);
+      expect(text(result)).toContain('approve and answer go with resume: true');
+    }
+    const both = await client.callTool({ name: 'resurrect', arguments: { source: root, resume: true, approve: true, answer: 'stub it' } });
+    expect(both.isError).toBe(true);
+    expect(text(both)).toContain('not both');
+    expect((await store.load(path.basename(root)))!.resurrect!.outcome).toBe('needs-you');
   });
 
   it('keeps the paused run\'s limits on resume unless the caller gives new ones', async () => {
@@ -304,24 +328,36 @@ describe('necromancer MCP resurrect', () => {
     expect(lastResume()).toMatchObject({ approve: true, maxIterations: 6, tokenBudget: 0 });
   });
 
-  it('decides on a model from the paused run\'s budget on resume', async () => {
+  it('asks the paused run\'s model on resume, and none when it asked none', async () => {
     const root = await deadApp(expressMongoApp);
     const store = new ReportStore(path.join(await mkdtemp(path.join(os.tmpdir(), 'necro-mcp-')), 'reports'));
-    const lastModel = () => vi.mocked(resurrect).mock.calls.at(-1)![1].model;
-    const pause = async () =>
-      (await connect({ store, model: new ScriptedModel(), sandbox: new FakeSandbox({ install: [{ ok: false, log: NODE_GYP_LOG }] }) })).callTool({
+    const last = () => vi.mocked(resurrect).mock.calls.at(-1)![1];
+    const pause = async (args: Record<string, unknown>, model?: ScriptedModel) =>
+      (await connect({ store, model, sandbox: new FakeSandbox({ install: [{ ok: false, log: NODE_GYP_LOG }] }) })).callTool({
         name: 'resurrect',
-        arguments: { source: root, tokenBudget: 0 },
+        arguments: { source: root, ...args },
       });
     const client = await connect({ store, model: new ScriptedModel(), sandbox: new FakeSandbox({}) });
 
-    await pause();
-    await client.callTool({ name: 'resurrect', arguments: { source: root, resume: true, approve: true } });
-    expect(lastModel()).toBeNull();
-
-    await pause();
+    // Paused without a model: a larger budget alone does not bring one in.
+    await pause({ tokenBudget: 0 }, new ScriptedModel());
     await client.callTool({ name: 'resurrect', arguments: { source: root, resume: true, approve: true, tokenBudget: 1000 } });
-    expect(lastModel()).toBeInstanceOf(ScriptedModel);
+    expect(last().model).toBeNull();
+
+    await pause({}, new ScriptedModel());
+    expect(JSON.parse(text(await client.callTool({ name: 'resurrect', arguments: { source: root, resume: true, approve: true } }))).outcome).toBe('RESURRECTED');
+    expect(last().model).toBeInstanceOf(ScriptedModel);
+
+    // Paused with a model, resumed where there is no key: say how to add one, or to go on without.
+    await pause({}, new ScriptedModel());
+    const keyless = await connect({ store, sandbox: new FakeSandbox({}) });
+    const refused = await keyless.callTool({ name: 'resurrect', arguments: { source: root, resume: true, approve: true } });
+    expect(refused.isError).toBe(true);
+    expect(text(refused)).toMatch(/the paused run asked scripted for fixes, and there is no Anthropic API key; to add one, .*, or call again with tokenBudget: 0/);
+    expect((await store.load(path.basename(root)))!.resurrect!.outcome).toBe('needs-you');
+    const known = JSON.parse(text(await keyless.callTool({ name: 'resurrect', arguments: { source: root, resume: true, approve: true, tokenBudget: 0 } })));
+    expect(known.outcome).toBe('RESURRECTED');
+    expect(last().model).toBeNull();
   });
 
   it('pauses on a question and passes the answer on when resumed', async () => {
@@ -347,7 +383,7 @@ describe('necromancer MCP resurrect', () => {
     expect(body.next).toMatch(/resume: true and answer/);
     expect(body.next).toContain('do not ask them for passwords, keys or other secrets');
 
-    const model = new ScriptedModel({ diagnosis: 'stub it', decision: 'fix', ops: [{ op: 'setEnv', name: 'ACME_STUB', value: '1' }], blockedReason: null, question: null, choices: [] });
+    const model = new ScriptedModel({ diagnosis: 'stub it', decision: 'fix', ops: [{ op: 'setEnv', name: 'CI', value: 'true' }], blockedReason: null, question: null, choices: [] });
     const client = await connect({ store, sandbox: new FakeSandbox({}), model });
     for (const blank of ['', '  ']) {
       const empty = await client.callTool({ name: 'resurrect', arguments: { source: root, resume: true, answer: blank } });

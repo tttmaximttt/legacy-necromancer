@@ -13,6 +13,7 @@ import { graveyard } from '@necromancer/graveyard';
 import { buildPlan, renderPlanMarkdown } from '@necromancer/plan';
 import { ClaudeModel, credentialsHint, DEFAULT_MODEL, hasCredentials, type Effort, type StructuredModel } from '@necromancer/llm';
 import {
+  DEFAULT_HEALTH_TIMEOUT_SEC,
   DEFAULT_LIMITS,
   DEFAULT_MAX_ITERATIONS,
   DEFAULT_TOKEN_BUDGET,
@@ -22,11 +23,13 @@ import {
   FixCache,
   resurrect,
   resumeSettings,
+  ResumeError,
   type ApprovalAnswer,
   type ApprovalRequest,
   type OwnerQuestion,
   type ResumeInput,
   type ResumeOverrides,
+  type RunSettings,
   type Sandbox,
 } from '@necromancer/resurrect';
 import { compareWitness, witness } from '@necromancer/witness';
@@ -178,7 +181,8 @@ export function createProgram(deps: ProgramDeps = {}): Command {
     .description(
       'Get the project installing, building and booting in a Docker sandbox pinned to its era. Known fixes first, then ' +
         'Claude (if an Anthropic API key is set); stops with BLOCKED: <reason> when it cannot get further. Fixes that change ' +
-        'dependencies, the Node version, system packages or what runs wait for your OK, and questions only you can answer ' +
+        'dependencies, the Node version or base image, system packages, install flags, environment variables or what runs ' +
+        'wait for your OK (except a short allow-list of harmless flags and variables), and questions only you can answer ' +
         'are asked; without a terminal to ask on, the run stops with NEEDS YOU (exit code 3) and `--resume` carries on. Needs Docker.',
     )
     .argument('<source>', 'git URL or local path')
@@ -189,12 +193,14 @@ export function createProgram(deps: ProgramDeps = {}): Command {
     .option('--cpus <n>', 'CPUs per container', Number, DEFAULT_LIMITS.cpus)
     .option('--memory <mb>', 'memory per container, in MB', int, DEFAULT_LIMITS.memoryMb)
     .option('--step-timeout <sec>', 'time limit for each install, build or boot step', int, DEFAULT_LIMITS.stepTimeoutSec)
-    .option('--health-timeout <sec>', 'how long to wait for the app to answer', int, 90)
+    .option('--health-timeout <sec>', 'how long to wait for the app to answer', int, DEFAULT_HEALTH_TIMEOUT_SEC)
     .option('--out-dir <dir>', 'also write Dockerfile.necromancer and docker-compose.necromancer.yml here')
     .option('--ca-file <file>', 'extra CA certificate for a TLS-intercepting proxy during install')
     .option('--build-proxy', "pass this machine's HTTP(S)_PROXY to the install step")
+    .option('--no-build-proxy', "with --resume: don't pass the proxy, though the saved run did")
     .option('--keep-images', 'keep the built images')
-    .option('-y, --yes', 'apply risky fixes without asking')
+    .option('--no-keep-images', "with --resume: remove the built images, though the saved run kept them")
+    .option('-y, --yes', 'apply risky fixes without asking (with --resume, not the one it is waiting on: pass --approve or --reject)')
     .option('--resume', 'carry on from the saved run that is waiting on you')
     .option('--approve', 'with --resume: apply the fix it is waiting on')
     .option('--reject', 'with --resume: decline that fix and look for another')
@@ -251,17 +257,24 @@ export function createProgram(deps: ProgramDeps = {}): Command {
                 memoryMb: given('memory') ? opts.memory : undefined,
                 stepTimeoutSec: given('stepTimeout') ? opts.stepTimeout : undefined,
               },
+              model: given('llm') && !opts.llm ? null : given('model') ? opts.model : undefined,
+              keepImages: given('keepImages') ? !!opts.keepImages : undefined,
+              workdir: given('workdir') ? path.resolve(opts.workdir!) : undefined,
+              sandbox: {
+                buildProxy: given('buildProxy') ? !!opts.buildProxy : undefined,
+                healthTimeoutSec: given('healthTimeout') ? opts.healthTimeout : undefined,
+              },
             };
-            // Older reports did not save every setting; the flags' values stand in for what is missing.
-            const fallback = { maxIterations: opts.maxIterations, tokenBudget: opts.tokenBudget };
-            const settings = resumeSettings(from, overrides, fallback);
-            // A pending question always needs a model, so the check below can say whether it is the key or the budget that is missing.
-            model = settings.tokenBudget > 0 || from.pending?.kind === 'question' ? chooseModel(opts, deps, noKey) : null;
             // Everything that can stop the resume is checked before asking, so an answer is never thrown away.
+            let settings: RunSettings | undefined;
+            model = null;
             try {
-              checkResumable(from, { model, ...fallback, resume: overrides });
+              settings = resumeSettings(from, overrides);
+              // The model the paused run asked, or the one named again; none when there is no key, which the check reports.
+              model = settings.model === null ? null : (deps.model ?? (hasCredentials() ? new ClaudeModel({ model: settings.model }) : null));
+              checkResumable(from, { model, resume: overrides });
             } catch (err) {
-              throw new Error(`${errorMessage(err)}${resumeHint(source, from, model)}`);
+              throw new Error(`${errorMessage(err)}${resumeHint(source, from, err, settings)}`);
             }
             const decision = await resumeDecision(from, opts, prompt);
             if (!decision) {
@@ -270,12 +283,8 @@ export function createProgram(deps: ProgramDeps = {}): Command {
               process.exitCode = 3;
               return;
             }
-            sandbox =
-              deps.sandbox ??
-              new DockerSandbox({
-                buildProxy: given('buildProxy') ? opts.buildProxy : settings.sandbox?.buildProxy,
-                healthTimeoutSec: given('healthTimeout') ? opts.healthTimeout : (settings.sandbox?.healthTimeoutSec ?? opts.healthTimeout),
-              });
+            // The paused run's sandbox, with any --build-proxy or --health-timeout typed again already merged in.
+            sandbox = deps.sandbox ?? new DockerSandbox(settings!.sandbox ?? {});
             resume = { from, ...decision, ...overrides };
           } else {
             model = opts.tokenBudget > 0 ? chooseModel(opts, deps, noKey) : null;
@@ -334,7 +343,7 @@ export function createProgram(deps: ProgramDeps = {}): Command {
     .option('--no-tests', "don't run the project's test script")
     .option('-m, --model <id>', 'Claude model', DEFAULT_MODEL)
     .option('--step-timeout <sec>', 'time limit for each install, build or test step', int)
-    .option('--health-timeout <sec>', 'how long to wait for the app to answer', int, 90)
+    .option('--health-timeout <sec>', 'how long to wait for the app to answer', int, DEFAULT_HEALTH_TIMEOUT_SEC)
     .option('--ca-file <file>', 'extra CA certificate for a TLS-intercepting proxy during install')
     .option('--build-proxy', "pass this machine's HTTP(S)_PROXY to the install step")
     .option('--reports <dir>', 'report store directory')
@@ -458,8 +467,10 @@ async function resumeDecision(
   const pending = from.pending!;
   if (pending.kind === 'approval') {
     if (opts.answer !== undefined) throw new Error('the saved run is waiting on a fix, not a question; pass --approve or --reject');
-    if (opts.approve || opts.yes) return { approve: true };
+    // --yes covers risky fixes found later in the run, never the one the owner is asked about: that takes --approve,
+    // --reject or the prompt, so `--resume --reject --yes` declines it.
     if (opts.reject) return { approve: false };
+    if (opts.approve) return { approve: true };
     if (!prompt) return null;
     const failed = from.resume?.failure;
     const excerpt = from.attempts.find((a) => a.n === failed?.attempt)?.errorExcerpt ?? failed?.log ?? '';
@@ -498,13 +509,31 @@ async function askQuestion(question: OwnerQuestion, prompt: Prompt): Promise<str
   return Number.isInteger(n) && n >= 1 && n <= question.choices.length ? question.choices[n - 1]! : reply;
 }
 
-/** The flags that get past a failed `checkResumable`, to add to its message. */
-function resumeHint(source: string, from: ResurrectReport, model: StructuredModel | null): string {
-  if (from.outcome !== 'needs-you' || !from.pending || !from.resume) {
-    return ` (\`necromancer resurrect ${shellArg(source)}\` without --resume starts a new run)`;
+/** The flags that get past a failed `resumeSettings` or `checkResumable`, by the `ResumeError` code, to add to its message. */
+function resumeHint(source: string, from: ResurrectReport, err: unknown, settings: RunSettings | undefined): string {
+  if (!(err instanceof ResumeError)) return '';
+  const question = from.pending?.kind === 'question';
+  switch (err.code) {
+    case 'not-paused':
+    case 'no-state':
+      return ` (\`necromancer resurrect ${shellArg(source)}\` without --resume starts a new run)`;
+    case 'budget-spent':
+      return '; pass a larger --token-budget';
+    case 'no-model':
+      return `; drop --no-llm, or pass -m ${DEFAULT_MODEL} (or another model) to ask one`;
+    case 'model-null':
+      return `; to add an Anthropic API key, ${credentialsHint()}${question ? '' : ', or pass --no-llm to carry on with known and cached fixes only'}`;
+    case 'model-mismatch':
+      return settings?.model ? `; pass -m ${settings.model} (or another model)` : '; drop -m to resume without a model';
+    case 'model-without-budget':
+      return '; pass a larger --token-budget, or drop -m';
+    case 'wrong-kind':
+      return question ? '; pass --answer "…"' : '; pass --approve or --reject';
+    case 'needs-approve':
+      return '; pass --approve or --reject';
+    case 'needs-answer':
+      return '; pass --answer "…"';
   }
-  if (from.pending.kind !== 'question') return '';
-  return model ? '; pass a larger --token-budget' : '; set an Anthropic API key and drop --no-llm';
 }
 
 /** The NEEDS YOU block: what the run is waiting on and the exact commands that carry it on. */

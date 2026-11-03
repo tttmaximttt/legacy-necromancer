@@ -44,10 +44,12 @@ the agent's `proposal`, whose citations are checked against the repo.
 for known fixes only), `approvals` and `save`. It takes minutes and sends
 progress notifications. Claude proposes fixes only if the server has an
 API key. With `approvals: "ask"` (the default), a fix that changes
-dependencies, the Node version, system packages or what runs stops the run
-with outcome `NEEDS YOU`, and so does a question only you can answer. The
+dependencies, the Node version or base image, system packages, install
+flags or environment variables (beyond a short allow-list of harmless
+ones), or what runs stops the run with outcome `NEEDS YOU`, and so does a question only you can answer. The
 agent asks you, then calls `resurrect` again with `resume: true` and
-`approve` (true or false) or `answer`. `approvals: "all"` applies every fix.
+`approve` (true or false) or `answer`. `approvals: "all"` applies every fix,
+except the one a resumed run is waiting on, which still needs `approve`.
 
 `plan` takes `source` and `save`, and returns each step (up to 30) as one
 line with its risk and check command; the full plan is in `plan.md`.

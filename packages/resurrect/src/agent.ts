@@ -1,4 +1,4 @@
-import type { BuildRecipe, InterviewReport, OwnerDecision, RecipeOp, ResurrectAttempt, ResurrectPhase } from '@necromancer/core';
+import type { BuildRecipe, OwnerDecision, RecipeOp, ResurrectAttempt, ResurrectPhase, ResurrectRunState } from '@necromancer/core';
 import type { StructuredModel } from '@necromancer/llm';
 import { z } from 'zod';
 import { RecipeOpSchema } from './recipe.js';
@@ -28,6 +28,16 @@ export const FixProposalSchema = z.object({
 
 export type FixProposal = z.infer<typeof FixProposalSchema>;
 
+/** `FixProposalSchema` for when the owner has answered all the questions they will about this failure: no "ask". */
+export const FixProposalNoAskSchema = FixProposalSchema.extend({
+  decision: z
+    .enum(['fix', 'blocked'])
+    .describe('"fix" to try recipe changes; "blocked" when no recipe change can fix this. The owner takes no more questions about this failure'),
+});
+
+export const NO_MORE_QUESTIONS =
+  'The owner has answered all the questions they will about this failure, so you can no longer ask: propose a fix, or answer "blocked".';
+
 export const FIX_SYSTEM_PROMPT = `You get abandoned Node.js projects installing, building and booting inside a locked-down Docker sandbox. Each attempt failed at one step; you see the tail of that step's log and decide the next change.
 
 You cannot edit the project's source code or the Dockerfile directly. You change a build recipe with ops:
@@ -56,13 +66,16 @@ export interface ProposeInput {
   dockerfile: string;
   dependencies: Record<string, string>;
   history: ResurrectAttempt[];
-  interview: InterviewReport | null;
+  /** The project's intent and the owner's goals, from the interview the run started with. */
+  interview: ResurrectRunState['interview'];
   /** Why the previous proposal was rejected, when asking again in the same attempt. */
   rejected?: string;
   /** The owner's approvals and answers so far in this run. */
   decisions?: OwnerDecision[];
   /** The owner's answer to the question the model asked about this failure. */
   answer?: string;
+  /** false once the owner has answered as many questions about this failure as they will; "ask" is then not offered. */
+  canAsk?: boolean;
 }
 
 export function buildFixPrompt(input: ProposeInput): string {
@@ -75,7 +88,7 @@ export function buildFixPrompt(input: ProposeInput): string {
       : `- attempt ${d.attempt}: the owner ${d.answer} fix ${d.subject.startsWith('llm:') && d.description ? `"${d.description}"` : d.subject}`,
   );
   const goals = input.interview
-    ? `\nWhat the project is for: ${input.interview.intent}${input.interview.goals.length ? `\nOwner's goals: ${input.interview.goals.map((g) => g.text).join('; ')}` : ''}\n`
+    ? `\nWhat the project is for: ${input.interview.intent}${input.interview.goals.length ? `\nOwner's goals: ${input.interview.goals.join('; ')}` : ''}\n`
     : '';
   return [
     goals,
@@ -83,6 +96,7 @@ export function buildFixPrompt(input: ProposeInput): string {
     tried.length ? `Already tried:\n${tried.join('\n')}` : 'Nothing tried yet.',
     decisions.length ? `\nThe owner's decisions so far:\n${decisions.join('\n')}` : '',
     input.answer ? `\nThe owner answered your question: ${input.answer}` : '',
+    input.canAsk === false ? `\n${NO_MORE_QUESTIONS}` : '',
     input.rejected ? `\nYour previous proposal was rejected: ${input.rejected}. Propose something else.` : '',
     `\nCurrent recipe:\n${JSON.stringify(input.recipe, null, 2)}`,
     `\nDockerfile rendered from it:\n${input.dockerfile}`,
@@ -95,7 +109,8 @@ export async function proposeFix(
   model: StructuredModel,
   input: ProposeInput,
 ): Promise<{ proposal: FixProposal & { ops: RecipeOp[] }; tokens: number }> {
-  const result = await model.generate({ system: FIX_SYSTEM_PROMPT, prompt: buildFixPrompt(input), schema: FixProposalSchema, effort: 'medium', maxTokens: 8000 });
+  const schema: z.ZodType<FixProposal> = input.canAsk === false ? FixProposalNoAskSchema : FixProposalSchema;
+  const result = await model.generate({ system: FIX_SYSTEM_PROMPT, prompt: buildFixPrompt(input), schema, effort: 'medium', maxTokens: 8000 });
   return {
     proposal: result.output as FixProposal & { ops: RecipeOp[] },
     tokens: result.usage.inputTokens + result.usage.outputTokens,

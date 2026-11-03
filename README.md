@@ -309,13 +309,16 @@ including the sandbox, are in the [package README](packages/resurrect/README.md)
 
 Some fixes change the project rather than the sandbox: a dependency
 version, the Node major, system packages, where and how packages are
-installed (a registry, npm settings), or the build or start command.
-Those wait for your OK. In a terminal you see the fix, what it would
-change and the error it is for, and answer `y` to apply it, `n` to look
-for another fix, or `p` to stop. When Claude needs something only you
+installed (install flags, a registry, npm settings), environment
+variables, or the build or start command. A short allow-list of harmless
+install flags and variables (such as `--legacy-peer-deps` or `CI`) is
+applied without asking; the rest wait for your OK. In a terminal you see
+the fix, what it would change and the error it is for, and answer `y` to
+apply it, `n` to look for another fix, or `p` to stop. When Claude needs something only you
 know, such as what to do about a private package, it asks, with numbered
 suggestions; type a number or your own answer, or press Enter to stop.
-`--yes` applies every fix without asking.
+`--yes` applies every fix without asking, except the one a `--resume` is
+waiting on: that takes `--approve` or `--reject`.
 
 Without a terminal to ask on (in CI, or piped), the run stops at the first
 such fix or question with `NEEDS YOU`, saves where it got to, prints the
@@ -327,6 +330,9 @@ necromancer resurrect <repo> --resume --reject         # look for another fix
 necromancer resurrect <repo> --resume --answer "stub it"
 ```
 
+A resumed run keeps the paused run's settings (model or `--no-llm`, limits,
+`--keep-images`, `--workdir`, `--build-proxy`, `--health-timeout`); only the
+flags you type again change them, and `--no-build-proxy` turns the proxy off.
 Claude turns your answer into a fix, so `--answer` needs an API key.
 
 Through MCP, the agent you're talking to asks you instead and carries on

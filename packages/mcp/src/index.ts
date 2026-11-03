@@ -20,7 +20,7 @@ import { graveyard as runGraveyard, type GraveyardOptions } from '@necromancer/g
 import { buildPlan, renderPlanMarkdown } from '@necromancer/plan';
 import { answerInterview, interviewBrief, proposeIntent, ProposalSchema, recordProposal } from '@necromancer/interview';
 import { ClaudeModel, credentialsHint, hasCredentials, type StructuredModel } from '@necromancer/llm';
-import { DEFAULT_MAX_ITERATIONS, DEFAULT_TOKEN_BUDGET, DockerSandbox, FixCache, resumeSettings, resurrect, type ResumeInput, type RunSettings, type Sandbox } from '@necromancer/resurrect';
+import { DEFAULT_MAX_ITERATIONS, DEFAULT_TOKEN_BUDGET, DockerSandbox, FixCache, ResumeError, resumeSettings, resurrect, type ResumeInput, type RunSettings, type Sandbox } from '@necromancer/resurrect';
 import { compareWitness, witness } from '@necromancer/witness';
 
 export interface ServerOptions {
@@ -58,7 +58,7 @@ export function createServer(options: ServerOptions = {}): McpServer {
   /** Earlier reports for this source, or null when there are none or the store can't be read. */
   const loadSaved = (source: string) => store.load(slugFor(source)).catch(() => null);
   const defaultSandbox = () => options.sandbox ?? new DockerSandbox();
-  const defaultModel = () => options.model ?? (hasCredentials() ? new ClaudeModel() : null);
+  const defaultModel = (name?: string) => options.model ?? (hasCredentials() ? new ClaudeModel({ model: name }) : null);
   const server = new McpServer({ name: 'necromancer', version: serverVersion() });
 
   server.registerTool(
@@ -250,8 +250,8 @@ export function createServer(options: ServerOptions = {}): McpServer {
         'Phase 5. Builds the project in Docker on the Node version of its era, with its databases (Mongo, Redis, Postgres, ' +
         'MySQL…) as sidecars, and boots it until a port answers. Failures are fixed from a table of known fixes, then by ' +
         'Claude if an Anthropic API key is set, for at most maxIterations attempts and tokenBudget tokens; otherwise it ends ' +
-        'with BLOCKED and a reason. With approvals "ask", a fix that changes dependencies, the Node version, system packages ' +
-        'or what runs pauses the run with outcome NEEDS YOU, and so does a question only the user can answer: ask the user, ' +
+        'with BLOCKED and a reason. With approvals "ask", a fix that changes dependencies, the Node version or base image, ' +
+        'system packages, install flags or environment variables (beyond a short allow-list of harmless ones), or what runs pauses the run with outcome NEEDS YOU, and so does a question only the user can answer: ask the user, ' +
         'then call resurrect again with resume: true and approve or answer. A paused run is always saved, since resume reads it. ' +
         'Sandbox: network only while installing dependencies, no host mounts, no credentials, CPU/memory/process/time ' +
         'limits. Takes minutes. Needs Docker on the machine running this server.',
@@ -273,7 +273,7 @@ export function createServer(options: ServerOptions = {}): McpServer {
         approvals: z
           .enum(['ask', 'all'])
           .default('ask')
-          .describe('"ask" pauses on risky fixes so you can ask the user; "all" applies every fix without asking'),
+          .describe('"ask" pauses on risky fixes so you can ask the user; "all" applies every fix without asking, except that with resume the pending fix still needs approve'),
         resume: z.boolean().default(false).describe('Carry on from the saved run that ended NEEDS YOU, with approve or answer'),
         approve: z.boolean().optional().describe('With resume, for a pending fix: true applies it, false declines it and looks for another'),
         answer: z.string().optional().describe("With resume, for a pending question: the user's answer"),
@@ -283,6 +283,9 @@ export function createServer(options: ServerOptions = {}): McpServer {
     },
     async ({ source, maxIterations, tokenBudget, approvals, resume, approve, answer, save }, extra) => {
       try {
+        // Without resume the run would start over and replace the paused one the decision was meant for.
+        if ((approve !== undefined || answer !== undefined) && !resume) throw new Error('approve and answer go with resume: true; without it the paused run would be replaced by a new one.');
+        if (approve !== undefined && answer !== undefined) throw new Error('pass approve for a pending fix or answer for a pending question, not both.');
         const saved = await loadSaved(source);
         let from: ResumeInput | undefined;
         let settings: RunSettings | undefined;
@@ -294,8 +297,15 @@ export function createServer(options: ServerOptions = {}): McpServer {
           from = { from: saved.resurrect, approve, answer, maxIterations, tokenBudget };
           settings = resumeSettings(saved.resurrect, { maxIterations, tokenBudget });
         }
-        const budget = settings ? settings.tokenBudget : (tokenBudget ?? DEFAULT_TOKEN_BUDGET);
-        const model = budget > 0 ? defaultModel() : null;
+        // A resumed run asks the model the paused run asked, or none when it asked none.
+        const wanted = settings ? settings.model : (tokenBudget ?? DEFAULT_TOKEN_BUDGET) > 0 ? undefined : null;
+        const model = wanted === null ? null : defaultModel(wanted);
+        if (settings && wanted && !model) {
+          throw new Error(
+            `the paused run asked ${wanted} for fixes, and there is no Anthropic API key; to add one, ${credentialsHint()}` +
+              (saved!.resurrect!.pending?.kind === 'approval' ? ', or call again with tokenBudget: 0 to carry on with known and cached fixes only.' : '.'),
+          );
+        }
         const report = await resurrect(source, {
           // A resumed run's sandbox is set up as the paused run's was.
           sandbox: settings ? (options.sandbox ?? new DockerSandbox(settings.sandbox ?? {})) : defaultSandbox(),
@@ -327,12 +337,12 @@ export function createServer(options: ServerOptions = {}): McpServer {
           warnings: report.warnings,
           dockerfile: report.dockerfile,
           compose: report.compose,
-          ...(!model && budget > 0 && { note: `No Anthropic API key, so only known fixes were tried. To add one, ${credentialsHint()}.` }),
+          ...(!model && wanted !== null && { note: `No Anthropic API key, so only known fixes were tried. To add one, ${credentialsHint()}.` }),
           // A resumed run replaces the saved needs-you report, which resume would otherwise read again.
           ...((save || paused || resume) && (await saveNote('resurrect', report))),
         });
       } catch (err) {
-        return failure('resurrect', err);
+        return failure('resurrect', err, err instanceof ResumeError ? resumeHint(err) : '');
       }
     },
   );
@@ -435,7 +445,7 @@ export function createServer(options: ServerOptions = {}): McpServer {
         }
         const rest = plan.steps.length - MAX_PLAN_STEPS;
         return text({
-          target: plan.target.node ? `Node ${plan.target.node}` : plan.target.why,
+          target: `Node ${plan.target.node}`,
           steps: [
             ...plan.steps.slice(0, MAX_PLAN_STEPS).map((s) => `${s.n}. ${s.title} (${s.risk}) → ${s.check.command}`),
             ...(rest > 0 ? [`…and ${rest} more; ${markdown ? `see ${markdown}` : markdownError ? 'plan.md could not be saved, as markdownError says' : 'call plan with save: true to write them all to plan.md'}`] : []),
@@ -524,11 +534,33 @@ function nextStep(pending: PendingDecision): string {
         'another. Do not decide for them.';
 }
 
-function failure(tool: string, err: unknown) {
+function failure(tool: string, err: unknown, hint = '') {
   return {
     isError: true,
-    content: [{ type: 'text' as const, text: `${tool} failed: ${errorMessage(err)}` }],
+    content: [{ type: 'text' as const, text: `${tool} failed: ${errorMessage(err)}${hint && ` ${hint}`}` }],
   };
+}
+
+/** What the host can do about a refused resume, by the `ResumeError` code; empty where the message already says it. */
+function resumeHint(err: ResumeError): string {
+  switch (err.code) {
+    case 'not-paused':
+    case 'no-state':
+      return 'Call resurrect without resume to start a new run.';
+    case 'budget-spent':
+    case 'model-without-budget':
+      return 'Call again with a larger tokenBudget.';
+    case 'no-model':
+      return 'A pending question needs a model: call again with a tokenBudget above 0, or, if the paused run used no model, call resurrect without resume to start a new run.';
+    case 'needs-approve':
+      return 'Ask the user whether to apply the pending fix, then call again with approve: true or false; approvals: "all" does not answer it.';
+    case 'needs-answer':
+      return 'Ask the user the pending question, then call again with answer set to what they said.';
+    case 'wrong-kind':
+    case 'model-null':
+    case 'model-mismatch':
+      return '';
+  }
 }
 
 /** Healthy dependencies collapse to names; everything with a cause keeps its full tombstone. */

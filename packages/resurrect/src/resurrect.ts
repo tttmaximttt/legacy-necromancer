@@ -15,6 +15,7 @@ import type {
   ResurrectAttempt,
   ResurrectPhase,
   ResurrectReport,
+  ResurrectRunSettings,
   ResurrectRunState,
   SandboxLimits,
   SandboxSettings,
@@ -26,7 +27,7 @@ import { proposeFix } from './agent.js';
 import { fixRisks } from './approval.js';
 import { DEFAULT_LIMITS, renderCompose } from './compose.js';
 import { bootServices, chooseNode, detectServices, imageRepoFor, initialRecipe, readFacts, type ProjectFacts } from './detect.js';
-import type { Sandbox, StepResult } from './docker.js';
+import { DEFAULT_HEALTH_TIMEOUT_SEC, type Sandbox, type StepResult } from './docker.js';
 import { errorSignature, findKnownFix, FixCache, tail } from './fixes.js';
 import { applyOps, changesRecipe, patchManifest, renderDockerfile } from './recipe.js';
 
@@ -61,32 +62,36 @@ export interface ResumeInput {
   answer?: string;
   /**
    * Attempts in total for the resumed run, replacing the limit the paused run had. Left out, the paused run's
-   * limit stands (or, for reports from before it was saved, `ResurrectOptions.maxIterations`). Either way the
-   * resumed run gets at least one attempt to try the fix it settles on.
+   * limit stands. Either way the resumed run gets at least one attempt to try the fix it settles on.
    */
   maxIterations?: number;
   /** Token budget for the whole run, replacing the paused run's. Left out, the paused run's budget stands. */
   tokenBudget?: number;
   /** Sandbox limits to change for the resumed run; the rest stay as the paused run had them. */
   limits?: Partial<SandboxLimits>;
+  /**
+   * The model to ask for fixes, by name, replacing the paused run's; null runs on known and cached fixes only.
+   * `ResurrectOptions.model` must then be that model (or none for null).
+   */
+  model?: string | null;
+  /** Whether to keep the built images, replacing the paused run's choice. */
+  keepImages?: boolean;
+  /** Where to clone remote repos, replacing the paused run's; null for the default temp directory. */
+  workdir?: string | null;
+  /**
+   * How the sandbox is set up for the resumed run, where it differs from the paused run's; the rest stays. The resumed
+   * run saves the result, so a later pause keeps it. The sandbox handed in should be set up this way.
+   */
+  sandbox?: Partial<SandboxSettings>;
 }
 
 /**
- * Everything besides the repo that defines a run. A fresh run takes it from `ResurrectOptions`; a resume takes it
- * from the paused run, with only the attempt limit, token budget and sandbox limits open to change.
+ * Everything besides the repo that defines a run: the saved `ResurrectRunSettings` plus the sandbox limits. A fresh
+ * run takes it from `ResurrectOptions`; a resume takes it from the paused run, changed only by the `ResumeOverrides`
+ * the caller gives.
  */
-export interface RunSettings {
-  /** Attempts in total. */
-  maxIterations: number;
-  tokenBudget: number;
+export interface RunSettings extends ResurrectRunSettings {
   limits: SandboxLimits;
-  /** The CA certificate the install step trusts, or null for none. */
-  caFile: string | null;
-  /**
-   * How the sandbox was set up (the sandbox's own `settings`); null when it did not say. A front-end resuming a run
-   * builds its sandbox from this, since `resurrect` is handed a sandbox it cannot rebuild.
-   */
-  sandbox: SandboxSettings | null;
 }
 
 /** A paused run that can carry on: what it waits on, its state, and the settings the resumed run has. */
@@ -98,7 +103,11 @@ export interface ResumableRun {
 
 export interface ResurrectOptions {
   sandbox: Sandbox;
-  /** Asked for a fix when the known-fix table and the cache have none. null runs table-only. */
+  /**
+   * Asked for a fix when the known-fix table and the cache have none. null runs table-only, as does a token budget
+   * of 0. When resuming, it must be the model the resumed run's settings name (`resumeSettings(...).model`), or none
+   * when they name none.
+   */
   model?: StructuredModel | null;
   /** Attempts in total. When resuming, the paused run's limit is kept instead; `resume.maxIterations` changes it. */
   maxIterations?: number;
@@ -106,7 +115,10 @@ export interface ResurrectOptions {
   tokenBudget?: number;
   /** When resuming, the paused run's limits are kept instead; `resume.limits` changes them. */
   limits?: Partial<SandboxLimits>;
-  /** Earlier reports, if saved: the era comes from graveyard, the owner's goals from interview. */
+  /**
+   * Earlier reports, if saved: the era comes from graveyard, the project's intent and the owner's goals from interview.
+   * When resuming, none is read: the paused run's era and interview are used instead.
+   */
   exhume?: ExhumeReport | null;
   graveyard?: GraveyardReport | null;
   interview?: InterviewReport | null;
@@ -114,8 +126,9 @@ export interface ResurrectOptions {
   fixCache?: FixCache;
   /** CA certificate for a TLS-intercepting proxy during install. When resuming, the paused run's is used instead. */
   caFile?: string;
+  /** Where remote repos are cloned. When resuming, the paused run's is used unless `resume.workdir` changes it. */
   workdir?: string;
-  /** Keep the images, e.g. to run the result yourself. */
+  /** Keep the images, e.g. to run the result yourself. When resuming, as `workdir`. */
   keepImages?: boolean;
   onProgress?: (message: string) => void;
   /**
@@ -156,15 +169,68 @@ type Settled =
   | { kind: 'pause'; pending: PendingDecision; turn: Turn };
 
 /**
- * The key a declined fix is remembered by, whatever its source: the same ops match whatever order their keys come in, and
- * whatever order apt packages or install flags are listed in.
+ * The key a declined fix is remembered by, whatever its source. Two fixes get the same key when they have the same
+ * effect on a recipe (`applyOps`): optional fields count as their defaults; apt packages and install flags are one set
+ * however they are split across ops or ordered; repeated ops count once; of the ops that set one thing (the image, a
+ * variable, a dependency, a command, the port) only the last counts; and the ops' order does not matter, except that
+ * the commands run before install keep theirs.
  */
-export const opsKey = (ops: RecipeOp[]): string =>
-  `ops:${canonicalJson(
-    ops.map((op) =>
-      op.op === 'aptInstall' ? { ...op, packages: [...op.packages].sort() } : op.op === 'addInstallFlags' ? { ...op, flags: [...op.flags].sort() } : op,
-    ),
-  )}`;
+export const opsKey = (ops: RecipeOp[]): string => `ops:${canonicalJson(normalizeOps(ops))}`;
+
+function normalizeOps(ops: RecipeOp[]): RecipeOp[] {
+  const packages = new Set<string>();
+  const flags = new Set<string>();
+  const globals = new Set<string>();
+  const commands: string[] = [];
+  // The last op for each thing an op sets, by what it sets; flags (useDebianArchive, dropLockfile) count once.
+  const last = new Map<string, RecipeOp>();
+  for (const op of ops) {
+    switch (op.op) {
+      case 'aptInstall':
+        op.packages.forEach((p) => packages.add(p));
+        break;
+      case 'addInstallFlags':
+        op.flags.forEach((f) => flags.add(f));
+        break;
+      case 'globalInstall':
+        globals.add(op.spec);
+        break;
+      case 'runBeforeInstall':
+        if (!commands.includes(op.command)) commands.push(op.command);
+        break;
+      case 'setNodeImage':
+        last.set(op.op, { op: op.op, tag: op.tag });
+        break;
+      case 'setEnv':
+        last.set(`env:${op.name}`, { op: op.op, name: op.name, value: op.value });
+        break;
+      // Both write the same dependency patch.
+      case 'setDependency':
+        last.set(`dep:${op.name}`, { op: op.op, name: op.name, version: op.version, dev: op.dev ?? false });
+        break;
+      case 'removeDependency':
+        last.set(`dep:${op.name}`, { op: op.op, name: op.name });
+        break;
+      case 'setBuildCommand':
+      case 'setStartCommand':
+        last.set(op.op, { op: op.op, command: op.command });
+        break;
+      case 'setPort':
+        last.set(op.op, { op: op.op, port: op.port });
+        break;
+      case 'useDebianArchive':
+      case 'dropLockfile':
+        last.set(op.op, { op: op.op });
+        break;
+    }
+  }
+  const sorted = [...last.values()];
+  if (packages.size) sorted.push({ op: 'aptInstall', packages: [...packages].sort() });
+  if (flags.size) sorted.push({ op: 'addInstallFlags', flags: [...flags].sort() });
+  for (const spec of globals) sorted.push({ op: 'globalInstall', spec });
+  const keyed = sorted.map((op) => [canonicalJson(op), op] as const).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
+  return [...keyed.map(([, op]) => op), ...commands.map((command) => ({ op: 'runBeforeInstall' as const, command }))];
+}
 
 function canonicalJson(value: unknown): string {
   if (Array.isArray(value)) return `[${value.map(canonicalJson).join(',')}]`;
@@ -190,14 +256,23 @@ export async function resurrect(source: string, options: ResurrectOptions): Prom
   const settings = resumed?.settings ?? runSettings(options);
   const { maxIterations, tokenBudget: budget, limits } = settings;
   const caFile = settings.caFile ?? undefined;
+  const workdir = settings.workdir ?? undefined;
+  // The settings name the model to ask; a model handed in for a run that names none (a budget of 0) is not asked.
+  const model = settings.model ? options.model! : null;
   const log = options.onProgress ?? (() => {});
   const cache = options.fixCache ?? new FixCache(null);
   const sandbox = options.sandbox;
+  // What the model is told about the project; a resume tells it what the paused run did.
+  const interview: ResurrectRunState['interview'] = resumed
+    ? (resumed.state.interview ?? null)
+    : options.interview
+      ? { intent: options.interview.intent, goals: options.interview.goals.map((g) => g.text) }
+      : null;
 
   await sandbox.ping();
   log(`checking out ${source}`);
-  const repo = await checkout(source, { workdir: options.workdir });
-  const context = await mkdtemp(path.join(options.workdir ?? os.tmpdir(), 'necromancer-context-'));
+  const repo = await checkout(source, { workdir });
+  const context = await mkdtemp(path.join(workdir ?? os.tmpdir(), 'necromancer-context-'));
   try {
     const files = await listRepoFiles(repo.root);
     const facts = await readFacts(repo.root, files);
@@ -258,7 +333,7 @@ export async function resurrect(source: string, options: ResurrectOptions): Prom
       compose: renderCompose(recipe, services, limits),
       limits,
       attempts,
-      llm: { model: options.model?.name ?? null, calls, tokens, budget },
+      llm: { model: settings.model, calls, tokens, budget },
       warnings,
     });
 
@@ -278,8 +353,7 @@ export async function resurrect(source: string, options: ResurrectOptions): Prom
     let pendingLlmFix = null as { signature: string; fix: AppliedFix } | null;
     const seen = new Map<string, number>(Object.entries(resumed?.state.seen ?? {}));
     // Every fix the owner declined in this run, by opsKey (and known-fix id): none comes back, from any source.
-    // Older reports kept only the pending failure's, as ids and op keys, under `skip`.
-    const declinedFixes = new Set<string>([...(resumed?.state.declinedFixes ?? []), ...(resumed?.state.skip ?? [])]);
+    const declinedFixes = new Set<string>(resumed?.state.declinedFixes ?? []);
     const isDeclined = (ops: RecipeOp[], id?: string) => declinedFixes.has(opsKey(ops)) || (id !== undefined && declinedFixes.has(id));
 
     const decide = (attempt: number, kind: OwnerDecision['kind'], subject: string, answer: string, description?: string) =>
@@ -300,14 +374,14 @@ export async function resurrect(source: string, options: ResurrectOptions): Prom
         if (declined) passedOver ??= k.id;
         return declined;
       });
-      if (known) return { kind: 'fix', fix: { source: 'known', id: known.id, description: known.description, ops: known.ops(ctx) } };
+      if (known) return { kind: 'fix', fix: { source: 'known', id: known.fix.id, description: known.fix.description, ops: known.ops } };
       const cacheId = `cache:${f.signature}`;
       const cached = await cache.get(f.signature);
       if (cached && changesRecipe(recipe, cached.ops)) {
         if (!isDeclined(cached.ops, cacheId)) return { kind: 'fix', fix: { source: 'cache', id: cacheId, ...cached } };
         passedOver ??= cacheId;
       }
-      if (!options.model) {
+      if (!model) {
         const reason = turn.declined.length
           ? `the owner declined ${turn.declined.at(-1)} and there is no other fix for: ${lastError}`
           : passedOver
@@ -316,26 +390,29 @@ export async function resurrect(source: string, options: ResurrectOptions): Prom
         return { kind: 'blocked', reason };
       }
       let rejected = turn.rejected;
+      // Once the owner has answered as many questions as they will about this failure, the model may not ask another.
+      const canAsk = turn.questions < MAX_OWNER_QUESTIONS;
       for (let ask = 0; ask < 2; ask++) {
         if (tokens >= budget) return { kind: 'blocked', reason: `token budget of ${budget} spent; last error at ${f.phase}: ${lastError}` };
-        log(`attempt ${n}: ${turn.answer ? 'passing the owner’s answer to' : 'no known fix, asking'} ${options.model.name}`);
+        log(`attempt ${n}: ${turn.answer ? 'passing the owner’s answer to' : 'no known fix, asking'} ${model.name}`);
         calls++;
         let answer: Awaited<ReturnType<typeof proposeFix>>;
         try {
-          answer = await proposeFix(options.model, {
+          answer = await proposeFix(model, {
             phase: f.phase,
             errorTail: f.log,
             recipe,
             dockerfile: renderDockerfile(recipe),
             dependencies,
             history: attempts,
-            interview: options.interview ?? null,
+            interview,
             rejected,
             decisions,
             answer: turn.answer,
+            canAsk,
           });
         } catch (err) {
-          return { kind: 'blocked', reason: `could not ask ${options.model.name} for a fix (${errorMessage(err)}); last error at ${f.phase}: ${lastError}` };
+          return { kind: 'blocked', reason: `could not ask ${model.name} for a fix (${errorMessage(err)}); last error at ${f.phase}: ${lastError}` };
         }
         const { proposal, tokens: used } = answer;
         tokens += used;
@@ -431,10 +508,8 @@ export async function resurrect(source: string, options: ResurrectOptions): Prom
           answer: turn.answer ?? null,
           questions: turn.questions,
           declines: turn.declines,
-          maxIterations,
-          tokenBudget: budget,
-          caFile: settings.caFile,
-          sandbox: settings.sandbox,
+          interview,
+          settings: savedSettings(settings),
         };
         return false;
       }
@@ -456,14 +531,7 @@ export async function resurrect(source: string, options: ResurrectOptions): Prom
         const attempt = attempts.find((a) => a.n === state.failure.attempt);
         if (!attempt) throw new Error(`the saved report has no attempt ${state.failure.attempt} to resume from`);
         const f: Failure = { attempt, phase: state.failure.phase, signature: state.failure.signature, log: state.failure.log };
-        // Older reports counted questions and declines together as `rounds`.
-        const declines = state.declines ?? state.declined?.length ?? 0;
-        const turn: Turn = {
-          declined: state.declined ?? [],
-          answer: state.answer ?? undefined,
-          questions: state.questions ?? Math.max(0, (state.rounds ?? 0) - declines),
-          declines,
-        };
+        const turn: Turn = { declined: state.declined, answer: state.answer ?? undefined, questions: state.questions, declines: state.declines };
         log(`resuming after attempt ${attempt.n}`);
         let settled: Settled;
         if (waiting.kind === 'approval') {
@@ -549,7 +617,7 @@ export async function resurrect(source: string, options: ResurrectOptions): Prom
         if (!conclude(failure, await settle(failure, { declined: [], questions: 0, declines: 0 }))) break;
       }
     } finally {
-      if (!options.keepImages) await sandbox.cleanup();
+      if (!settings.keepImages) await sandbox.cleanup();
     }
     if (!health && !blockedReason && !pending) {
       blockedReason = attempts.length ? `out of attempts: ${maxIterations} allowed, ${attempts.length} made` : 'no attempts were made';
@@ -563,48 +631,104 @@ export async function resurrect(source: string, options: ResurrectOptions): Prom
   }
 }
 
-type SettingsOptions = Pick<ResurrectOptions, 'maxIterations' | 'tokenBudget' | 'limits' | 'caFile'> & { sandbox?: Pick<Sandbox, 'settings'> };
+type SettingsOptions = Pick<ResurrectOptions, 'model' | 'maxIterations' | 'tokenBudget' | 'limits' | 'caFile' | 'keepImages' | 'workdir'> & {
+  sandbox?: Pick<Sandbox, 'settings'>;
+};
 
-/** The parts of a `ResumeInput` that change a paused run's settings. */
-export type ResumeOverrides = Pick<ResumeInput, 'maxIterations' | 'tokenBudget' | 'limits'>;
+/** The parts of a `ResumeInput` that change a paused run's settings. Everything left out stays as the paused run had it. */
+export type ResumeOverrides = Pick<ResumeInput, 'maxIterations' | 'tokenBudget' | 'limits' | 'model' | 'keepImages' | 'workdir' | 'sandbox'>;
 
 /**
- * The one place a run's settings come from: the options for a fresh run, or the paused run for a resume, with
- * the resume's overrides. Older reports did not save every setting; the options stand in for what is missing.
+ * Why a saved report can't be resumed as asked, from `checkResumable` (and `resurrect` with `resume`), so a front-end
+ * can say what to change without repeating the checks:
+ * - `not-paused`: the run did not end needs-you;
+ * - `no-state`: it did, but the report lacks the pending decision or the state to carry on from;
+ * - `model-without-budget`: the resume names a model, but the token budget is 0, so none would be asked;
+ * - `budget-spent`: a pending question needs a model, and the budget is spent;
+ * - `no-model`: a pending question needs a model, and the resumed run's settings name none;
+ * - `model-null`: the settings name a model, and none was handed in;
+ * - `model-mismatch`: a model was handed in that the settings don't name (another one, or one where they name none);
+ * - `wrong-kind`: an approval for a pending question, or an answer for a pending fix;
+ * - `needs-approve`: a pending fix, and no approve true or false;
+ * - `needs-answer`: a pending question, and no answer.
  */
-function runSettings(options: SettingsOptions, paused?: { from: ResurrectReport; state: ResurrectRunState; resume?: ResumeOverrides }): RunSettings {
-  if (!paused) {
-    return {
-      maxIterations: options.maxIterations ?? DEFAULT_MAX_ITERATIONS,
-      tokenBudget: options.tokenBudget ?? DEFAULT_TOKEN_BUDGET,
-      limits: { ...DEFAULT_LIMITS, ...defined(options.limits) },
-      caFile: options.caFile ?? null,
-      sandbox: options.sandbox?.settings ?? null,
-    };
+export class ResumeError extends Error {
+  constructor(
+    readonly code:
+      | 'not-paused'
+      | 'no-state'
+      | 'model-without-budget'
+      | 'budget-spent'
+      | 'no-model'
+      | 'model-null'
+      | 'model-mismatch'
+      | 'wrong-kind'
+      | 'needs-approve'
+      | 'needs-answer',
+    message: string,
+  ) {
+    super(message);
+    this.name = 'ResumeError';
   }
-  const { from, state, resume = {} } = paused;
-  const limit = resume.maxIterations ?? state.maxIterations ?? options.maxIterations ?? DEFAULT_MAX_ITERATIONS;
+}
+
+/** A fresh run's settings, from its options. A budget of 0 means no model is asked, so the settings name none. */
+function runSettings(options: SettingsOptions): RunSettings {
+  const tokenBudget = options.tokenBudget ?? DEFAULT_TOKEN_BUDGET;
   return {
-    // A resume that settles on a fix gets at least the attempt that tries it.
-    maxIterations: Math.max(limit, state.nextAttempt),
-    tokenBudget: resume.tokenBudget ?? state.tokenBudget ?? options.tokenBudget ?? DEFAULT_TOKEN_BUDGET,
-    limits: { ...DEFAULT_LIMITS, ...from.limits, ...defined(resume.limits) },
-    caFile: state.caFile !== undefined ? state.caFile : (options.caFile ?? null),
-    sandbox: state.sandbox !== undefined ? state.sandbox : (options.sandbox?.settings ?? null),
+    maxIterations: options.maxIterations ?? DEFAULT_MAX_ITERATIONS,
+    tokenBudget,
+    limits: { ...DEFAULT_LIMITS, ...defined(options.limits) },
+    model: tokenBudget > 0 ? (options.model?.name ?? null) : null,
+    caFile: options.caFile ?? null,
+    sandbox: options.sandbox?.settings ?? null,
+    keepImages: options.keepImages ?? false,
+    // Saved with the report for a resume, so made absolute.
+    workdir: options.workdir ? path.resolve(options.workdir) : null,
   };
 }
 
+/** What a paused run saves of its settings; the limits are saved as the report's own. */
+function savedSettings({ limits: _limits, ...settings }: RunSettings): ResurrectRunSettings {
+  return settings;
+}
+
+/** What a needs-you report waits on and the state to carry on from; throws a readable error for any other report. */
+function pausedRun(from: ResurrectReport): { pending: PendingDecision; state: ResurrectRunState } {
+  if (from.outcome !== 'needs-you') {
+    throw new ResumeError('not-paused', `only a run that is waiting on the owner (needs-you) can be resumed; this one ended ${from.outcome}`);
+  }
+  if (!from.pending || !from.resume) {
+    throw new ResumeError('no-state', 'the saved run is waiting on the owner but is missing the state it needs to carry on; start a new run instead');
+  }
+  return { pending: from.pending, state: from.resume };
+}
+
 /**
- * The settings a resume of `from` will run with, worked out the same way `checkResumable` and `resurrect` do but
- * without checking anything, so a front-end can pick its model and build its sandbox before validating.
- * `fallback` stands in for settings an older report did not save.
+ * The settings a resume of `from` will run with: the paused run's, changed only by the overrides given. Nothing is
+ * checked but that `from` is a paused run, so a front-end can build its sandbox, and the model the settings name
+ * (none when `model` is null), before validating with `checkResumable`.
  */
-export function resumeSettings(
-  from: ResurrectReport,
-  overrides?: ResumeOverrides,
-  fallback: Pick<ResurrectOptions, 'maxIterations' | 'tokenBudget' | 'caFile'> = {},
-): RunSettings {
-  return from.resume ? runSettings(fallback, { from, state: from.resume, resume: overrides }) : runSettings(fallback);
+export function resumeSettings(from: ResurrectReport, overrides: ResumeOverrides = {}): RunSettings {
+  const { settings: saved, nextAttempt } = pausedRun(from).state;
+  const tokenBudget = overrides.tokenBudget ?? saved.tokenBudget;
+  const model = overrides.model !== undefined ? overrides.model : saved.model;
+  const workdir = overrides.workdir !== undefined ? overrides.workdir : saved.workdir;
+  const sandbox = defined(overrides.sandbox);
+  return {
+    // A resume that settles on a fix gets at least the attempt that tries it.
+    maxIterations: Math.max(overrides.maxIterations ?? saved.maxIterations, nextAttempt),
+    tokenBudget,
+    limits: { ...DEFAULT_LIMITS, ...from.limits, ...defined(overrides.limits) },
+    model: tokenBudget > 0 ? model : null,
+    caFile: saved.caFile,
+    // A paused run whose sandbox did not say how it was set up counts as the defaults when the resume changes one.
+    sandbox: Object.keys(sandbox).length
+      ? { ...(saved.sandbox ?? { buildProxy: false, healthTimeoutSec: DEFAULT_HEALTH_TIMEOUT_SEC }), ...sandbox }
+      : saved.sandbox,
+    keepImages: overrides.keepImages ?? saved.keepImages,
+    workdir: workdir ? path.resolve(workdir) : null,
+  };
 }
 
 function defined<T extends object>(value: T | undefined): Partial<T> {
@@ -621,46 +745,64 @@ function describeSandbox(s: SandboxSettings): string {
 
 /**
  * Checks that a saved report is a paused run that can carry on, before anyone is asked for an answer: it is
- * waiting on the owner, has the state to resume from, and, for a pending question, a model and budget left to
- * turn the answer into a fix. Returns what it waits on and the settings the resumed run will have, so a front-end
- * can build its sandbox and pick its model the same way. Throws a readable error otherwise.
+ * waiting on the owner, has the state to resume from, is handed the model its settings name (or none when they
+ * name none), and, for a pending question, has a model and budget left to turn the answer into a fix. Returns what
+ * it waits on and the settings the resumed run will have (`resumeSettings`). Throws a `ResumeError` otherwise, whose
+ * code says which check failed; a resume naming a model with a token budget of 0 fails too.
  */
-export function checkResumable(
-  from: ResurrectReport,
-  options: Pick<ResurrectOptions, 'model'> & SettingsOptions & { resume?: ResumeOverrides } = {},
-): ResumableRun {
-  if (from.outcome !== 'needs-you') {
-    throw new Error(`only a run that is waiting on the owner (needs-you) can be resumed; this one ended ${from.outcome}`);
+export function checkResumable(from: ResurrectReport, options: Pick<ResurrectOptions, 'model'> & { resume?: ResumeOverrides } = {}): ResumableRun {
+  const { pending, state } = pausedRun(from);
+  const settings = resumeSettings(from, options.resume);
+  const named = options.resume?.model;
+  if (typeof named === 'string' && settings.tokenBudget <= 0) {
+    throw new ResumeError('model-without-budget', `the resume names the model ${named}, but its token budget is 0, so no model would be asked; raise the budget`);
   }
-  if (!from.pending || !from.resume) {
-    throw new Error('the saved run is waiting on the owner but is missing the state it needs to carry on; start a new run instead');
-  }
-  const { pending, resume: state } = from;
-  const settings = runSettings(options, { from, state, resume: options.resume });
   if (pending.kind === 'question') {
-    if (!options.model) throw new Error('answering the pending question needs a model to turn the answer into a fix, and none is available');
     if (settings.tokenBudget <= state.tokens) {
-      throw new Error(
+      throw new ResumeError(
+        'budget-spent',
         `answering the pending question needs a model, but the token budget of ${settings.tokenBudget} is already spent (${state.tokens} used); raise the budget`,
       );
     }
+    if (!settings.model) {
+      throw new ResumeError('no-model', 'answering the pending question needs a model to turn the answer into a fix, and the resumed run has none (its model is null)');
+    }
+  }
+  const given = options.model?.name ?? null;
+  if (pending.kind === 'question' && given === null) {
+    throw new ResumeError(
+      'model-null',
+      `answering the pending question needs a model to turn the answer into a fix, and none is available; the resumed run asks ${settings.model}`,
+    );
+  }
+  if (given !== settings.model) {
+    throw new ResumeError(
+      given === null ? 'model-null' : 'model-mismatch',
+      settings.model === null
+        ? `the resumed run uses known and cached fixes only, but was handed the model ${given}; resume without a model, or name it in the resume's model`
+        : given === null
+          ? `the resumed run asks ${settings.model} for fixes, but was handed no model; pass that model, or resume with model null for known fixes only`
+          : `the resumed run asks ${settings.model} for fixes, but was handed the model ${given}; pass ${settings.model}, or name ${given} in the resume's model`,
+    );
   }
   return { pending, state, settings };
 }
 
 /** `checkResumable`, then that the resume answers what the run waits on: approve for a fix, an answer for a question. */
-function checkResume(resume: ResumeInput, options: Pick<ResurrectOptions, 'model'> & SettingsOptions): ResumableRun {
-  const run = checkResumable(resume.from, { ...options, resume });
+function checkResume(resume: ResumeInput, options: Pick<ResurrectOptions, 'model'>): ResumableRun {
+  const run = checkResumable(resume.from, { model: options.model, resume });
   const { pending } = run;
   if (pending.kind === 'approval') {
     const fix = `${pending.fix.id} (${pending.fix.description})`;
-    if (resume.answer !== undefined) throw new Error(`the run is waiting on a fix approval, not a question; pass approve true or false for ${fix}`);
-    if (typeof resume.approve !== 'boolean') throw new Error(`resuming needs a decision on the pending fix: approve or reject ${fix}`);
+    if (resume.answer !== undefined) {
+      throw new ResumeError('wrong-kind', `the run is waiting on a fix approval, not a question; pass approve true or false for ${fix}`);
+    }
+    if (typeof resume.approve !== 'boolean') throw new ResumeError('needs-approve', `resuming needs a decision on the pending fix: approve or reject ${fix}`);
   } else {
     if (resume.approve !== undefined) {
-      throw new Error(`the run is waiting on an answer to a question, not a fix approval; pass an answer to: ${pending.question}`);
+      throw new ResumeError('wrong-kind', `the run is waiting on an answer to a question, not a fix approval; pass an answer to: ${pending.question}`);
     }
-    if (!resume.answer?.trim()) throw new Error(`resuming needs an answer to the pending question: ${pending.question}`);
+    if (!resume.answer?.trim()) throw new ResumeError('needs-answer', `resuming needs an answer to the pending question: ${pending.question}`);
   }
   return run;
 }

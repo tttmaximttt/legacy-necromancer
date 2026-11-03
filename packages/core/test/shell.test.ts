@@ -12,4 +12,10 @@ describe('shellArg', () => {
     expect(shellArg("it's")).toBe(`'it'\\''s'`);
     expect(shellArg('$(rm -rf /)')).toBe(`'$(rm -rf /)'`);
   });
+
+  it('prefixes a path starting with a dash, so it is not read as an option', () => {
+    expect(shellArg('-app')).toBe('./-app');
+    expect(shellArg('--help')).toBe('./--help');
+    expect(shellArg("-my app")).toBe(`'./-my app'`);
+  });
 });
