@@ -197,7 +197,7 @@ export function createProgram(deps: ProgramDeps = {}): Command {
     .option('--step-timeout <sec>', 'time limit for each install, build or boot step', int, DEFAULT_LIMITS.stepTimeoutSec)
     .option('--health-timeout <sec>', 'how long to wait for the app to answer', int, DEFAULT_HEALTH_TIMEOUT_SEC)
     .option('--out-dir <dir>', 'also write Dockerfile.necromancer and docker-compose.necromancer.yml here')
-    .option('--ca-file <file>', 'extra CA certificate for a TLS-intercepting proxy during install')
+    .option('--ca-file <file>', "extra CA certificate for a TLS-intercepting proxy during install (with --resume, replaces the saved run's)")
     .option('--build-proxy', "pass this machine's HTTP(S)_PROXY to the install step")
     .option('--no-build-proxy', "with --resume: don't pass the proxy, though the saved run did")
     .option('--keep-images', 'keep the built images')
@@ -213,29 +213,13 @@ export function createProgram(deps: ProgramDeps = {}): Command {
     .action(
       async (
         source: string,
-        opts: ResumeFlags & {
-          maxIterations: number;
-          tokenBudget: number;
-          llm: boolean;
-          model: string;
-          cpus: number;
-          memory: number;
-          stepTimeout: number;
-          healthTimeout: number;
-          outDir?: string;
-          caFile?: string;
-          buildProxy?: boolean;
-          keepImages?: boolean;
-          workdir?: string;
-          quiet?: boolean;
-        },
+        opts: ResurrectFlags,
         command: Command,
       ) => {
         if ((opts.approve || opts.reject || opts.answer !== undefined) && !opts.resume) throw new Error('--approve, --reject and --answer go with --resume');
         if (opts.approve && opts.reject) throw new Error('pass --approve or --reject, not both');
         // A blank answer would otherwise read as "nobody answered" and exit 3, so a script would loop on it.
         if (opts.answer !== undefined && !opts.answer.trim()) throw new Error('--answer is empty; pass the answer text');
-        if (opts.resume && opts.caFile !== undefined) throw new Error("--ca-file does not go with --resume: the paused run's CA file is reused");
         const store = new ReportStore(opts.reports);
         const saved = await store.load(slugFor(source));
         const io = terminalIo();
@@ -256,22 +240,7 @@ export function createProgram(deps: ProgramDeps = {}): Command {
           if (opts.resume) {
             const from = saved?.resurrect;
             if (!from) throw new Error(`no resurrect report for ${source}; run \`necromancer resurrect ${shellArg(source)}\` first`);
-            const overrides: ResumeOverrides = {
-              maxIterations: given('maxIterations') ? opts.maxIterations : undefined,
-              tokenBudget: given('tokenBudget') ? opts.tokenBudget : undefined,
-              limits: {
-                cpus: given('cpus') ? opts.cpus : undefined,
-                memoryMb: given('memory') ? opts.memory : undefined,
-                stepTimeoutSec: given('stepTimeout') ? opts.stepTimeout : undefined,
-              },
-              model: given('llm') && !opts.llm ? null : given('model') ? opts.model : undefined,
-              keepImages: given('keepImages') ? !!opts.keepImages : undefined,
-              workdir: given('workdir') ? path.resolve(opts.workdir!) : undefined,
-              sandbox: {
-                buildProxy: given('buildProxy') ? !!opts.buildProxy : undefined,
-                healthTimeoutSec: given('healthTimeout') ? opts.healthTimeout : undefined,
-              },
-            };
+            const overrides = resumeOverrides(opts, given);
             let run: ResumableRun;
             try {
               // The model the paused run asked, or the one named again; none when there is no key, which the check reports.
@@ -301,7 +270,7 @@ export function createProgram(deps: ProgramDeps = {}): Command {
               report = await resurrect(source, { sandbox, model: run.model, fixCache, onProgress: say, approve, ask, resume: { run, ...decision } });
             } catch (err) {
               if (!asking) throw err;
-              throw new Error(`${errorMessage(err)}\nTo carry on with your answer:\n  ${resumeCommand(source, opts)}${overrideFlags(opts, given)} ${decisionFlags(decision)}`);
+              throw new Error(`${errorMessage(err)}\nTo carry on with your answer:\n  ${resumeCommand(source, opts)}${typedFlags(opts, given)} ${decisionFlags(decision)}`);
             }
           } else {
             report = await resurrect(source, {
@@ -472,6 +441,23 @@ interface ResumeFlags {
   reports?: string;
 }
 
+interface ResurrectFlags extends ResumeFlags {
+  maxIterations: number;
+  tokenBudget: number;
+  llm: boolean;
+  model: string;
+  cpus: number;
+  memory: number;
+  stepTimeout: number;
+  healthTimeout: number;
+  outDir?: string;
+  caFile?: string;
+  buildProxy?: boolean;
+  keepImages?: boolean;
+  workdir?: string;
+  quiet?: boolean;
+}
+
 /** The owner's answer to the pending decision of a needs-you report, from flags or the terminal; null to stay paused. */
 async function resumeDecision(
   { from, pending }: ResumableRun,
@@ -568,36 +554,49 @@ function decisionFlags(decision: Pick<ResumeInput, 'approve' | 'answer'>): strin
   return decision.answer !== undefined ? `--answer ${shellQuote(decision.answer)}` : decision.approve ? '--approve' : '--reject';
 }
 
-/** The overrides typed with `--resume`, as flags to type again; each starts with a space. Mirrors the resume's `overrides`. */
-function overrideFlags(
-  opts: {
-    maxIterations: number;
-    tokenBudget: number;
-    cpus: number;
-    memory: number;
-    stepTimeout: number;
-    llm: boolean;
-    model: string;
-    keepImages?: boolean;
-    workdir?: string;
-    buildProxy?: boolean;
-    healthTimeout: number;
-  },
-  given: (name: string) => boolean,
-): string {
-  const flags: string[] = [];
-  if (given('maxIterations')) flags.push(`-n ${opts.maxIterations}`);
-  if (given('tokenBudget')) flags.push(`--token-budget ${opts.tokenBudget}`);
-  if (given('cpus')) flags.push(`--cpus ${opts.cpus}`);
-  if (given('memory')) flags.push(`--memory ${opts.memory}`);
-  if (given('stepTimeout')) flags.push(`--step-timeout ${opts.stepTimeout}`);
-  if (given('llm') && !opts.llm) flags.push('--no-llm');
-  else if (given('model')) flags.push(`-m ${shellArg(opts.model)}`);
-  if (given('keepImages')) flags.push(opts.keepImages ? '--keep-images' : '--no-keep-images');
-  if (given('workdir')) flags.push(`--workdir ${shellArg(path.resolve(opts.workdir!))}`);
-  if (given('buildProxy')) flags.push(opts.buildProxy ? '--build-proxy' : '--no-build-proxy');
-  if (given('healthTimeout')) flags.push(`--health-timeout ${opts.healthTimeout}`);
-  return flags.map((f) => ` ${f}`).join('');
+/**
+ * The flags `--resume` takes again, by the option name commander reports: how each is typed in a command, and what it
+ * changes of the paused run's settings (none for those that only change how this command runs). The resume's
+ * overrides and the command that carries an answer on are both built from it, so they cannot drift.
+ */
+const RESUME_FLAGS: Array<{ name: keyof ResurrectFlags; typed: (o: ResurrectFlags) => string; override?: (o: ResurrectFlags) => ResumeOverrides }> = [
+  { name: 'maxIterations', typed: (o) => `-n ${o.maxIterations}`, override: (o) => ({ maxIterations: o.maxIterations }) },
+  { name: 'tokenBudget', typed: (o) => `--token-budget ${o.tokenBudget}`, override: (o) => ({ tokenBudget: o.tokenBudget }) },
+  { name: 'cpus', typed: (o) => `--cpus ${o.cpus}`, override: (o) => ({ limits: { cpus: o.cpus } }) },
+  { name: 'memory', typed: (o) => `--memory ${o.memory}`, override: (o) => ({ limits: { memoryMb: o.memory } }) },
+  { name: 'stepTimeout', typed: (o) => `--step-timeout ${o.stepTimeout}`, override: (o) => ({ limits: { stepTimeoutSec: o.stepTimeout } }) },
+  { name: 'model', typed: (o) => `-m ${shellArg(o.model)}`, override: (o) => ({ model: o.model }) },
+  // After -m, so --no-llm wins when both are typed; only --no-llm sets it.
+  { name: 'llm', typed: () => '--no-llm', override: () => ({ model: null }) },
+  { name: 'keepImages', typed: (o) => (o.keepImages ? '--keep-images' : '--no-keep-images'), override: (o) => ({ keepImages: !!o.keepImages }) },
+  // Paths are saved with the report, and typed again from anywhere, so made absolute.
+  { name: 'workdir', typed: (o) => `--workdir ${shellArg(path.resolve(o.workdir!))}`, override: (o) => ({ workdir: path.resolve(o.workdir!) }) },
+  { name: 'caFile', typed: (o) => `--ca-file ${shellArg(path.resolve(o.caFile!))}`, override: (o) => ({ caFile: path.resolve(o.caFile!) }) },
+  { name: 'buildProxy', typed: (o) => (o.buildProxy ? '--build-proxy' : '--no-build-proxy'), override: (o) => ({ sandbox: { buildProxy: !!o.buildProxy } }) },
+  { name: 'healthTimeout', typed: (o) => `--health-timeout ${o.healthTimeout}`, override: (o) => ({ sandbox: { healthTimeoutSec: o.healthTimeout } }) },
+  { name: 'yes', typed: () => '--yes' },
+  { name: 'quiet', typed: () => '-q' },
+  { name: 'outDir', typed: (o) => `--out-dir ${shellArg(path.resolve(o.outDir!))}` },
+];
+
+/** What the flags typed with `--resume` change of the paused run's settings. */
+function resumeOverrides(opts: ResurrectFlags, given: (name: string) => boolean): ResumeOverrides {
+  const overrides: ResumeOverrides = {};
+  for (const flag of RESUME_FLAGS) {
+    if (!flag.override || !given(flag.name)) continue;
+    const { limits, sandbox, ...rest } = flag.override(opts);
+    Object.assign(overrides, rest);
+    if (limits) overrides.limits = { ...overrides.limits, ...limits };
+    if (sandbox) overrides.sandbox = { ...overrides.sandbox, ...sandbox };
+  }
+  return overrides;
+}
+
+/** The flags typed with `--resume`, to type again; each starts with a space. */
+function typedFlags(opts: ResurrectFlags, given: (name: string) => boolean): string {
+  return RESUME_FLAGS.filter((flag) => given(flag.name))
+    .map((flag) => ` ${flag.typed(opts)}`)
+    .join('');
 }
 
 /** The NEEDS YOU block: what the run is waiting on and the exact commands that carry it on. */

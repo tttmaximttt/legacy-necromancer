@@ -993,6 +993,9 @@ describe('a resumed run restores the model, image cleanup and workdir', () => {
     const { root, from } = await pausedOn({ keepImages: true, workdir });
     expect(resumeSettings(from, { model: null, keepImages: false, workdir: null })).toMatchObject({ model: null, keepImages: false, workdir: null });
     expect(resumeSettings(from, { tokenBudget: 0 }).model).toBeNull();
+    // A CA file that moved is replaced, made absolute; null drops it.
+    expect(resumeSettings(from, { caFile: 'new.pem' }).caFile).toBe(path.resolve('new.pem'));
+    expect(resumeSettings(from, { caFile: null }).caFile).toBeNull();
     const sandbox = new ContextSandbox({});
     const report = await resurrect(root, { sandbox, resume: resumeOf(from, { approve: true }, null, { model: null, keepImages: false, workdir: null }) });
     expect(report.outcome).toBe('resurrected');

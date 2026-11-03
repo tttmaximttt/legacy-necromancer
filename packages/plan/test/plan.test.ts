@@ -421,6 +421,32 @@ describe('buildPlan', () => {
     expect(local.leftAlone.find((l) => l.name === 'config')!.reason).toMatch(/^Used by the start script\. /);
   });
 
+  it('counts a script that runs a dependency by its node_modules path, but not another directory of that name', () => {
+    const planWith = (name: string, script: string) => {
+      const dead = tomb(name, { status: 'dead', causes: [{ kind: 'deprecated', detail: 'Deprecated' }] });
+      const manifest = { ...exhume.manifests[0]!, dependencies: { ...exhume.manifests[0]!.dependencies, [name]: '^1.0.0' }, scripts: { start: script } };
+      return buildPlan({ ...all, graveyard: { ...graveyard, tombstones: [...tombstones, dead] }, exhume: { ...exhume, manifests: [manifest] } }, { now: NOW });
+    };
+    for (const [name, script] of [
+      ['forever', './node_modules/.bin/forever start app.js'],
+      ['forever', 'node_modules/.bin/forever start app.js'],
+      ['forever', 'node node_modules/forever/bin/x.js'],
+      ['@scope/pkg', 'node node_modules/@scope/pkg/bin/x.js'],
+    ] as const) {
+      const kept = planWith(name, script);
+      expect(ids(kept), script).not.toContain(`remove:${name}`);
+      expect(kept.leftAlone.find((l) => l.name === name)!.reason, script).toMatch(/^Used by the start script\. /);
+    }
+    expect(ids(planWith('forever', 'node other/forever/x.js && ./vendor/bin/forever'))).toContain('remove:forever');
+  });
+
+  it('warns to re-run exhume when its report predates scripts', () => {
+    const old = { ...exhume, manifests: exhume.manifests.map(({ scripts: _scripts, ...m }) => m) };
+    const plan = buildPlan({ ...all, exhume: old as typeof exhume }, { now: NOW });
+    expect(plan.warnings.some((w) => w.includes('predates script') && w.includes('exhume'))).toBe(true);
+    expect(buildPlan(all, { now: NOW }).warnings.some((w) => w.includes('predates script'))).toBe(false);
+  });
+
   it('does not remove a package that is loaded by name, and lists those files', () => {
     const jade = tomb('jade', { status: 'dead', causes: [{ kind: 'deprecated', detail: 'Deprecated: renamed to pug' }] });
     const manifest = { ...exhume.manifests[0]!, dependencies: { ...exhume.manifests[0]!.dependencies, jade: '^1.11.0' } };

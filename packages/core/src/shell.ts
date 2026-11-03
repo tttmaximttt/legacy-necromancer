@@ -4,7 +4,8 @@
  */
 export function shellArg(value: string): string {
   const arg = value.startsWith('-') ? `./${value}` : value;
-  return /^[\w@%+=:,./-][\w@%+=:,./~-]*$/.test(arg) ? arg : shellQuote(arg);
+  // Not `=` or `%` first: zsh expands `=word` to a command's path, and `%word` is a job spec.
+  return /^[\w@+:,./-][\w@%+=:,./~-]*$/.test(arg) ? arg : shellQuote(arg);
 }
 
 /** Single-quotes any value for a POSIX shell command line, as it is: for text such as an answer, not a path. */

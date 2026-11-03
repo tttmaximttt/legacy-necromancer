@@ -231,17 +231,21 @@ describe('necromancer resurrect', () => {
     expect(process.exitCode).toBe(3);
     const asked: string[] = [];
     const prompt = async (q: string) => (asked.push(q), '1');
+    const out = path.join(path.dirname(reports), 'out');
     const resume = (sandbox: FakeSandbox) =>
-      createProgram({ sandbox, model: new ScriptedModel(setEnv), prompt }).parseAsync(['node', 'necromancer', 'resurrect', root, '--reports', reports, '-q', '--resume', '-n', '6']);
+      createProgram({ sandbox, model: new ScriptedModel(setEnv), prompt }).parseAsync([
+        'node', 'necromancer', 'resurrect', root, '--reports', reports, '-q', '--resume', '-n', '6', '--yes', '--out-dir', out,
+      ]);
 
     const down = Object.assign(new FakeSandbox({}), { ping: async () => Promise.reject(new Error('Docker is not reachable')) });
     await expect(resume(down)).rejects.toThrow('Docker is not reachable');
     expect(asked).toEqual([]);
 
-    // The repo is gone, so the checkout fails after the owner answered: the error carries the answer on, with -n.
+    // The repo is gone, so the checkout fails after the owner answered: the error carries the answer on, with every
+    // flag typed that changes the resumed run.
     await rm(root, { recursive: true, force: true });
     await expect(resume(new FakeSandbox({}))).rejects.toThrow(
-      new RegExp(`could not clone[^]*\\nTo carry on with your answer:\\n  necromancer resurrect ${root} --resume --reports ${reports} -n 6 --answer 'stub it'$`),
+      new RegExp(`could not clone[^]*\\nTo carry on with your answer:\\n  necromancer resurrect ${root} --resume --reports ${reports} -n 6 --yes -q --out-dir ${out} --answer 'stub it'$`),
     );
     expect(asked).toHaveLength(1);
     expect((await new ReportStore(reports).load(path.basename(root)))!.resurrect!.outcome).toBe('needs-you');
@@ -361,7 +365,7 @@ describe('necromancer resurrect', () => {
     expect(await saved()).toMatchObject({ outcome: 'resurrected', limits: { cpus: 2, memoryMb: 2048, stepTimeoutSec: 120 } });
   });
 
-  it('rebuilds the paused run\'s sandbox on --resume, and rejects --ca-file there', async () => {
+  it('rebuilds the paused run\'s sandbox on --resume, and takes a new --ca-file there', async () => {
     const root = await deadApp(expressMongoApp);
     const reports = path.join(await mkdtemp(path.join(os.tmpdir(), 'necro-cli-res-')), 'reports');
     vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
@@ -389,11 +393,13 @@ describe('necromancer resurrect', () => {
     await store.save('resurrect', { ...paused, resume: { ...paused.resume!, settings: { ...paused.resume!.settings, sandbox: null } } });
     expect(await resumeWith('--build-proxy')).toEqual({ buildProxy: true, healthTimeoutSec: 90 });
 
-    await expect(
-      createProgram({ sandbox: new FakeSandbox({}), prompt: null }).parseAsync([
-        'node', 'necromancer', 'resurrect', root, '--reports', reports, '--no-llm', '-q', '--resume', '--approve', '--ca-file', 'ca.pem',
-      ]),
-    ).rejects.toThrow("--ca-file does not go with --resume: the paused run's CA file is reused");
+
+    // The saved CA file may have moved: --ca-file replaces it, made absolute as on a fresh run.
+    await resumeWith('--ca-file', 'ca.pem');
+    expect(vi.mocked(resurrect).mock.calls.at(-1)![1].resume!.run.settings.caFile).toBe(path.resolve('ca.pem'));
+    await store.save('resurrect', { ...paused, resume: { ...paused.resume!, settings: { ...paused.resume!.settings, caFile: '/old/ca.pem' } } });
+    await resumeWith();
+    expect(vi.mocked(resurrect).mock.calls.at(-1)![1].resume!.run.settings.caFile).toBe('/old/ca.pem');
   });
 
   it('does not ask a pending question that no model could act on', async () => {

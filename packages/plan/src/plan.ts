@@ -180,6 +180,9 @@ export function buildPlan(reports: PlanInputs, options: PlanOptions = {}): PlanR
     warnings.push(`The project's tests already failed when witnessed (${how}), so they can't be used to check steps until they're fixed.`);
   }
   if (!exhume) warnings.push('No exhume report: the plan cannot tell which packages are unused or how widely each is imported.');
+  else if (exhume.manifests.some((m) => m.scripts === undefined)) {
+    warnings.push(`The exhume report predates script and loaded-by-name tracking, so the plan cannot tell which packages scripts or string-named lookups use: run \`necromancer exhume ${shellArg(source)}\` again before removing anything.`);
+  }
   if (!interview) warnings.push('No interview report: steps are not tied to the owner\'s goals.');
   if (!resurrect) warnings.push('No resurrect report: the app has not been booted yet, so the starting Node version is a guess.');
   else if (resurrect.outcome !== 'resurrected') {
@@ -371,7 +374,7 @@ function usageOf(exhume: ExhumeReport | null): (name: string) => Usage {
   const scripts = exhume.manifests.flatMap((m) => Object.entries(m.scripts ?? {}));
   return (name) => {
     const p = imported.get(name);
-    const names = new RegExp(`(^|[^\\w@/.-])${escape(name)}($|[^\\w.-])`);
+    const names = new RegExp(`(^|[^\\w@/.-]|node_modules/(\\.bin/)?)${escape(name)}($|[^\\w.-])`);
     return {
       importedBy: p ? p.importedBy : declared.has(name) ? 0 : null,
       importers: [...(p?.importers ?? [])].sort(compare),

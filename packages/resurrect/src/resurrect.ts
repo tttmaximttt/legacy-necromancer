@@ -90,6 +90,8 @@ export interface ResumeOverrides {
   keepImages?: boolean;
   /** Where to clone remote repos, replacing the paused run's; null for the default temp directory. */
   workdir?: string | null;
+  /** CA certificate for a TLS-intercepting proxy during install, replacing the paused run's (say, the file moved); null for none. */
+  caFile?: string | null;
   /**
    * How the sandbox is set up for the resumed run, where it differs from the paused run's; the rest stays. The resumed
    * run saves the result, so a later pause keeps it. The sandbox handed in should be set up this way.
@@ -141,7 +143,7 @@ export interface ResurrectOptions {
   interview?: InterviewReport | null;
   /** Fixes the model found before, by error signature. */
   fixCache?: FixCache;
-  /** CA certificate for a TLS-intercepting proxy during install. When resuming, the paused run's is used instead. */
+  /** CA certificate for a TLS-intercepting proxy during install. When resuming, the paused run's is used unless `resume.caFile` changes it. */
   caFile?: string;
   /** Where remote repos are cloned. When resuming, the paused run's is used unless `resume.workdir` changes it. */
   workdir?: string;
@@ -751,6 +753,7 @@ export function resumeSettings(from: ResurrectReport, overrides: ResumeOverrides
   const tokenBudget = overrides.tokenBudget ?? saved.tokenBudget;
   const model = overrides.model !== undefined ? overrides.model : saved.model;
   const workdir = overrides.workdir !== undefined ? overrides.workdir : saved.workdir;
+  const caFile = overrides.caFile !== undefined ? overrides.caFile : saved.caFile;
   const sandbox = defined(overrides.sandbox);
   return {
     // A resume that settles on a fix gets at least the attempt that tries it.
@@ -758,7 +761,8 @@ export function resumeSettings(from: ResurrectReport, overrides: ResumeOverrides
     tokenBudget,
     limits: { ...DEFAULT_LIMITS, ...from.limits, ...defined(overrides.limits) },
     model: tokenBudget > 0 ? model : null,
-    caFile: saved.caFile,
+    // Saved with the report for a resume, so made absolute.
+    caFile: caFile ? path.resolve(caFile) : null,
     // A paused run whose sandbox did not say how it was set up counts as the defaults when the resume changes one.
     sandbox: Object.keys(sandbox).length
       ? { ...(saved.sandbox ?? { buildProxy: false, healthTimeoutSec: DEFAULT_HEALTH_TIMEOUT_SEC }), ...sandbox }
