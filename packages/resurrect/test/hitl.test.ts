@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import type { BuildRecipe } from '@necromancer/core';
 import { ScriptedModel } from '@necromancer/llm';
-import { FixCache, fixRisks, resurrect, type ApprovalRequest, type FixProposal, type OwnerQuestion } from '@necromancer/resurrect';
+import { FixCache, fixRisks, nodeLine, opsKey, resurrect, type ApprovalRequest, type FixProposal, type OwnerQuestion } from '@necromancer/resurrect';
 import { deadApp, expressMongoApp, FakeSandbox, NODE_GYP_LOG } from './helpers.js';
 
 const UNKNOWN = "Error: Cannot find module './config/local.json'\n    at Function.Module._resolveFilename (module.js:470:15)";
@@ -78,6 +78,68 @@ describe('fixRisks', () => {
     for (const flags of [['-f'], ['--registry', 'https://evil.example'], ['--registry=https://evil.example'], ['--unsafe-perm']]) {
       expect(fixRisks(recipe, [{ op: 'addInstallFlags', flags }]), flags.join(' ')).toHaveLength(1);
     }
+  });
+});
+
+describe('Node release lines', () => {
+  it('treats each 0.x minor as its own line', () => {
+    expect(['0.10', 'node:0.10-slim', '0.12.18', 'node:0.12.18-wheezy', '6', '6.17-stretch', 'node:14.21.3', 'lts', 'argon', '0'].map(nodeLine)).toEqual([
+      '0.10',
+      '0.10',
+      '0.12',
+      '0.12',
+      '6',
+      '6',
+      '14',
+      null,
+      null,
+      null,
+    ]);
+  });
+
+  it('asks before moving between 0.x lines or to a tag with no version', () => {
+    const old = { nodeImage: 'node:0.10' } as BuildRecipe;
+    expect(fixRisks(old, [{ op: 'setNodeImage', tag: '0.12' }])).toEqual([{ op: 'setNodeImage', reason: 'moves Node from 0.10 to 0.12 (node:0.12)' }]);
+    expect(fixRisks(old, [{ op: 'setNodeImage', tag: '0.12.18' }])).toHaveLength(1);
+    expect(fixRisks(old, [{ op: 'setNodeImage', tag: '0.10-slim' }])).toEqual([]);
+    expect(fixRisks(old, [{ op: 'setNodeImage', tag: '0.10.48' }])).toEqual([]);
+    expect(fixRisks(old, [{ op: 'setNodeImage', tag: 'argon' }])).toEqual([{ op: 'setNodeImage', reason: 'moves Node from 0.10 to argon (node:argon)' }]);
+    expect(fixRisks({ nodeImage: 'node:lts' } as BuildRecipe, [{ op: 'setNodeImage', tag: '18' }])).toEqual([
+      { op: 'setNodeImage', reason: 'moves Node from lts to 18 (node:18)' },
+    ]);
+    expect(fixRisks({ nodeImage: 'node:lts' } as BuildRecipe, [{ op: 'setNodeImage', tag: 'lts' }])).toEqual([]);
+  });
+});
+
+describe('declined fix keys', () => {
+  it('match the same ops whatever the key order, apt package order or flag order', () => {
+    const a = opsKey([
+      { op: 'aptInstall', packages: ['python', 'g++'] },
+      { op: 'addInstallFlags', flags: ['--ignore-scripts', '--force'] },
+      { op: 'setDependency', name: 'sass', version: '^1.32.0', dev: true },
+    ]);
+    const b = opsKey(
+      JSON.parse(
+        '[{"packages":["g++","python"],"op":"aptInstall"},{"flags":["--force","--ignore-scripts"],"op":"addInstallFlags"},{"dev":true,"version":"^1.32.0","name":"sass","op":"setDependency"}]',
+      ),
+    );
+    expect(b).toBe(a);
+    expect(opsKey([{ op: 'setEnv', name: 'A', value: '1' }])).not.toBe(opsKey([{ op: 'setEnv', name: 'A', value: '2' }]));
+  });
+
+  it('refuses a declined model fix that comes back reordered', async () => {
+    const first = fix([{ op: 'aptInstall', packages: ['python', 'g++'] }], 'install python and g++');
+    const reordered = fix(JSON.parse('[{"packages":["g++","python"],"op":"aptInstall"}]'), 'install them again');
+    const model = new ScriptedModel(first, reordered, fix([{ op: 'setEnv', name: 'CONFIG', value: 'local' }]));
+    const verdicts: string[] = [];
+    const report = await resurrect(await deadApp(expressMongoApp), {
+      sandbox: new FakeSandbox({ boot: [{ ok: false, log: UNKNOWN }] }),
+      model,
+      approve: async (r) => (verdicts.push(r.fix.description), 'reject'),
+    });
+    expect(report.outcome).toBe('resurrected');
+    expect(verdicts).toEqual(['install python and g++']);
+    expect(report.warnings).toEqual(['attempt 1: rejected a proposed fix (the owner already declined that fix)']);
   });
 });
 
@@ -242,7 +304,7 @@ describe('questions', () => {
     expect(model.requests[2]!.prompt).toContain('the owner declined it: stub @acme/core');
   });
 
-  it('gives up after three rounds with the owner about one failure', async () => {
+  it('gives up on the fourth question about one failure', async () => {
     const model = new ScriptedModel(question('one?'), question('two?'), question('three?'), question('four?'));
     const asked: string[] = [];
     const report = await resurrect(await deadApp(expressMongoApp), {
@@ -251,9 +313,81 @@ describe('questions', () => {
       ask: async (q) => (asked.push(q.question), 'no idea'),
     });
     expect(report.outcome).toBe('blocked');
-    expect(report.blockedReason).toBe(`asked the owner 3 times about this failure and still no fix: ${PRIVATE}`);
+    expect(report.blockedReason).toBe(`asked the owner 3 questions about this failure and still no fix: ${PRIVATE}`);
     expect(asked).toEqual(['one?', 'two?', 'three?']);
     expect(report.llm.calls).toBe(4);
+  });
+
+  it('still shows the owner a risky fix built on three answers', async () => {
+    const risky = fix([{ op: 'setDependency', name: '@acme/core', version: 'file:./stub' }], 'stub @acme/core');
+    const model = new ScriptedModel(question('one?'), question('two?'), question('three?'), risky);
+    const shown: string[] = [];
+    const report = await resurrect(await deadApp(expressMongoApp), {
+      sandbox: new FakeSandbox({ install: [{ ok: false, log: PRIVATE }] }),
+      model,
+      ask: async () => 'stub it',
+      approve: async (r) => (shown.push(r.fix.description), 'approve'),
+    });
+    expect(shown).toEqual(['stub @acme/core']);
+    expect(report.outcome).toBe('resurrected');
+    expect(report.attempts[0]!.fix).toMatchObject({ description: 'stub @acme/core' });
+  });
+
+  it('asks about a fix after three answers and pauses on it, then carries on', async () => {
+    const root = await deadApp(expressMongoApp);
+    const risky = fix([{ op: 'setDependency', name: '@acme/core', version: 'file:./stub' }], 'stub @acme/core');
+    const from = await resurrect(root, {
+      sandbox: new FakeSandbox({ install: [{ ok: false, log: PRIVATE }] }),
+      model: new ScriptedModel(question('one?'), question('two?'), question('three?'), risky),
+      ask: async () => 'stub it',
+      approve: async () => 'pause',
+    });
+    expect(from.outcome).toBe('needs-you');
+    expect(from.pending).toMatchObject({ kind: 'approval', fix: { description: 'stub @acme/core' } });
+    expect(from.resume).toMatchObject({ questions: 3, declines: 0 });
+    const report = await resurrect(root, { sandbox: new FakeSandbox({}), resume: { from, approve: true } });
+    expect(report.outcome).toBe('resurrected');
+  });
+
+  it('gives up once the owner has declined three fixes for one failure', async () => {
+    const model = new ScriptedModel(
+      fix([{ op: 'setDependency', name: 'a', version: '1' }], 'add a'),
+      fix([{ op: 'setDependency', name: 'b', version: '1' }], 'add b'),
+      fix([{ op: 'setDependency', name: 'c', version: '1' }], 'add c'),
+      fix([{ op: 'setDependency', name: 'd', version: '1' }], 'add d'),
+    );
+    const shown: string[] = [];
+    const report = await resurrect(await deadApp(expressMongoApp), {
+      sandbox: new FakeSandbox({ boot: [{ ok: false, log: UNKNOWN }] }),
+      model,
+      approve: async (r) => (shown.push(r.fix.description), 'reject'),
+    });
+    expect(shown).toEqual(['add a', 'add b', 'add c']);
+    expect(report.outcome).toBe('blocked');
+    expect(report.blockedReason).toBe(
+      `the owner declined 3 fixes for this failure ("add a", "add b", "add c"): Error: Cannot find module './config/local.json'`,
+    );
+    expect(report.llm.calls).toBe(3);
+  });
+
+  it('counts answers and declines separately', async () => {
+    const model = new ScriptedModel(
+      question('one?'),
+      fix([{ op: 'setDependency', name: 'a', version: '1' }], 'add a'),
+      question('two?'),
+      fix([{ op: 'setDependency', name: 'b', version: '1' }], 'add b'),
+      question('three?'),
+      fix([{ op: 'setEnv', name: 'CONFIG', value: 'local' }], 'set CONFIG'),
+    );
+    const verdicts: Array<'reject' | 'approve'> = ['reject', 'reject'];
+    const report = await resurrect(await deadApp(expressMongoApp), {
+      sandbox: new FakeSandbox({ boot: [{ ok: false, log: UNKNOWN }] }),
+      model,
+      ask: async () => 'sure',
+      approve: async () => verdicts.shift()!,
+    });
+    expect(report.outcome).toBe('resurrected');
+    expect(report.attempts[0]!.fix).toMatchObject({ description: 'set CONFIG' });
   });
 
   it('keeps a fix built on the owner’s answer out of the shared cache', async () => {
@@ -332,7 +466,7 @@ describe('resume', () => {
       approve: async () => verdicts.shift()!,
     });
     expect(from.outcome).toBe('needs-you');
-    expect(from.resume).toMatchObject({ declined: ['"add the config package"'], rounds: 1, answer: null });
+    expect(from.resume).toMatchObject({ declined: ['"add the config package"'], questions: 0, declines: 1, answer: null });
     const model = new ScriptedModel(a, fix([{ op: 'setEnv', name: 'CONFIG', value: 'local' }]));
     const report = await resurrect(root, { sandbox: new FakeSandbox({}), model, approve: async () => 'reject', resume: { from, approve: false } });
     expect(report.outcome).toBe('resurrected');
@@ -367,10 +501,55 @@ describe('resume', () => {
     const report = await resurrect(root, {
       sandbox: new FakeSandbox({ boot: [{ ok: false, log: UNKNOWN }] }),
       model: null,
-      maxIterations: 2,
-      resume: { from, approve: true },
+      resume: { from, approve: true, maxIterations: 2 },
     });
     expect(report.blockedReason).toMatch(/^still failing after 2 attempts/);
+  });
+
+  it('keeps the paused run’s attempt limit and token budget', async () => {
+    const root = await deadApp(expressMongoApp);
+    const failures = Array.from({ length: 12 }, () => ({ ok: false, log: UNKNOWN }));
+    // Eleven safe fixes, then a risky one after attempt 12.
+    const safe = Array.from({ length: 11 }, (_, i) => fix([{ op: 'setEnv', name: `TRY_${i}`, value: '1' }], `try ${i}`));
+    const risky = fix([{ op: 'setDependency', name: 'config', version: '^1.0.0' }], 'add the config package');
+    // Each error differs, so loop detection stays out of it.
+    const sandbox = new FakeSandbox({ boot: failures.map((f, i) => ({ ...f, log: `${f.log}\nError: variant ${'x'.repeat(i + 1)}` })) });
+    const from = await resurrect(root, {
+      sandbox,
+      model: new ScriptedModel(...safe, risky),
+      maxIterations: 20,
+      tokenBudget: 500_000,
+      approve: async (r) => (r.risks.length ? 'pause' : 'approve'),
+    });
+    expect(from.outcome).toBe('needs-you');
+    expect(from.resume).toMatchObject({ nextAttempt: 13, maxIterations: 20, tokenBudget: 500_000 });
+    const report = await resurrect(root, { sandbox: new FakeSandbox({}), model: null, resume: { from, approve: true } });
+    expect(report.outcome).toBe('resurrected');
+    expect(report.attempts.at(-1)).toMatchObject({ n: 13, ok: true });
+    expect(report.llm.budget).toBe(500_000);
+  });
+
+  it('always tries the fix a resume settles on, even past a lower limit', async () => {
+    const { root, report: from } = await paused();
+    for (const resume of [{ from, approve: true, maxIterations: 1 }, { from: { ...from, resume: { ...from.resume!, maxIterations: undefined } }, approve: true }]) {
+      const report = await resurrect(root, { sandbox: new FakeSandbox({}), maxIterations: 1, resume });
+      expect(report.outcome).toBe('resurrected');
+      expect(report.attempts.map((a) => a.n)).toEqual([1, 2]);
+    }
+  });
+
+  it('reads the shared round count of older reports', async () => {
+    const root = await deadApp(expressMongoApp);
+    const from = await resurrect(root, { sandbox: new FakeSandbox({ install: [{ ok: false, log: PRIVATE }] }), model: new ScriptedModel(question('three?')) });
+    const { questions: _q, declines: _d, ...state } = from.resume!;
+    // An old report: two answered questions counted as two rounds, nothing declined.
+    const old = { ...from, resume: { ...state, rounds: 2, declined: [] } };
+    const report = await resurrect(root, {
+      sandbox: new FakeSandbox({}),
+      model: new ScriptedModel(question('four?')),
+      resume: { from: old, answer: 'no idea' },
+    });
+    expect(report.blockedReason).toBe(`asked the owner 3 questions about this failure and still no fix: ${PRIVATE}`);
   });
 
   it('refuses a report that is not waiting, or a resume without the answer it needs', async () => {
@@ -386,8 +565,8 @@ describe('resume', () => {
     await expect(resurrect(root, { sandbox: new FakeSandbox({}), resume: { from: asking, answer: ' ' } })).rejects.toThrow(
       /needs an answer to the pending question: Is there a public replacement/,
     );
-    for (const options of [{ model: null }, { model: new ScriptedModel(), tokenBudget: 0 }]) {
-      await expect(resurrect(root, { sandbox: new FakeSandbox({}), ...options, resume: { from: asking, answer: 'stub it' } })).rejects.toThrow(
+    for (const options of [{ model: null, resume: {} }, { model: new ScriptedModel(), resume: { tokenBudget: 0 } }]) {
+      await expect(resurrect(root, { sandbox: new FakeSandbox({}), model: options.model, resume: { from: asking, answer: 'stub it', ...options.resume } })).rejects.toThrow(
         /answering the pending question needs a model/,
       );
     }

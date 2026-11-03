@@ -3,13 +3,20 @@ import os from 'node:os';
 import path from 'node:path';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { ReportStore, slugFor, type ExhumeReport, type GraveyardReport, type Tombstone } from '@necromancer/core';
 import { ScriptedModel } from '@necromancer/llm';
 import { createServer, summarize, type ServerOptions } from '@necromancer/mcp';
+import { resurrect } from '@necromancer/resurrect';
 import { fixtureRepo, goodProposal } from '../../interview/test/fixtures.js';
 import { deadApp, expressMongoApp, FakeSandbox, NODE_GYP_LOG } from '../../resurrect/test/helpers.js';
 import { answering } from '../../witness/test/helpers.js';
+
+// The real resurrect, wrapped so a test can see the options the server passed.
+vi.mock('@necromancer/resurrect', async (importOriginal) => {
+  const original = await importOriginal<typeof import('@necromancer/resurrect')>();
+  return { ...original, resurrect: vi.fn(original.resurrect) };
+});
 
 const storeDir = await mkdtemp(path.join(os.tmpdir(), 'necro-store-'));
 
@@ -277,6 +284,26 @@ describe('necromancer MCP resurrect', () => {
     expect(resumed.pending).toBeUndefined();
   });
 
+  it('keeps the paused run\'s limits on resume unless the caller gives new ones', async () => {
+    const root = await deadApp(expressMongoApp);
+    const store = new ReportStore(path.join(await mkdtemp(path.join(os.tmpdir(), 'necro-mcp-')), 'reports'));
+    const lastResume = () => vi.mocked(resurrect).mock.calls.at(-1)![1].resume!;
+    const pause = async () =>
+      (await connect({ store, sandbox: new FakeSandbox({ install: [{ ok: false, log: NODE_GYP_LOG }] }) })).callTool({
+        name: 'resurrect',
+        arguments: { source: root, maxIterations: 4, tokenBudget: 0 },
+      });
+
+    await pause();
+    const client = await connect({ store, sandbox: new FakeSandbox({}) });
+    expect(JSON.parse(text(await client.callTool({ name: 'resurrect', arguments: { source: root, resume: true, approve: true } }))).outcome).toBe('RESURRECTED');
+    expect(lastResume()).toMatchObject({ approve: true, maxIterations: undefined, tokenBudget: undefined });
+
+    await pause();
+    await client.callTool({ name: 'resurrect', arguments: { source: root, resume: true, approve: true, maxIterations: 6, tokenBudget: 0 } });
+    expect(lastResume()).toMatchObject({ approve: true, maxIterations: 6, tokenBudget: 0 });
+  });
+
   it('pauses on a question and passes the answer on when resumed', async () => {
     const root = await deadApp(expressMongoApp);
     // A store of its own, so the model fix it learns stays out of the shared fix cache.
@@ -335,7 +362,29 @@ describe('necromancer MCP plan', () => {
     await new ReportStore(storeDir).save('graveyard', { ...base, tombstones, repo: { source, commit: null } });
     const body = JSON.parse(text(await (await connect()).callTool({ name: 'plan', arguments: { source, save: false } })));
     expect(body.steps).toHaveLength(31);
-    expect(body.steps.at(-1)).toBe('…and 11 more; see plan.md');
+    expect(body.steps.at(-1)).toBe('…and 11 more; call plan with save: true to write them all to plan.md');
+    const saved = JSON.parse(text(await (await connect()).callTool({ name: 'plan', arguments: { source } })));
+    expect(saved.steps.at(-1)).toBe(`…and 11 more; see ${path.join(storeDir, slugFor(source), 'plan.md')}`);
+  });
+
+  it('reports a plan.md that could not be saved instead of pointing at it', async () => {
+    const source = 'https://example.com/plan-unsaved.git';
+    const base = fakeGraveyard();
+    const tombstones = Array.from({ length: 40 }, (_, i) => ({ ...base.tombstones[0]!, name: `pkg-${String(i).padStart(2, '0')}`, latest: '4.18.0' }));
+    class NoFiles extends ReportStore {
+      override async saveFile(source: string, name: string, text: string): Promise<string> {
+        if (name === 'plan.md') throw new Error('EACCES: permission denied');
+        return super.saveFile(source, name, text);
+      }
+    }
+    const store = new NoFiles(storeDir);
+    await store.save('graveyard', { ...base, tombstones, repo: { source, commit: null } });
+    const body = JSON.parse(text(await (await connect({ store })).callTool({ name: 'plan', arguments: { source } })));
+    expect(body.savedTo).toBe(path.join(storeDir, slugFor(source), 'plan.json'));
+    expect(body.markdown).toBeNull();
+    expect(body.markdownError).toContain('EACCES: permission denied');
+    expect(body.steps.at(-1)).not.toContain('see ');
+    expect(body.steps.at(-1)).toContain('could not be saved');
   });
 });
 

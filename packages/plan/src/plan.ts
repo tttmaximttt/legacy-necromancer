@@ -115,22 +115,23 @@ export function buildPlan(reports: PlanInputs, options: PlanOptions = {}): PlanR
     leftAlone.push({ name: dep.name, reason: `Not on the npm registry (${dep.spec}); check its source by hand.` });
   }
 
-  const eraNode = nodeMajor(resurrect?.recipe.nodeImage) ?? nodeMajor(graveyard.era.node?.release);
+  const eraNode = nodeLine(resurrect?.recipe.nodeImage) ?? nodeLine(graveyard.era.node?.release);
+  // A 0.x release line (0.10, 0.12) predates io.js and the 4.x line, so counting majors from 0 would mislead.
+  const preFour = eraNode !== null && /^0(\.|$)/.test(eraNode);
+  const jump = eraNode === null || preFour ? null : Number(TARGET_NODE) - Number(eraNode);
   const nodeWhy = [TARGET_WHY];
   if (eraNode !== null) {
-    const jump = Number(TARGET_NODE) - Number(eraNode);
-    const majors = `this is a jump of ${jump} major${jump === 1 ? '' : 's'}`;
+    const distance = preFour ? `this starts from Node ${eraNode}, before the 4.x line` : `this is a jump of ${jump} major${jump === 1 ? '' : 's'}`;
     nodeWhy.push(
       resurrect?.outcome === 'resurrected'
-        ? `Resurrect booted the app on Node ${eraNode} (${resurrect.recipe.nodeImage}); ${majors}.`
+        ? `Resurrect booted the app on Node ${eraNode} (${resurrect.recipe.nodeImage}); ${distance}.`
         : resurrect
-          ? `Resurrect tried Node ${eraNode} (${resurrect.recipe.nodeImage}) but has not booted the app yet; ${majors}.`
-          : `The project targets Node ${eraNode}; ${majors}.`,
+          ? `Resurrect tried Node ${eraNode} (${resurrect.recipe.nodeImage}) but has not booted the app yet; ${distance}.`
+          : `The project targets Node ${eraNode}; ${distance}.`,
     );
   }
   nodeWhy.push('Last, so every package is already on a version that supports the new runtime.');
-  if (eraNode === null || Number(eraNode) < Number(TARGET_NODE)) {
-    const jump = eraNode === null ? null : Number(TARGET_NODE) - Number(eraNode);
+  if (eraNode === null || preFour || jump! > 0) {
     drafts.push({
       step: {
         id: `upgrade-node:${TARGET_NODE}`,
@@ -245,7 +246,7 @@ function draftFor(t: Tombstone, use: Usage, fixes: string[], leftAlone: PlanRepo
     };
   }
 
-  if (!t.latest || t.latest === t.resolved) {
+  if (!t.latest || t.latest === (t.resolved ?? declaredVersion(t.declared)) || t.latest === current) {
     const reason =
       t.status === 'dead' || t.status === 'dying'
         ? 'Unmaintained, with no known replacement and no newer release; revisit when a successor is chosen.'
@@ -276,6 +277,12 @@ function draftFor(t: Tombstone, use: Usage, fixes: string[], leftAlone: PlanRepo
   };
 }
 
+/** The version a declared range starts from when it names one exact version ("^1.2.3", "~1.2.3", "=v1.2.3", "1.2.3"), else null. */
+function declaredVersion(range: string): string | null {
+  const m = range.trim().match(/^(?:[\^~]|=)?\s*v?(\d+\.\d+\.\d+(?:-[\w.]+)?)$/);
+  return m?.[1] ?? null;
+}
+
 function advisoryLine(a: Tombstone['advisories'][number]): string {
   return `Advisory ${a.id} (${a.severity}): ${a.title}${a.vulnerableVersions ? `, affects ${a.vulnerableVersions}` : ''}.`;
 }
@@ -303,10 +310,14 @@ function resurrectEvidence(resurrect: ResurrectReport | null): Map<string, strin
   return out;
 }
 
-/** The Node major in an image tag, a version or a release name ("node:8-stretch", "registry/v2/node:8", "v8.9.0", "8"), or null. */
-function nodeMajor(value: string | null | undefined): string | null {
-  const m = value?.match(/(?:^|\bnode:)v?(\d+)/);
-  return m?.[1] ?? null;
+/**
+ * The Node release line in an image tag, a version or a release name ("node:8-stretch", "registry/v2/node:8",
+ * "v8.9.0", "8", "node:0.10"), or null: the major from 4 on, and "0.<minor>" for the 0.x lines before it.
+ */
+function nodeLine(value: string | null | undefined): string | null {
+  const m = value?.match(/(?:^|\bnode:)v?(\d+)(?:\.(\d+))?/);
+  if (!m) return null;
+  return m[1] === '0' && m[2] !== undefined ? `0.${m[2]}` : m[1]!;
 }
 
 /** Looks up what exhume knows about a package. Without exhume, or for a package it never saw declared, nothing is known. */

@@ -440,8 +440,16 @@ export interface ResurrectRunState {
   declined?: string[];
   /** The owner's latest answer about this failure. */
   answer?: string | null;
-  /** Questions answered and fixes declined for this failure so far. */
+  /** Questions the owner answered about this failure so far. */
+  questions?: number;
+  /** Fixes the owner declined for this failure so far. */
+  declines?: number;
+  /** Before `questions` and `declines`: both counted together. Read from older reports only. */
   rounds?: number;
+  /** The run's attempt limit; a resume keeps it unless told otherwise. Missing in older reports. */
+  maxIterations?: number;
+  /** The run's token budget; a resume keeps it unless told otherwise. Missing in older reports. */
+  tokenBudget?: number;
 }
 
 export interface ResurrectReport {

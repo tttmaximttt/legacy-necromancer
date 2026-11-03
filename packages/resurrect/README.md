@@ -42,15 +42,18 @@ inside Docker, on the Node version of its era.
 
    The loop stops with `BLOCKED: <reason>` when nothing applies, the model
    says so, the same error survives two fixes, the attempts run out
-   (default 10), the token budget is spent (default 150,000), or three
-   rounds with the owner about one failure did not produce a fix.
+   (default 10), the token budget is spent (default 150,000), the model
+   asks a fourth question about one failure after the owner answered three,
+   or the owner declined three fixes for one failure. A fix is never dropped
+   without being shown: approving one doesn't count against either limit.
 
 ## The owner's part
 
 Some fixes change the project rather than the sandbox, so they wait for the
 owner's OK, whichever source they came from. These are risky:
 
-- moving to another Node major;
+- moving to another Node major (for 0.x, another release line: 0.10 to 0.12
+  counts), or to a tag with no version in it, like `lts` or `argon`;
 - installing Debian packages, or a package globally;
 - changing `package.json` (setting or removing a dependency) or dropping the
   lockfile;
@@ -62,7 +65,7 @@ owner's OK, whichever source they came from. These are risky:
   start command.
 
 Other variables, the port, the Debian archive mirrors, a different image of
-the same Node major and flags that only relax resolution
+the same Node line and flags that only relax resolution
 (`--legacy-peer-deps`, `--ignore-engines`) are applied without asking.
 
 When the owner declines a fix, the loop looks for another one and doesn't
@@ -74,7 +77,9 @@ With nobody to ask (no terminal, or the MCP host's turn ended), the run
 stops as `needs-you` and the report holds the pending fix or question and
 the state to carry on from. `resurrect --resume` with an approval, a
 rejection or an answer continues with the next attempt, keeping the attempt
-count, the token spend and the fixes already declined. Answering a question
+count and limit, the token spend and budget, and the fixes already declined.
+A resume can set a new limit or budget; either way it gets at least one
+attempt to try the fix it settles on. Answering a question
 needs a model, so a resume with an answer and no model fails before
 anything runs. If the repo moved to another commit since the pause, the
 report warns that the saved recipe was worked out against the old one.

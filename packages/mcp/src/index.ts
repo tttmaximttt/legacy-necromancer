@@ -257,8 +257,19 @@ export function createServer(options: ServerOptions = {}): McpServer {
         'limits. Takes minutes. Needs Docker on the machine running this server.',
       inputSchema: {
         source: z.string().min(1).describe('Git URL (https or ssh) or a local directory path'),
-        maxIterations: z.number().int().min(1).max(DEFAULT_MAX_ITERATIONS).default(DEFAULT_MAX_ITERATIONS),
-        tokenBudget: z.number().int().min(0).default(DEFAULT_TOKEN_BUDGET).describe('Tokens Claude may spend on fixes; 0 for known fixes only'),
+        maxIterations: z
+          .number()
+          .int()
+          .min(1)
+          .max(DEFAULT_MAX_ITERATIONS)
+          .optional()
+          .describe(`Build attempts in total; default ${DEFAULT_MAX_ITERATIONS}, or the paused run's limit with resume`),
+        tokenBudget: z
+          .number()
+          .int()
+          .min(0)
+          .optional()
+          .describe(`Tokens Claude may spend on fixes, 0 for known fixes only; default ${DEFAULT_TOKEN_BUDGET}, or the paused run's budget with resume`),
         approvals: z
           .enum(['ask', 'all'])
           .default('ask')
@@ -276,14 +287,16 @@ export function createServer(options: ServerOptions = {}): McpServer {
         let from: ResumeInput | undefined;
         if (resume) {
           if (!saved?.resurrect) throw new Error('No resurrect report for this source; call `resurrect` without resume first.');
-          from = { from: saved.resurrect, approve, answer };
+          // Limits the caller did not give stay as the paused run had them.
+          from = { from: saved.resurrect, approve, answer, maxIterations, tokenBudget };
         }
-        const model = tokenBudget > 0 ? defaultModel() : null;
+        const budget = tokenBudget ?? (from ? (from.from.resume?.tokenBudget ?? DEFAULT_TOKEN_BUDGET) : DEFAULT_TOKEN_BUDGET);
+        const model = budget > 0 ? defaultModel() : null;
         const report = await resurrect(source, {
           sandbox: defaultSandbox(),
           model,
-          maxIterations,
-          tokenBudget,
+          maxIterations: maxIterations ?? DEFAULT_MAX_ITERATIONS,
+          tokenBudget: tokenBudget ?? DEFAULT_TOKEN_BUDGET,
           exhume: saved?.exhume,
           graveyard: saved?.graveyard,
           interview: saved?.interview,
@@ -309,7 +322,7 @@ export function createServer(options: ServerOptions = {}): McpServer {
           warnings: report.warnings,
           dockerfile: report.dockerfile,
           compose: report.compose,
-          ...(!model && tokenBudget > 0 && { note: `No Anthropic API key, so only known fixes were tried. To add one, ${credentialsHint()}.` }),
+          ...(!model && budget > 0 && { note: `No Anthropic API key, so only known fixes were tried. To add one, ${credentialsHint()}.` }),
           // A resumed run replaces the saved needs-you report, which resume would otherwise read again.
           ...((save || paused || resume) && (await saveNote('resurrect', report))),
         });
@@ -391,7 +404,7 @@ export function createServer(options: ServerOptions = {}): McpServer {
         'replacements and upgrades, then the Node upgrade, lowest risk first, each followed by the check that proves ' +
         'nothing broke (the witness replay when there are golden snapshots). Deterministic; no network, no model. Needs a ' +
         'saved graveyard report; exhume, interview, resurrect and witness reports make it sharper. Saves plan.md next to ' +
-        'the reports for the full text.',
+        'the reports for the full text; the result names it in markdown, or gives markdownError when it could not be saved.',
       inputSchema: {
         source: z.string().min(1).describe('Git URL (https or ssh) or a local directory path, as given to the earlier tools'),
         save: z.boolean().default(true).describe('Save plan.json and plan.md next to the other reports'),
@@ -404,16 +417,23 @@ export function createServer(options: ServerOptions = {}): McpServer {
         if (!saved?.graveyard) throw new Error('No graveyard report saved for this source; run the `graveyard` tool first.');
         const plan = buildPlan(saved, { source });
         let saveInfo = {};
+        let markdown: string | null = null;
+        let markdownError: string | undefined;
         if (save) {
           const note = await saveNote('plan', plan);
-          const markdown = await store.saveFile(source, 'plan.md', renderPlanMarkdown(plan)).catch(() => null);
-          saveInfo = { ...note, markdown };
+          try {
+            markdown = await store.saveFile(source, 'plan.md', renderPlanMarkdown(plan));
+          } catch (err) {
+            markdownError = errorMessage(err);
+          }
+          saveInfo = { ...note, markdown, ...(markdownError && { markdownError }) };
         }
+        const rest = plan.steps.length - MAX_PLAN_STEPS;
         return text({
           target: plan.target.node ? `Node ${plan.target.node}` : plan.target.why,
           steps: [
             ...plan.steps.slice(0, MAX_PLAN_STEPS).map((s) => `${s.n}. ${s.title} (${s.risk}) → ${s.check.command}`),
-            ...(plan.steps.length > MAX_PLAN_STEPS ? [`…and ${plan.steps.length - MAX_PLAN_STEPS} more; see plan.md`] : []),
+            ...(rest > 0 ? [`…and ${rest} more; ${markdown ? `see ${markdown}` : markdownError ? 'plan.md could not be saved, as markdownError says' : 'call plan with save: true to write them all to plan.md'}`] : []),
           ],
           leftAlone: plan.leftAlone.length,
           warnings: plan.warnings,

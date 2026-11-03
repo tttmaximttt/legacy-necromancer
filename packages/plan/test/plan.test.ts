@@ -196,6 +196,36 @@ describe('buildPlan', () => {
     expect(node.why.join(' ')).not.toContain('booted the app on');
   });
 
+  it('treats a Node 0.x release line as older than 4.x, not as major 0', () => {
+    for (const [nodeImage, line] of [['node:0.10', '0.10'], ['node:0.12.18-slim', '0.12']] as const) {
+      const old = { ...resurrect, recipe: { ...resurrect.recipe, nodeImage } } as ResurrectReport;
+      const node = step(buildPlan({ ...all, resurrect: old }, { now: NOW }), `upgrade-node:${TARGET_NODE}`);
+      expect(node.change).toEqual([{ name: 'node', from: line, to: TARGET_NODE }]);
+      expect(node.why.join(' ')).toContain(`from Node ${line}, before the 4.x line`);
+      expect(node.why.join(' ')).not.toMatch(/jump of/);
+      expect(node.risk).toBe('high');
+    }
+    const era = { ...graveyard, era: { ...graveyard.era, node: { range: '>=0.10', release: '0.10', released: '2013-03' } } };
+    const fromEra = step(buildPlan({ ...all, graveyard: era, resurrect: null }, { now: NOW }), `upgrade-node:${TARGET_NODE}`);
+    expect(fromEra.change).toEqual([{ name: 'node', from: '0.10', to: TARGET_NODE }]);
+    expect(fromEra.why.join(' ')).toContain('The project targets Node 0.10; this starts from Node 0.10, before the 4.x line.');
+  });
+
+  it('never plans an upgrade to the version it is already on', () => {
+    const cases = [
+      tomb('exact', { status: 'ailing', declared: '1.2.3', resolved: null, latest: '1.2.3', causes: [{ kind: 'outdated', detail: 'x' }] }),
+      tomb('caret', { status: 'ailing', declared: '^1.2.3', resolved: null, latest: '1.2.3', causes: [{ kind: 'outdated', detail: 'x' }] }),
+      tomb('vee', { status: 'ailing', declared: '=v1.2.3', resolved: null, latest: '1.2.3', advisories: [advisory('GHSA-vee')] }),
+      tomb('range', { status: 'ailing', declared: '>=1.0.0', resolved: null, latest: '1.2.3', causes: [{ kind: 'outdated', detail: 'x' }] }),
+    ];
+    const plan = buildPlan({ exhume: null, graveyard: { ...graveyard, tombstones: cases, nonRegistry: [] }, interview: null, resurrect: null, witness: null }, { now: NOW });
+    expect(ids(plan)).toEqual(['upgrade:range', `upgrade-node:${TARGET_NODE}`]);
+    expect(plan.steps.flatMap((s) => s.change).every((c) => c.from !== c.to)).toBe(true);
+    expect(plan.leftAlone.find((l) => l.name === 'exact')!.reason).toBe('Already on the newest release.');
+    expect(plan.leftAlone.find((l) => l.name === 'vee')!.reason).toMatch(/no newer release/);
+    expect(plan.leftAlone.map((l) => l.name)).toEqual(expect.arrayContaining(['exact', 'caret', 'vee']));
+  });
+
   it('quotes the source in commands', () => {
     for (const source of ['~/my repo', '~/code/app']) {
       const plan = buildPlan({ exhume: null, graveyard, interview: null, resurrect: null, witness: null }, { now: NOW, source });

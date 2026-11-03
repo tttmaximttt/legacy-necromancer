@@ -18,7 +18,24 @@ function envRisk(name: string): string {
   return 'changes how npm installs';
 }
 
-const major = (image: string): string | null => /^(?:node:)?(\d+)/.exec(image)?.[1] ?? null;
+/**
+ * The Node release line an image tag is on: the major ("14" for "14.21-slim"), or for 0.x the minor too, since
+ * 0.10 and 0.12 are different lines ("0.10" for "node:0.10.48-slim"). null for tags that name no version, like
+ * "lts", "latest" or codenames such as "argon".
+ */
+export function nodeLine(image: string): string | null {
+  const m = /^(?:node:)?(\d+)(?:\.(\d+))?/.exec(image);
+  if (!m) return null;
+  return m[1] === '0' ? (m[2] === undefined ? null : `0.${Number(m[2])}`) : String(Number(m[1]));
+}
+
+/** Whether moving between two image tags changes the Node release line. A tag with no version counts as a change unless it is the same tag. */
+export function changesNodeLine(from: string, to: string): boolean {
+  const a = nodeLine(from);
+  const b = nodeLine(to);
+  if (a === null || b === null) return from.replace(/^node:/, '') !== to.replace(/^node:/, '');
+  return a !== b;
+}
 
 /**
  * Why a fix should wait for the owner's OK: it changes the project's dependencies or Node major, installs
@@ -30,9 +47,10 @@ export function fixRisks(recipe: BuildRecipe, ops: RecipeOp[]): FixRisk[] {
   for (const op of ops) {
     switch (op.op) {
       case 'setNodeImage': {
-        const from = major(recipe.nodeImage);
-        const to = major(op.tag);
-        if (from !== to) add(op, `moves Node from ${from ?? recipe.nodeImage} to ${to ?? op.tag} (node:${op.tag})`);
+        if (changesNodeLine(recipe.nodeImage, op.tag)) {
+          const from = nodeLine(recipe.nodeImage) ?? recipe.nodeImage.replace(/^node:/, '');
+          add(op, `moves Node from ${from} to ${nodeLine(op.tag) ?? op.tag} (node:${op.tag})`);
+        }
         break;
       }
       case 'aptInstall':

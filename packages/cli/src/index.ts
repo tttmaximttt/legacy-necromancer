@@ -179,8 +179,8 @@ export function createProgram(deps: ProgramDeps = {}): Command {
         'are asked; without a terminal to ask on, the run stops with NEEDS YOU (exit code 3) and `--resume` carries on. Needs Docker.',
     )
     .argument('<source>', 'git URL or local path')
-    .option('-n, --max-iterations <n>', 'build attempts before giving up', int, DEFAULT_MAX_ITERATIONS)
-    .option('--token-budget <n>', 'input + output tokens the model may spend', int, DEFAULT_TOKEN_BUDGET)
+    .option('-n, --max-iterations <n>', "build attempts before giving up (with --resume, default: the saved run's)", int, DEFAULT_MAX_ITERATIONS)
+    .option('--token-budget <n>', "input + output tokens the model may spend (with --resume, default: the saved run's)", int, DEFAULT_TOKEN_BUDGET)
     .option('--no-llm', 'known fixes and cached fixes only')
     .option('-m, --model <id>', 'Claude model', DEFAULT_MODEL)
     .option('--cpus <n>', 'CPUs per container', Number, DEFAULT_LIMITS.cpus)
@@ -218,6 +218,7 @@ export function createProgram(deps: ProgramDeps = {}): Command {
           workdir?: string;
           quiet?: boolean;
         },
+        command: Command,
       ) => {
         if ((opts.approve || opts.reject || opts.answer !== undefined) && !opts.resume) throw new Error('--approve, --reject and --answer go with --resume');
         if (opts.approve && opts.reject) throw new Error('pass --approve or --reject, not both');
@@ -226,23 +227,44 @@ export function createProgram(deps: ProgramDeps = {}): Command {
         const io = terminalIo();
         const prompt = deps.prompt !== undefined ? deps.prompt : io.ask;
         try {
+          const say = progress(opts, '☥');
+          // The paused run's limits stand unless -n or --token-budget is given again.
+          const given = (name: string) => command.getOptionValueSource(name) === 'cli';
+          const limits = {
+            maxIterations: given('maxIterations') ? opts.maxIterations : undefined,
+            tokenBudget: given('tokenBudget') ? opts.tokenBudget : undefined,
+          };
+          // The budget the run will actually have: on a resume, the saved one unless overridden.
+          const budget = opts.resume ? (limits.tokenBudget ?? saved?.resurrect?.resume?.tokenBudget ?? opts.tokenBudget) : opts.tokenBudget;
+          const model =
+            budget > 0 ? chooseModel(opts, deps, () => say?.(`no Anthropic API key, so only known fixes will be tried (to add one, ${credentialsHint()})`)) : null;
           let resume: ResumeInput | undefined;
           if (opts.resume) {
             const from = saved?.resurrect;
             if (!from) throw new Error(`no resurrect report for ${source}; run \`necromancer resurrect ${shellArg(source)}\` first`);
-            if (from.outcome !== 'needs-you' || !from.pending) {
-              throw new Error(`the saved run is not waiting on you (it ended ${from.outcome}); run \`necromancer resurrect ${shellArg(source)}\` without --resume to start again`);
+            // Everything that can stop the resume is checked before asking, so an answer is never thrown away.
+            if (from.outcome !== 'needs-you' || !from.pending || !from.resume) {
+              throw new Error(
+                from.outcome === 'needs-you'
+                  ? `the saved run is missing the state it needs to carry on; run \`necromancer resurrect ${shellArg(source)}\` without --resume to start again`
+                  : `the saved run is not waiting on you (it ended ${from.outcome}); run \`necromancer resurrect ${shellArg(source)}\` without --resume to start again`,
+              );
             }
-            const decision = await resumeDecision(source, from, opts, prompt);
+            if (from.pending.kind === 'question') {
+              if (budget <= from.resume.tokens) {
+                throw new Error(`answering the pending question needs a model, but the token budget of ${budget} is already spent (${from.resume.tokens} used); pass a larger --token-budget`);
+              }
+              if (!model) throw new Error('answering the pending question needs a model to turn the answer into a fix; set an Anthropic API key and drop --no-llm');
+            }
+            const decision = await resumeDecision(from, opts, prompt);
             if (!decision) {
+              // Nobody answered (no terminal, or the owner chose to pause): still waiting, so the same exit as a fresh pause.
               process.stderr.write(needsYou(source, from.pending, opts));
               process.exitCode = 3;
               return;
             }
-            resume = { from, ...decision };
+            resume = { from, ...decision, ...limits };
           }
-          const say = progress(opts, '☥');
-          const model = chooseModel(opts, deps, () => say?.(`no Anthropic API key, so only known fixes will be tried (to add one, ${credentialsHint()})`));
           const report = await resurrect(source, {
             sandbox: chooseSandbox(opts, deps),
             model,
@@ -412,7 +434,6 @@ interface ResumeFlags {
 
 /** The owner's answer to the pending decision of a needs-you report, from flags or the terminal; null to stay paused. */
 async function resumeDecision(
-  source: string,
   from: ResurrectReport,
   opts: ResumeFlags,
   prompt: Prompt | null,
@@ -422,7 +443,7 @@ async function resumeDecision(
     if (opts.answer !== undefined) throw new Error('the saved run is waiting on a fix, not a question; pass --approve or --reject');
     if (opts.approve || opts.yes) return { approve: true };
     if (opts.reject) return { approve: false };
-    if (!prompt) throw new Error(`the saved run is waiting for your OK on a fix; pass --approve or --reject\n${needsYou(source, pending, opts)}`);
+    if (!prompt) return null;
     const failed = from.resume?.failure;
     const excerpt = from.attempts.find((a) => a.n === failed?.attempt)?.errorExcerpt ?? failed?.log ?? '';
     const verdict = await askApproval({ attempt: failed?.attempt ?? 0, phase: failed?.phase ?? 'install', fix: pending.fix, risks: pending.risks, errorExcerpt: excerpt }, prompt);
@@ -430,7 +451,7 @@ async function resumeDecision(
   }
   if (opts.approve || opts.reject) throw new Error('the saved run is waiting on a question, not a fix; pass --answer "…"');
   if (opts.answer?.trim()) return { answer: opts.answer };
-  if (!prompt) throw new Error(`the saved run is waiting on your answer; pass --answer "…"\n${needsYou(source, pending, opts)}`);
+  if (!prompt) return null;
   const answer = await askQuestion({ ...pending, attempt: from.resume?.failure.attempt ?? 0 }, prompt);
   return answer === null ? null : { answer };
 }

@@ -31,8 +31,10 @@ import { applyOps, changesRecipe, patchManifest, renderDockerfile } from './reci
 
 export const DEFAULT_MAX_ITERATIONS = 10;
 export const DEFAULT_TOKEN_BUDGET = 150_000;
-/** Questions answered plus fixes declined for one failure before the run gives up on it. */
-export const MAX_OWNER_ROUNDS = 3;
+/** Questions the owner answers about one failure before the run gives up on it. */
+export const MAX_OWNER_QUESTIONS = 3;
+/** Fixes the owner declines for one failure before the run gives up on it. */
+export const MAX_OWNER_DECLINES = 3;
 
 /** What the owner is shown before a risky fix is applied. */
 export interface ApprovalRequest {
@@ -56,15 +58,23 @@ export interface ResumeInput {
   approve?: boolean;
   /** For a pending question: the owner's answer. */
   answer?: string;
+  /**
+   * Attempts in total for the resumed run, replacing the limit the paused run had. Left out, the paused run's
+   * limit stands (or, for reports from before it was saved, `ResurrectOptions.maxIterations`). Either way the
+   * resumed run gets at least one attempt to try the fix it settles on.
+   */
+  maxIterations?: number;
+  /** Token budget for the whole run, replacing the paused run's. Left out, the paused run's budget stands. */
+  tokenBudget?: number;
 }
 
 export interface ResurrectOptions {
   sandbox: Sandbox;
   /** Asked for a fix when the known-fix table and the cache have none. null runs table-only. */
   model?: StructuredModel | null;
-  /** Attempts in total, counting those made before a pause when resuming. */
+  /** Attempts in total. When resuming, the paused run's limit is kept instead; `resume.maxIterations` changes it. */
   maxIterations?: number;
-  /** Input plus output tokens the model may spend across the whole run. */
+  /** Input plus output tokens the model may spend across the whole run. When resuming, as `maxIterations`. */
   tokenBudget?: number;
   limits?: Partial<SandboxLimits>;
   /** Earlier reports, if saved: the era comes from graveyard, the owner's goals from interview. */
@@ -107,8 +117,10 @@ interface Turn {
   answer?: string;
   /** The fixes the owner declined, for the blocked message. */
   declined: string[];
-  /** Questions answered and fixes declined so far. */
-  rounds: number;
+  /** Questions the owner answered so far. */
+  questions: number;
+  /** Fixes the owner declined so far. */
+  declines: number;
 }
 
 type Settled =
@@ -116,7 +128,28 @@ type Settled =
   | { kind: 'blocked'; reason: string }
   | { kind: 'pause'; pending: PendingDecision; turn: Turn };
 
-const opsKey = (ops: RecipeOp[]) => `ops:${JSON.stringify(ops)}`;
+/**
+ * The key a declined model fix is remembered by: the same ops match whatever order their keys come in, and
+ * whatever order apt packages or install flags are listed in.
+ */
+export const opsKey = (ops: RecipeOp[]): string =>
+  `ops:${canonicalJson(
+    ops.map((op) =>
+      op.op === 'aptInstall' ? { ...op, packages: [...op.packages].sort() } : op.op === 'addInstallFlags' ? { ...op, flags: [...op.flags].sort() } : op,
+    ),
+  )}`;
+
+function canonicalJson(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(',')}]`;
+  if (value && typeof value === 'object') {
+    const entries = Object.entries(value).filter(([, v]) => v !== undefined);
+    return `{${entries
+      .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
+      .map(([k, v]) => `${JSON.stringify(k)}:${canonicalJson(v)}`)
+      .join(',')}}`;
+  }
+  return JSON.stringify(value) ?? 'null';
+}
 
 /**
  * Phase 5: the build-fix loop. Each attempt installs (the only step with network), runs the build script and
@@ -126,11 +159,12 @@ const opsKey = (ops: RecipeOp[]) => `ops:${JSON.stringify(ops)}`;
  * `resume` carries on from that report.
  */
 export async function resurrect(source: string, options: ResurrectOptions): Promise<ResurrectReport> {
-  const budget = options.tokenBudget ?? DEFAULT_TOKEN_BUDGET;
-  const resumed = options.resume ? checkResume(options.resume, options.model ?? null, budget) : null;
+  const resumed = options.resume ? checkResume(options.resume, options) : null;
+  const budget = resumed?.budget ?? options.tokenBudget ?? DEFAULT_TOKEN_BUDGET;
+  // A resume that settles on a fix gets at least the attempt that tries it.
+  const maxIterations = resumed?.maxIterations ?? options.maxIterations ?? DEFAULT_MAX_ITERATIONS;
   const log = options.onProgress ?? (() => {});
   const limits: SandboxLimits = { ...DEFAULT_LIMITS, ...options.limits };
-  const maxIterations = options.maxIterations ?? DEFAULT_MAX_ITERATIONS;
   const cache = options.fixCache ?? new FixCache(null);
   const sandbox = options.sandbox;
 
@@ -277,33 +311,40 @@ export async function resurrect(source: string, options: ResurrectOptions): Prom
         rejected: `the owner declined it: ${fix.description}`,
         answer: turn.answer,
         declined: [...turn.declined, fix.source === 'llm' ? `"${fix.description}"` : fix.id],
-        rounds: turn.rounds + 1,
+        questions: turn.questions,
+        declines: turn.declines + 1,
       };
     };
 
-    const outOfRounds = (f: Failure): Settled => ({
-      kind: 'blocked',
-      reason: `asked the owner ${MAX_OWNER_ROUNDS} times about this failure and still no fix: ${firstError(f.log)}`,
-    });
-
-    /** Finds the fix to apply for a failure, asking the owner where needed, or says why the run must stop. */
+    /**
+     * Finds the fix to apply for a failure, asking the owner where needed, or says why the run must stop.
+     * Every fix found is either applied or shown to the owner; only further questions and further proposals after
+     * the owner has had enough are cut off.
+     */
     const settle = async (f: Failure, turn: Turn): Promise<Settled> => {
       for (;;) {
+        if (turn.declines >= MAX_OWNER_DECLINES) {
+          return {
+            kind: 'blocked',
+            reason: `the owner declined ${turn.declines} fixes for this failure (${turn.declined.join(', ')}): ${firstError(f.log)}`,
+          };
+        }
         const found = await propose(f, turn);
         if (found.kind === 'blocked') return found;
         if (found.kind === 'question') {
-          if (turn.rounds >= MAX_OWNER_ROUNDS) return outOfRounds(f);
+          if (turn.questions >= MAX_OWNER_QUESTIONS) {
+            return { kind: 'blocked', reason: `asked the owner ${turn.questions} questions about this failure and still no fix: ${firstError(f.log)}` };
+          }
           const reply = options.ask ? await options.ask({ ...found.question, attempt: f.attempt.n }) : null;
           if (!reply?.trim()) return { kind: 'pause', pending: found.question, turn };
           decide(f.attempt.n, 'question', found.question.question, reply);
-          turn = { ...turn, rejected: undefined, answer: reply, rounds: turn.rounds + 1 };
+          turn = { ...turn, rejected: undefined, answer: reply, questions: turn.questions + 1 };
           continue;
         }
         const { fix } = found;
         const answered = turn.answer !== undefined;
         const risks = fixRisks(recipe, fix.ops);
         if (!risks.length || !options.approve) return { kind: 'apply', fix, answered };
-        if (turn.rounds >= MAX_OWNER_ROUNDS) return outOfRounds(f);
         const errorExcerpt = f.attempt.errorExcerpt ?? tail(f.log, 40);
         const verdict = await options.approve({ attempt: f.attempt.n, phase: f.phase, fix, risks, errorExcerpt });
         if (verdict === 'pause') return { kind: 'pause', pending: { kind: 'approval', fix, risks }, turn };
@@ -331,7 +372,10 @@ export async function resurrect(source: string, options: ResurrectOptions): Prom
           skip: [...turn.skip],
           declined: turn.declined,
           answer: turn.answer ?? null,
-          rounds: turn.rounds,
+          questions: turn.questions,
+          declines: turn.declines,
+          maxIterations,
+          tokenBudget: budget,
         };
         return false;
       }
@@ -352,11 +396,14 @@ export async function resurrect(source: string, options: ResurrectOptions): Prom
         const attempt = attempts.find((a) => a.n === state.failure.attempt);
         if (!attempt) throw new Error(`the saved report has no attempt ${state.failure.attempt} to resume from`);
         const f: Failure = { attempt, phase: state.failure.phase, signature: state.failure.signature, log: state.failure.log };
+        // Older reports counted questions and declines together as `rounds`.
+        const declines = state.declines ?? state.declined?.length ?? 0;
         const turn: Turn = {
           skip: new Set(state.skip ?? []),
           declined: state.declined ?? [],
           answer: state.answer ?? undefined,
-          rounds: state.rounds ?? 0,
+          questions: state.questions ?? Math.max(0, (state.rounds ?? 0) - declines),
+          declines,
         };
         log(`resuming after attempt ${attempt.n}`);
         let settled: Settled;
@@ -368,7 +415,7 @@ export async function resurrect(source: string, options: ResurrectOptions): Prom
         } else {
           const answer = options.resume!.answer!;
           decide(attempt.n, 'question', waiting.question, answer);
-          settled = await settle(f, { ...turn, rejected: undefined, answer, rounds: turn.rounds + 1 });
+          settled = await settle(f, { ...turn, rejected: undefined, answer, questions: turn.questions + 1 });
         }
         go = conclude(f, settled);
         first = state.nextAttempt;
@@ -442,7 +489,7 @@ export async function resurrect(source: string, options: ResurrectOptions): Prom
           break;
         }
         const failure: Failure = { attempt, phase, signature, log: tail(step.log, 120) };
-        if (!conclude(failure, await settle(failure, { skip: new Set(), declined: [], rounds: 0 }))) break;
+        if (!conclude(failure, await settle(failure, { skip: new Set(), declined: [], questions: 0, declines: 0 }))) break;
       }
     } finally {
       if (!options.keepImages) await sandbox.cleanup();
@@ -462,13 +509,17 @@ export async function resurrect(source: string, options: ResurrectOptions): Prom
 /** Checks that a resume has a paused run to carry on and the answer its pending decision needs. */
 function checkResume(
   resume: ResumeInput,
-  model: StructuredModel | null,
-  budget: number,
-): { from: ResurrectReport; pending: PendingDecision; state: ResurrectRunState } {
+  options: Pick<ResurrectOptions, 'model' | 'maxIterations' | 'tokenBudget'>,
+): { from: ResurrectReport; pending: PendingDecision; state: ResurrectRunState; maxIterations: number; budget: number } {
   const { from } = resume;
+  const model = options.model ?? null;
   if (from.outcome !== 'needs-you' || !from.pending || !from.resume) {
     throw new Error(`only a run that is waiting on the owner (needs-you) can be resumed; this one ended ${from.outcome}`);
   }
+  const state = from.resume;
+  const budget = resume.tokenBudget ?? state.tokenBudget ?? options.tokenBudget ?? DEFAULT_TOKEN_BUDGET;
+  const limit = resume.maxIterations ?? state.maxIterations ?? options.maxIterations ?? DEFAULT_MAX_ITERATIONS;
+  const maxIterations = Math.max(limit, state.nextAttempt);
   if (from.pending.kind === 'approval' && typeof resume.approve !== 'boolean') {
     throw new Error(`resuming needs a decision on the pending fix: approve or reject ${from.pending.fix.id} (${from.pending.fix.description})`);
   }
@@ -479,7 +530,7 @@ function checkResume(
       throw new Error(`answering the pending question needs a model, but the token budget of ${budget} is already spent (${from.resume.tokens} used); raise it`);
     }
   }
-  return { from, pending: from.pending, state: from.resume };
+  return { from, pending: from.pending, state, maxIterations, budget };
 }
 
 /** The sandbox's copy of the repo: everything but .git and node_modules, with the recipe's manifest and Dockerfile. */
