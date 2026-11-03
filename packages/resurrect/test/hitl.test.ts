@@ -1235,6 +1235,31 @@ describe('resume errors', () => {
     expect(await resume({ answer: 'yes' })).toBe('wrong-kind');
     expect(await resume({ approve: true }, other)).toBe('model-mismatch');
     expect(await resume({ approve: true }, null)).toBe('model-null');
+    // resurrect checks the run it is handed, whatever was checked before.
+    const questionRun = checkResumable(asking, { model: new ScriptedModel() });
+    const spent = { ...questionRun, settings: { ...questionRun.settings, tokenBudget: questionRun.state.tokens } };
+    expect(await asyncCode(resurrect(root, { sandbox: new FakeSandbox({}), model: new ScriptedModel(), resume: { run: spent, answer: 'stub it' } }))).toBe(
+      'budget-spent',
+    );
+  });
+
+  it('build the model from the settings, called only when they name one', async () => {
+    const root = await deadApp(expressMongoApp);
+    const approval = await resurrect(root, {
+      sandbox: new FakeSandbox({ boot: [{ ok: false, log: UNKNOWN }] }),
+      model: new ScriptedModel(fix([{ op: 'setDependency', name: 'config', version: '^1.0.0' }])),
+      approve: async () => 'pause',
+    });
+    const named: string[] = [];
+    const build = (name: string) => (named.push(name), new ScriptedModel());
+    const run = checkResumable(approval, { model: build });
+    expect(named).toEqual(['scripted']);
+    expect(run.model).toBeInstanceOf(ScriptedModel);
+    // Settings that name no model build none.
+    expect(checkResumable(approval, { model: build, resume: { model: null } }).model).toBeNull();
+    expect(named).toEqual(['scripted']);
+    const input = prepareResume(approval, { model: build, approve: true });
+    expect((await resurrect(root, { sandbox: new FakeSandbox({}), model: input.run.model, resume: input })).outcome).toBe('resurrected');
   });
 
   it('refuse a resume that names a model with a token budget of 0', async () => {

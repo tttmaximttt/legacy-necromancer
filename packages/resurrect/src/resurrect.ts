@@ -106,12 +106,16 @@ export interface RunSettings extends ResurrectRunSettings {
   limits: SandboxLimits;
 }
 
-/** A paused run checked by `checkResumable`: the report, what it waits on, its state, and the settings the resumed run has. */
+/**
+ * A paused run checked by `checkResumable`: the report, what it waits on, its state, the settings the resumed run has,
+ * and the model it was checked with, to hand to `resurrect`.
+ */
 export interface ResumableRun {
   from: ResurrectReport;
   pending: PendingDecision;
   state: ResurrectRunState;
   settings: RunSettings;
+  model: StructuredModel | null;
 }
 
 export interface ResurrectOptions {
@@ -267,8 +271,8 @@ function canonicalJson(value: unknown): string {
  * needs-you, and `resume` carries on from that report.
  */
 export async function resurrect(source: string, options: ResurrectOptions): Promise<ResurrectReport> {
-  // The structural checks ran in `checkResumable`; only the answer, and that the model is the one checked, are left.
-  const resumed = options.resume ? checkDecision(options.resume, options.model ?? null) : null;
+  // The checks are cheap and pure, so they run again here on whatever run and answer are handed in.
+  const resumed = options.resume ? checkedResume(options.resume, options.model ?? null) : null;
   const settings = resumed?.settings ?? runSettings(options);
   const { maxIterations, tokenBudget: budget, limits } = settings;
   const caFile = settings.caFile ?? undefined;
@@ -780,17 +784,31 @@ function describeSandbox(s: SandboxSettings): string {
  * Checks that a saved report is a paused run that can carry on, before anyone is asked for an answer: it is
  * waiting on the owner, has the state to resume from, is handed the model its settings name (or none when they
  * name none), and, for a pending question, has a model and budget left to turn the answer into a fix. Returns the
- * report, what it waits on and the settings the resumed run will have (`resumeSettings`), for `ResumeInput.run`.
- * Throws a `ResumeError` otherwise, whose code says which check failed; a resume naming a model with a token budget
- * of 0 fails too.
+ * report, what it waits on, the settings the resumed run will have (`resumeSettings`) and the model, for
+ * `ResumeInput.run`. `model` can be a
+ * function that builds the model the settings name, called only when they name one, so a front-end need not work
+ * out the settings first. Throws a `ResumeError` otherwise, whose code says which check failed; a resume naming a
+ * model with a token budget of 0 fails too.
  */
-export function checkResumable(from: ResurrectReport, options: Pick<ResurrectOptions, 'model'> & { resume?: ResumeOverrides } = {}): ResumableRun {
+export function checkResumable(
+  from: ResurrectReport,
+  options: { model?: StructuredModel | null | ((name: string) => StructuredModel | null); resume?: ResumeOverrides } = {},
+): ResumableRun {
   const { pending, state } = pausedRun(from);
   const settings = resumeSettings(from, options.resume);
   const named = options.resume?.model;
   if (typeof named === 'string' && settings.tokenBudget <= 0) {
     throw new ResumeError('model-without-budget', `the resume names the model ${named}, but its token budget is 0, so no model would be asked; raise the budget`);
   }
+  const model = typeof options.model === 'function' ? (settings.model ? options.model(settings.model) : null) : (options.model ?? null);
+  const run: ResumableRun = { from, pending, state, settings, model };
+  checkRun(run, model);
+  return run;
+}
+
+/** The checks of `checkResumable` that a run's settings already decide: what it needs to answer and the model. */
+function checkRun({ from, pending, state, settings }: ResumableRun, model: StructuredModel | null): void {
+  pausedRun(from);
   if (pending.kind === 'question') {
     if (settings.tokenBudget <= state.tokens) {
       throw new ResumeError(
@@ -801,15 +819,14 @@ export function checkResumable(from: ResurrectReport, options: Pick<ResurrectOpt
     if (!settings.model) {
       throw new ResumeError('no-model', 'answering the pending question needs a model to turn the answer into a fix, and the resumed run has none (its model is null)');
     }
-    if (!options.model) {
+    if (!model) {
       throw new ResumeError(
         'model-null',
         `answering the pending question needs a model to turn the answer into a fix, and none is available; the resumed run asks ${settings.model}`,
       );
     }
   }
-  checkModel(settings, options.model ?? null);
-  return { from, pending, state, settings };
+  checkModel(settings, model);
 }
 
 /** That the model handed in is the one the settings name, or none when they name none. */
@@ -826,14 +843,8 @@ function checkModel(settings: RunSettings, model: StructuredModel | null): void 
   );
 }
 
-/**
- * That a checked run is handed the model it was checked with, and that the resume answers what the run waits on:
- * approve for a fix, an answer for a question. Returns the run with the answer.
- */
-function checkDecision(resume: ResumeInput, model: StructuredModel | null): ResumableRun & Pick<ResumeInput, 'approve' | 'answer'> {
-  const { run, approve, answer } = resume;
-  checkModel(run.settings, model);
-  const { pending } = run;
+/** That the resume answers what the run waits on: approve for a fix, an answer for a question. */
+function checkDecision({ run: { pending }, approve, answer }: ResumeInput): void {
   if (pending.kind === 'approval') {
     const fix = `${pending.fix.id} (${pending.fix.description})`;
     if (answer !== undefined) {
@@ -846,20 +857,32 @@ function checkDecision(resume: ResumeInput, model: StructuredModel | null): Resu
     }
     if (!answer?.trim()) throw new ResumeError('needs-answer', `resuming needs an answer to the pending question: ${pending.question}`);
   }
-  return { ...run, approve, answer };
+}
+
+/** The resume `resurrect` carries on: the run checked against the model it is handed, and the answer. */
+function checkedResume(resume: ResumeInput, model: StructuredModel | null): ResumableRun & Pick<ResumeInput, 'approve' | 'answer'> {
+  checkRun(resume.run, model);
+  checkDecision(resume);
+  return { ...resume.run, approve: resume.approve, answer: resume.answer };
 }
 
 /**
  * `checkResumable` and the decision check in one call, for library use: the `ResumeInput` that carries `from` on
- * with the owner's answer. Pass the same `model` to `resurrect`. Throws a `ResumeError` as those checks do.
+ * with the owner's answer. Pass `run.model` to `resurrect`.
+ * Throws a `ResumeError` as those checks do.
  */
 export function prepareResume(
   from: ResurrectReport,
-  options: { model?: StructuredModel | null; overrides?: ResumeOverrides; approve?: boolean; answer?: string } = {},
+  options: {
+    model?: StructuredModel | null | ((name: string) => StructuredModel | null);
+    overrides?: ResumeOverrides;
+    approve?: boolean;
+    answer?: string;
+  } = {},
 ): ResumeInput {
   const run = checkResumable(from, { model: options.model, resume: options.overrides });
   const input: ResumeInput = { run, approve: options.approve, answer: options.answer };
-  checkDecision(input, options.model ?? null);
+  checkDecision(input);
   return input;
 }
 

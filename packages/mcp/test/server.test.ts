@@ -356,6 +356,8 @@ describe('necromancer MCP resurrect', () => {
     const client = await connect({ store, sandbox: new FakeSandbox({}) });
     expect(JSON.parse(text(await client.callTool({ name: 'resurrect', arguments: { source: root, resume: true, approve: true } }))).outcome).toBe('RESURRECTED');
     expect(lastResume()).toMatchObject({ approve: true, run: { settings: { maxIterations: 4, tokenBudget: 0 } } });
+    // A resume runs on the paused run's settings, so none of the fresh-run options is passed.
+    expect(Object.keys(vi.mocked(resurrect).mock.calls.at(-1)![1]).sort()).toEqual(['approve', 'fixCache', 'model', 'onProgress', 'resume', 'sandbox']);
 
     await pause();
     await client.callTool({ name: 'resurrect', arguments: { source: root, resume: true, approve: true, maxIterations: 6, tokenBudget: 0 } });
@@ -415,6 +417,8 @@ describe('necromancer MCP resurrect', () => {
     expect(body.outcome).toBe('NEEDS YOU');
     expect(body.pending).toEqual({ kind: 'question', question: question.question, context: expect.any(String), choices: question.choices });
     expect(body.next).toMatch(/resume: true and answer/);
+    // The choices are listed unnumbered, so the answer is the choice's text, never a number standing for it.
+    expect(body.next).toContain('for a choice, its text, not its number');
     expect(body.next).toContain('do not ask them for passwords, keys or other secrets');
 
     const model = new ScriptedModel({ diagnosis: 'stub it', decision: 'fix', ops: [{ op: 'setEnv', name: 'CI', value: 'true' }], blockedReason: null, question: null, choices: [] });

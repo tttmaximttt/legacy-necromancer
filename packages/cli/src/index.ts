@@ -6,7 +6,7 @@ import { createRequire } from 'node:module';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 import { Command } from 'commander';
-import { errorMessage, ReportStore, shellArg, slugFor, type PendingDecision, type ReportKind, type ResurrectReport } from '@necromancer/core';
+import { errorMessage, ReportStore, shellArg, shellQuote, slugFor, type PendingDecision, type ReportKind, type ResurrectReport } from '@necromancer/core';
 import { exhume } from '@necromancer/excavate';
 import { runStdio } from '@necromancer/mcp';
 import { graveyard } from '@necromancer/graveyard';
@@ -30,7 +30,7 @@ import {
   type ResumableRun,
   type ResumeInput,
   type ResumeOverrides,
-  type RunSettings,
+  type ResurrectOptions,
   type Sandbox,
 } from '@necromancer/resurrect';
 import { compareWitness, witness } from '@necromancer/witness';
@@ -206,7 +206,7 @@ export function createProgram(deps: ProgramDeps = {}): Command {
     .option('--resume', 'carry on from the saved run that is waiting on you')
     .option('--approve', 'with --resume: apply the fix it is waiting on')
     .option('--reject', 'with --resume: decline that fix and look for another')
-    .option('--answer <text>', 'with --resume: your answer to its question')
+    .option('--answer <text>', 'with --resume: your answer to its question, or the number of one of its choices')
     .option('--reports <dir>', 'report store directory')
     .option('-w, --workdir <dir>', 'where to clone remote repos')
     .option('-q, --quiet', 'no progress output on stderr')
@@ -245,9 +245,14 @@ export function createProgram(deps: ProgramDeps = {}): Command {
           const noKey = () => say?.(`no Anthropic API key, so only known fixes will be tried (to add one, ${credentialsHint()})`);
           // On a resume the paused run's settings stand, except for the flags typed again.
           const given = (name: string) => command.getOptionValueSource(name) === 'cli';
-          let model: StructuredModel | null;
-          let sandbox: Sandbox;
-          let resume: ResumeInput | undefined;
+          const fixCache = new FixCache(path.join(path.dirname(store.dir), 'fix-cache.json'));
+          const approve: ResurrectOptions['approve'] = opts.yes
+            ? async () => 'auto-approve'
+            : prompt
+              ? (request) => askApproval(request, prompt)
+              : async () => 'pause';
+          const ask: ResurrectOptions['ask'] = prompt ? (question) => askQuestion(question, prompt) : undefined;
+          let report: ResurrectReport;
           if (opts.resume) {
             const from = saved?.resurrect;
             if (!from) throw new Error(`no resurrect report for ${source}; run \`necromancer resurrect ${shellArg(source)}\` first`);
@@ -267,19 +272,22 @@ export function createProgram(deps: ProgramDeps = {}): Command {
                 healthTimeoutSec: given('healthTimeout') ? opts.healthTimeout : undefined,
               },
             };
-            // Everything that can stop the resume is checked before asking, so an answer is never thrown away.
-            let settings: RunSettings | undefined;
             let run: ResumableRun;
-            model = null;
             try {
-              // Only to know which model to build; checkResumable below does the checks, once.
-              settings = resumeSettings(from, overrides);
               // The model the paused run asked, or the one named again; none when there is no key, which the check reports.
-              model = settings.model === null ? null : (deps.model ?? (hasCredentials() ? new ClaudeModel({ model: settings.model }) : null));
-              run = checkResumable(from, { model, resume: overrides });
+              run = checkResumable(from, {
+                model: (name) => deps.model ?? (hasCredentials() ? new ClaudeModel({ model: name }) : null),
+                resume: overrides,
+              });
             } catch (err) {
-              throw new Error(`${errorMessage(err)}${resumeHint(source, from, err, settings)}`);
+              throw new Error(`${errorMessage(err)}${resumeHint(source, from, overrides, err)}`);
             }
+            // The paused run's sandbox, with any --build-proxy or --health-timeout typed again already merged in.
+            const sandbox = deps.sandbox ?? new DockerSandbox(run.settings.sandbox ?? {});
+            // Docker is checked before the owner is asked, so a typed answer is not lost to it. If the run fails in any
+            // way after the answer was given (the clone, say), the error gives the command that passes it again.
+            const asking = prompt !== null && !opts.approve && !opts.reject && opts.answer === undefined;
+            if (asking) await sandbox.ping();
             const decision = await resumeDecision(run, opts, prompt);
             if (!decision) {
               // Nobody answered (no terminal, or the owner chose to pause): still waiting, so the same exit as a fresh pause.
@@ -287,33 +295,34 @@ export function createProgram(deps: ProgramDeps = {}): Command {
               process.exitCode = 3;
               return;
             }
-            // The paused run's sandbox, with any --build-proxy or --health-timeout typed again already merged in.
-            sandbox = deps.sandbox ?? new DockerSandbox(run.settings.sandbox ?? {});
-            // The overrides are already in run.settings.
-            resume = { run, ...decision };
+            try {
+              // A resume runs with the paused run's settings (the overrides are already in run.settings), so the
+              // fresh-run options are not passed.
+              report = await resurrect(source, { sandbox, model: run.model, fixCache, onProgress: say, approve, ask, resume: { run, ...decision } });
+            } catch (err) {
+              if (!asking) throw err;
+              throw new Error(`${errorMessage(err)}\nTo carry on with your answer:\n  ${resumeCommand(source, opts)}${overrideFlags(opts, given)} ${decisionFlags(decision)}`);
+            }
           } else {
-            model = opts.tokenBudget > 0 ? chooseModel(opts, deps, noKey) : null;
-            sandbox = chooseSandbox(opts, deps);
+            report = await resurrect(source, {
+              sandbox: chooseSandbox(opts, deps),
+              model: opts.tokenBudget > 0 ? chooseModel(opts, deps, noKey) : null,
+              maxIterations: opts.maxIterations,
+              tokenBudget: opts.tokenBudget,
+              limits: { cpus: opts.cpus, memoryMb: opts.memory, stepTimeoutSec: opts.stepTimeout },
+              exhume: saved?.exhume,
+              graveyard: saved?.graveyard,
+              interview: saved?.interview,
+              fixCache,
+              // Saved with the report for a resume, so made absolute.
+              caFile: opts.caFile === undefined ? undefined : path.resolve(opts.caFile),
+              workdir: opts.workdir,
+              keepImages: opts.keepImages,
+              onProgress: say,
+              approve,
+              ask,
+            });
           }
-          const report = await resurrect(source, {
-            sandbox,
-            model,
-            maxIterations: opts.maxIterations,
-            tokenBudget: opts.tokenBudget,
-            limits: { cpus: opts.cpus, memoryMb: opts.memory, stepTimeoutSec: opts.stepTimeout },
-            exhume: saved?.exhume,
-            graveyard: saved?.graveyard,
-            interview: saved?.interview,
-            fixCache: new FixCache(path.join(path.dirname(store.dir), 'fix-cache.json')),
-            // Saved with the report for a resume, so made absolute.
-            caFile: opts.caFile === undefined ? undefined : path.resolve(opts.caFile),
-            workdir: opts.workdir,
-            keepImages: opts.keepImages,
-            onProgress: say,
-            approve: opts.yes ? async () => 'auto-approve' : prompt ? (request) => askApproval(request, prompt) : async () => 'pause',
-            ask: prompt ? (question) => askQuestion(question, prompt) : undefined,
-            resume,
-          });
           const file = await store.save('resurrect', report);
           if (opts.outDir) {
             await mkdir(opts.outDir, { recursive: true });
@@ -482,7 +491,7 @@ async function resumeDecision(
     return verdict === 'pause' ? null : { approve: verdict === 'approve' };
   }
   if (opts.approve || opts.reject) throw new Error('the saved run is waiting on a question, not a fix; pass --answer "…"');
-  if (opts.answer !== undefined) return { answer: opts.answer };
+  if (opts.answer !== undefined) return { answer: pickChoice(opts.answer, pending.choices) };
   if (!prompt) return null;
   const answer = await askQuestion({ ...pending, attempt: from.resume?.failure.attempt ?? 0 }, prompt);
   return answer === null ? null : { answer };
@@ -508,13 +517,18 @@ async function askApproval(request: ApprovalRequest, prompt: Prompt): Promise<Ap
 async function askQuestion(question: OwnerQuestion, prompt: Prompt): Promise<string | null> {
   process.stderr.write(`\n${question.question}\n${question.context ? `  ${question.context}\n` : ''}${question.choices.map((c, i) => `  ${i + 1}. ${c}\n`).join('')}`);
   const reply = (await prompt(question.choices.length ? 'Pick a number or type your answer (Enter to pause and exit): ' : 'Your answer (Enter to pause and exit): ')).trim();
-  if (!reply) return null;
-  const n = Number(reply);
-  return Number.isInteger(n) && n >= 1 && n <= question.choices.length ? question.choices[n - 1]! : reply;
+  return reply ? pickChoice(reply, question.choices) : null;
 }
 
-/** The flags that get past a failed `resumeSettings` or `checkResumable`, by the `ResumeError` code, to add to its message. */
-function resumeHint(source: string, from: ResurrectReport, err: unknown, settings: RunSettings | undefined): string {
+/** A reply of 1 to n picks that choice, as NEEDS YOU and the prompt number them; any other reply is the answer. */
+function pickChoice(reply: string, choices: string[]): string {
+  const digits = reply.trim();
+  const n = /^\d+$/.test(digits) ? Number(digits) : 0;
+  return n >= 1 && n <= choices.length ? choices[n - 1]! : reply;
+}
+
+/** The flags that get past a failed `checkResumable`, by the `ResumeError` code, to add to its message. */
+function resumeHint(source: string, from: ResurrectReport, overrides: ResumeOverrides, err: unknown): string {
   if (!(err instanceof ResumeError)) return '';
   const question = from.pending?.kind === 'question';
   switch (err.code) {
@@ -527,8 +541,11 @@ function resumeHint(source: string, from: ResurrectReport, err: unknown, setting
       return `; drop --no-llm, or pass -m ${DEFAULT_MODEL} (or another model) to ask one`;
     case 'model-null':
       return `; to add an Anthropic API key, ${credentialsHint()}${question ? '' : ', or pass --no-llm to carry on with known and cached fixes only'}`;
-    case 'model-mismatch':
-      return settings?.model ? `; pass -m ${settings.model} (or another model)` : '; drop -m to resume without a model';
+    case 'model-mismatch': {
+      // Only on this error path: what the resume would run with, to name its model.
+      const model = resumeSettings(from, overrides).model;
+      return model ? `; pass -m ${model} (or another model)` : '; drop -m to resume without a model';
+    }
     case 'model-without-budget':
       return '; pass a larger --token-budget, or drop -m';
     case 'wrong-kind':
@@ -540,9 +557,52 @@ function resumeHint(source: string, from: ResurrectReport, err: unknown, setting
   }
 }
 
+/** The command that resumes the paused run of `source`. */
+function resumeCommand(source: string, opts: { reports?: string }): string {
+  return `necromancer resurrect ${shellArg(source)} --resume${opts.reports ? ` --reports ${shellArg(opts.reports)}` : ''}`;
+}
+
+/** The flags that pass the owner's decision to `--resume` again. */
+function decisionFlags(decision: Pick<ResumeInput, 'approve' | 'answer'>): string {
+  // Always quoted, and never read as a path: an answer may start with a dash.
+  return decision.answer !== undefined ? `--answer ${shellQuote(decision.answer)}` : decision.approve ? '--approve' : '--reject';
+}
+
+/** The overrides typed with `--resume`, as flags to type again; each starts with a space. Mirrors the resume's `overrides`. */
+function overrideFlags(
+  opts: {
+    maxIterations: number;
+    tokenBudget: number;
+    cpus: number;
+    memory: number;
+    stepTimeout: number;
+    llm: boolean;
+    model: string;
+    keepImages?: boolean;
+    workdir?: string;
+    buildProxy?: boolean;
+    healthTimeout: number;
+  },
+  given: (name: string) => boolean,
+): string {
+  const flags: string[] = [];
+  if (given('maxIterations')) flags.push(`-n ${opts.maxIterations}`);
+  if (given('tokenBudget')) flags.push(`--token-budget ${opts.tokenBudget}`);
+  if (given('cpus')) flags.push(`--cpus ${opts.cpus}`);
+  if (given('memory')) flags.push(`--memory ${opts.memory}`);
+  if (given('stepTimeout')) flags.push(`--step-timeout ${opts.stepTimeout}`);
+  if (given('llm') && !opts.llm) flags.push('--no-llm');
+  else if (given('model')) flags.push(`-m ${shellArg(opts.model)}`);
+  if (given('keepImages')) flags.push(opts.keepImages ? '--keep-images' : '--no-keep-images');
+  if (given('workdir')) flags.push(`--workdir ${shellArg(path.resolve(opts.workdir!))}`);
+  if (given('buildProxy')) flags.push(opts.buildProxy ? '--build-proxy' : '--no-build-proxy');
+  if (given('healthTimeout')) flags.push(`--health-timeout ${opts.healthTimeout}`);
+  return flags.map((f) => ` ${f}`).join('');
+}
+
 /** The NEEDS YOU block: what the run is waiting on and the exact commands that carry it on. */
 function needsYou(source: string, pending: PendingDecision, opts: { reports?: string }): string {
-  const command = `necromancer resurrect ${shellArg(source)} --resume${opts.reports ? ` --reports ${shellArg(opts.reports)}` : ''}`;
+  const command = resumeCommand(source, opts);
   if (pending.kind === 'question') {
     return (
       `\nNEEDS YOU: ${pending.question}\n` +

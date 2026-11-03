@@ -390,6 +390,37 @@ describe('buildPlan', () => {
     }
   });
 
+  it('counts a script that loads a subpath of a dependency as using it, but not a package sharing its prefix', () => {
+    const coffee = tomb('coffee-script', { status: 'dead', causes: [{ kind: 'deprecated', detail: 'Deprecated' }] });
+    const planWith = (script: string) => {
+      const manifest = { ...exhume.manifests[0]!, dependencies: { ...exhume.manifests[0]!.dependencies, 'coffee-script': '^1.12.0' }, scripts: { start: script } };
+      return buildPlan({ ...all, graveyard: { ...graveyard, tombstones: [...tombstones, coffee] }, exhume: { ...exhume, manifests: [manifest] } }, { now: NOW });
+    };
+    for (const script of ['node -r coffee-script/register server.js', 'node -e "require(\'coffee-script/register\')"']) {
+      const kept = planWith(script);
+      expect(ids(kept)).not.toContain('remove:coffee-script');
+      expect(kept.leftAlone.find((l) => l.name === 'coffee-script')!.reason).toMatch(/^Used by the start script\. /);
+    }
+    expect(ids(planWith('node -r coffee-script-extra/register server.js'))).toContain('remove:coffee-script');
+  });
+
+  it('leaves alone a scoped package whose subpath a script loads, and a package named like a local directory', () => {
+    const planWith = (name: string, script: string) => {
+      const dead = tomb(name, { status: 'dead', causes: [{ kind: 'deprecated', detail: 'Deprecated' }] });
+      const manifest = { ...exhume.manifests[0]!, dependencies: { ...exhume.manifests[0]!.dependencies, [name]: '^1.0.0' }, scripts: { start: script } };
+      return buildPlan({ ...all, graveyard: { ...graveyard, tombstones: [...tombstones, dead] }, exhume: { ...exhume, manifests: [manifest] } }, { now: NOW });
+    };
+    // A scoped name followed by a subpath counts as used; a different package under the same scope does not.
+    const scoped = planWith('@scope/pkg', 'node -r @scope/pkg/register server.js');
+    expect(ids(scoped)).not.toContain('remove:@scope/pkg');
+    expect(scoped.leftAlone.find((l) => l.name === '@scope/pkg')!.reason).toMatch(/^Used by the start script\. /);
+    expect(ids(planWith('@scope/pkg', 'node -r @scope/pkg-extra/register server.js'))).toContain('remove:@scope/pkg');
+    // Accepted trade-off: a dependency named like a local directory counts as used, so it is kept rather than removed.
+    const local = planWith('config', 'node config/setup.js');
+    expect(ids(local)).not.toContain('remove:config');
+    expect(local.leftAlone.find((l) => l.name === 'config')!.reason).toMatch(/^Used by the start script\. /);
+  });
+
   it('does not remove a package that is loaded by name, and lists those files', () => {
     const jade = tomb('jade', { status: 'dead', causes: [{ kind: 'deprecated', detail: 'Deprecated: renamed to pug' }] });
     const manifest = { ...exhume.manifests[0]!, dependencies: { ...exhume.manifests[0]!.dependencies, jade: '^1.11.0' } };

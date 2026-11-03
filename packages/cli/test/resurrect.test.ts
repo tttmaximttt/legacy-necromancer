@@ -1,5 +1,5 @@
 import { mkdirSync, writeFileSync } from 'node:fs';
-import { mkdtemp, readFile } from 'node:fs/promises';
+import { mkdtemp, readFile, rm } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
@@ -197,6 +197,56 @@ describe('necromancer resurrect', () => {
     expect((await new ReportStore(reports).load(path.basename(root)))!.resurrect!.outcome).toBe('resurrected');
   });
 
+  it('maps a numeric --answer to the numbered choice, as the prompt does', async () => {
+    const root = await deadApp(expressMongoApp);
+    const reports = path.join(await mkdtemp(path.join(os.tmpdir(), 'necro-cli-res-')), 'reports');
+    vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+    const cli = (sandbox: FakeSandbox, model: ScriptedModel, ...args: string[]) =>
+      createProgram({ sandbox, model, prompt: null }).parseAsync(['node', 'necromancer', 'resurrect', root, '--reports', reports, '-q', ...args]);
+    const pause = () => cli(new FakeSandbox({ install: [{ ok: false, log: PRIVATE }] }), new ScriptedModel(question));
+    const lastResume = () => vi.mocked(resurrect).mock.calls.at(-1)![1].resume!;
+
+    await pause();
+    const model = new ScriptedModel(setEnv);
+    await cli(new FakeSandbox({}), model, '--resume', '--answer', '2');
+    expect(lastResume().answer).toBe('drop the feature');
+    expect(model.requests[0]!.prompt).toContain('The owner answered your question: drop the feature');
+    // A number with no choice of its own is the answer as typed.
+    await pause();
+    await cli(new FakeSandbox({}), new ScriptedModel(setEnv), '--resume', '--answer', '3');
+    expect(lastResume().answer).toBe('3');
+    // Only plain digits are a choice number.
+    await pause();
+    await cli(new FakeSandbox({}), new ScriptedModel(setEnv), '--resume', '--answer', '1.0');
+    expect(lastResume().answer).toBe('1.0');
+  });
+
+  it('checks Docker before asking on --resume, and says how to pass the answer again when the run fails before using it', async () => {
+    const root = await deadApp(expressMongoApp);
+    const reports = path.join(await mkdtemp(path.join(os.tmpdir(), 'necro-cli-res-')), 'reports');
+    vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+    await createProgram({ sandbox: new FakeSandbox({ install: [{ ok: false, log: PRIVATE }] }), model: new ScriptedModel(question), prompt: null }).parseAsync([
+      'node', 'necromancer', 'resurrect', root, '--reports', reports, '-q',
+    ]);
+    expect(process.exitCode).toBe(3);
+    const asked: string[] = [];
+    const prompt = async (q: string) => (asked.push(q), '1');
+    const resume = (sandbox: FakeSandbox) =>
+      createProgram({ sandbox, model: new ScriptedModel(setEnv), prompt }).parseAsync(['node', 'necromancer', 'resurrect', root, '--reports', reports, '-q', '--resume', '-n', '6']);
+
+    const down = Object.assign(new FakeSandbox({}), { ping: async () => Promise.reject(new Error('Docker is not reachable')) });
+    await expect(resume(down)).rejects.toThrow('Docker is not reachable');
+    expect(asked).toEqual([]);
+
+    // The repo is gone, so the checkout fails after the owner answered: the error carries the answer on, with -n.
+    await rm(root, { recursive: true, force: true });
+    await expect(resume(new FakeSandbox({}))).rejects.toThrow(
+      new RegExp(`could not clone[^]*\\nTo carry on with your answer:\\n  necromancer resurrect ${root} --resume --reports ${reports} -n 6 --answer 'stub it'$`),
+    );
+    expect(asked).toHaveLength(1);
+    expect((await new ReportStore(reports).load(path.basename(root)))!.resurrect!.outcome).toBe('needs-you');
+  });
+
   it('keeps the paused run\'s limits on --resume unless -n or --token-budget is given again', async () => {
     const root = await deadApp(expressMongoApp);
     const reports = path.join(await mkdtemp(path.join(os.tmpdir(), 'necro-cli-res-')), 'reports');
@@ -209,6 +259,8 @@ describe('necromancer resurrect', () => {
     expect(process.exitCode).toBe(3);
     await cli(new FakeSandbox({}), '--resume', '--approve');
     expect(lastResume()).toMatchObject({ approve: true, run: { settings: { maxIterations: 4, tokenBudget: 1000 } } });
+    // A resume runs on the paused run's settings, so none of the fresh-run options is passed.
+    expect(Object.keys(vi.mocked(resurrect).mock.calls.at(-1)![1]).sort()).toEqual(['approve', 'ask', 'fixCache', 'model', 'onProgress', 'resume', 'sandbox']);
 
     await cli(pausing(reports));
     await cli(new FakeSandbox({}), '--resume', '--approve', '-n', '6', '--token-budget', '2000');

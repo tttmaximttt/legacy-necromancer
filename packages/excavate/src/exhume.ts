@@ -36,8 +36,13 @@ export async function exhume(source: string, options: ExhumeOptions = {}): Promi
   try {
     const allFiles = await listRepoFiles(repo.root);
     const sourcePaths = allFiles.filter((f) => languageFor(f));
-    log(`parsing ${sourcePaths.length} source files`);
 
+    log('auditing install scripts');
+    const { findings, manifests } = await auditManifests(repo.root, allFiles);
+    // Packages loaded by name rather than imported: `app.set('view engine', 'jade')`, `require.resolve('x')`.
+    const declared = new Set(manifests.flatMap((m) => [...Object.keys(m.dependencies), ...Object.keys(m.devDependencies)]));
+
+    log(`parsing ${sourcePaths.length} source files`);
     const parser = await ImportParser.create();
     const resolver = new ImportResolver(allFiles, await readMains(repo.root, allFiles));
     const files: SourceFile[] = [];
@@ -59,7 +64,8 @@ export async function exhume(source: string, options: ExhumeOptions = {}): Promi
           isTest: isTestFile(rel),
           imports: parsed.imports.map((imp) => resolver.resolve(rel, imp)),
         });
-        if (parsed.names.length) namesByFile.set(rel, parsed.names);
+        const named = parsed.names.filter((n) => declared.has(n));
+        if (named.length) namesByFile.set(rel, named);
         if (parsed.routes.length && !isTestFile(rel)) routesByFile.set(rel, parsed.routes);
         const mounts = parsed.mounts.flatMap((m) => {
           const r = resolver.resolve(rel, { specifier: m.specifier, kind: 'require', line: m.line });
@@ -83,9 +89,6 @@ export async function exhume(source: string, options: ExhumeOptions = {}): Promi
       includeTests: options.includeTests,
     });
 
-    log('auditing install scripts');
-    const { findings, manifests } = await auditManifests(repo.root, allFiles);
-
     const external = new Map<string, Set<string>>();
     const caseMismatches: ExhumeReport['caseMismatches'] = [];
     let unresolved = 0;
@@ -102,12 +105,9 @@ export async function exhume(source: string, options: ExhumeOptions = {}): Promi
       }
     }
 
-    // Packages loaded by name rather than imported: `app.set('view engine', 'jade')`, `require.resolve('x')`.
-    const declared = new Set(manifests.flatMap((m) => [...Object.keys(m.dependencies), ...Object.keys(m.devDependencies)]));
     const referenced = new Map<string, Set<string>>();
     for (const [file, names] of namesByFile) {
       for (const name of names) {
-        if (!declared.has(name)) continue;
         let files = referenced.get(name);
         if (!files) referenced.set(name, (files = new Set()));
         files.add(file);
@@ -126,7 +126,7 @@ export async function exhume(source: string, options: ExhumeOptions = {}): Promi
         files: files.length,
         loc: files.reduce((n, f) => n + f.loc, 0),
         internalEdges: graph.size,
-        externalPackages: external.size,
+        externalPackages: packageNames.length,
         unresolvedImports: unresolved,
         caseMismatchedImports: caseMismatches.length,
         testFiles: files.filter((f) => f.isTest).length,

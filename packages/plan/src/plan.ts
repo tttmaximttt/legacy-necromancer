@@ -371,7 +371,7 @@ function usageOf(exhume: ExhumeReport | null): (name: string) => Usage {
   const scripts = exhume.manifests.flatMap((m) => Object.entries(m.scripts ?? {}));
   return (name) => {
     const p = imported.get(name);
-    const names = new RegExp(`(^|[^\\w@/.-])${escape(name)}($|[^\\w/.-])`);
+    const names = new RegExp(`(^|[^\\w@/.-])${escape(name)}($|[^\\w.-])`);
     return {
       importedBy: p ? p.importedBy : declared.has(name) ? 0 : null,
       importers: [...(p?.importers ?? [])].sort(compare),

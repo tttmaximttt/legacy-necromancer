@@ -14,6 +14,7 @@ import {
   type InterviewReport,
   type PendingDecision,
   type ReportKind,
+  type ResurrectReport,
 } from '@necromancer/core';
 import { exhume as runExhume, type ExhumeOptions } from '@necromancer/excavate';
 import { graveyard as runGraveyard, type GraveyardOptions } from '@necromancer/graveyard';
@@ -30,7 +31,7 @@ import {
   resumeSettings,
   resurrect,
   type ResumeInput,
-  type RunSettings,
+  type ResurrectOptions,
   type Sandbox,
 } from '@necromancer/resurrect';
 import { compareWitness, witness } from '@necromancer/witness';
@@ -301,42 +302,62 @@ export function createServer(options: ServerOptions = {}): McpServer {
         if ((approve !== undefined || answer !== undefined) && !resume) throw new Error('approve and answer go with resume: true; without it the paused run would be replaced by a new one.');
         if (approve !== undefined && answer !== undefined) throw new Error('pass approve for a pending fix or answer for a pending question, not both.');
         const saved = await loadSaved(source);
-        let settings: RunSettings | undefined;
+        const fixCache = new FixCache(path.join(path.dirname(store.dir), 'fix-cache.json'));
+        const onProgress = progressReporter(extra);
+        const approveFix: ResurrectOptions['approve'] = approvals === 'all' ? async () => 'auto-approve' : async () => 'pause';
+        let report: ResurrectReport;
+        let model: StructuredModel | null;
+        // Whether a model was wanted and there is no key to build it, so only known fixes were tried.
+        let noKey = false;
         if (resume) {
           // A blank answer is an empty reply, not the user's answer: say so rather than pausing again.
           if (answer !== undefined && !answer.trim()) throw new Error('answer is empty; pass what the user said, or ask them again.');
-          if (!saved?.resurrect) throw new Error('No resurrect report for this source; call `resurrect` without resume first.');
-          // Only to know which model to build; prepareResume below does the checks, once.
-          settings = resumeSettings(saved.resurrect, { maxIterations, tokenBudget });
+          const from = saved?.resurrect;
+          if (!from) throw new Error('No resurrect report for this source; call `resurrect` without resume first.');
+          // A resumed run asks the model the paused run asked, or none when it asked none; limits the caller did not
+          // give stay as the paused run had them.
+          const overrides = { maxIterations, tokenBudget };
+          let input: ResumeInput;
+          try {
+            input = prepareResume(from, { model: (name) => defaultModel(name), overrides, approve, answer });
+          } catch (err) {
+            // Only on this error path: the model the paused run asked, which could not be built without a key.
+            const wanted = err instanceof ResumeError && err.code === 'model-null' ? resumeSettings(from, overrides).model : null;
+            if (!wanted) throw err;
+            throw new Error(
+              `the paused run asked ${wanted} for fixes, and there is no Anthropic API key; to add one, ${credentialsHint()}` +
+                (from.pending?.kind === 'approval' ? ', or call again with tokenBudget: 0 to carry on with known and cached fixes only.' : '.'),
+            );
+          }
+          model = input.run.model;
+          // A resume runs with the paused run's settings, so the fresh-run options are not passed; its sandbox is set
+          // up as the paused run's was.
+          report = await resurrect(source, {
+            sandbox: options.sandbox ?? new DockerSandbox(input.run.settings.sandbox ?? {}),
+            model,
+            fixCache,
+            onProgress,
+            approve: approveFix,
+            resume: input,
+          });
+        } else {
+          const wanted = (tokenBudget ?? DEFAULT_TOKEN_BUDGET) > 0;
+          model = wanted ? defaultModel() : null;
+          noKey = wanted && !model;
+          report = await resurrect(source, {
+            sandbox: defaultSandbox(),
+            model,
+            maxIterations: maxIterations ?? DEFAULT_MAX_ITERATIONS,
+            tokenBudget: tokenBudget ?? DEFAULT_TOKEN_BUDGET,
+            exhume: saved?.exhume,
+            graveyard: saved?.graveyard,
+            interview: saved?.interview,
+            fixCache,
+            workdir: options.workdir,
+            onProgress,
+            approve: approveFix,
+          });
         }
-        // A resumed run asks the model the paused run asked, or none when it asked none.
-        const wanted = settings ? settings.model : (tokenBudget ?? DEFAULT_TOKEN_BUDGET) > 0 ? undefined : null;
-        const model = wanted === null ? null : defaultModel(wanted);
-        if (settings && wanted && !model) {
-          throw new Error(
-            `the paused run asked ${wanted} for fixes, and there is no Anthropic API key; to add one, ${credentialsHint()}` +
-              (saved!.resurrect!.pending?.kind === 'approval' ? ', or call again with tokenBudget: 0 to carry on with known and cached fixes only.' : '.'),
-          );
-        }
-        // Limits the caller did not give stay as the paused run had them.
-        const from: ResumeInput | undefined = settings
-          ? prepareResume(saved!.resurrect!, { model, overrides: { maxIterations, tokenBudget }, approve, answer })
-          : undefined;
-        const report = await resurrect(source, {
-          // A resumed run's sandbox is set up as the paused run's was.
-          sandbox: from ? (options.sandbox ?? new DockerSandbox(from.run.settings.sandbox ?? {})) : defaultSandbox(),
-          model,
-          maxIterations: maxIterations ?? DEFAULT_MAX_ITERATIONS,
-          tokenBudget: tokenBudget ?? DEFAULT_TOKEN_BUDGET,
-          exhume: saved?.exhume,
-          graveyard: saved?.graveyard,
-          interview: saved?.interview,
-          fixCache: new FixCache(path.join(path.dirname(store.dir), 'fix-cache.json')),
-          workdir: options.workdir,
-          onProgress: progressReporter(extra),
-          approve: approvals === 'all' ? async () => 'auto-approve' : async () => 'pause',
-          resume: from,
-        });
         const paused = report.outcome === 'needs-you' && report.pending;
         return text({
           outcome: report.outcome === 'resurrected' ? 'RESURRECTED' : paused ? 'NEEDS YOU' : `BLOCKED: ${report.blockedReason}`,
@@ -353,7 +374,7 @@ export function createServer(options: ServerOptions = {}): McpServer {
           warnings: report.warnings,
           dockerfile: report.dockerfile,
           compose: report.compose,
-          ...(!model && wanted !== null && { note: `No Anthropic API key, so only known fixes were tried. To add one, ${credentialsHint()}.` }),
+          ...(noKey && { note: `No Anthropic API key, so only known fixes were tried. To add one, ${credentialsHint()}.` }),
           // A resumed run replaces the saved needs-you report, which resume would otherwise read again.
           ...((save || paused || resume) && (await saveNote('resurrect', report))),
         });
@@ -543,7 +564,8 @@ function pendingSummary(pending: PendingDecision) {
 function nextStep(pending: PendingDecision): string {
   return pending.kind === 'question'
     ? 'Ask the user this question in their own words, offering the choices but accepting any answer. Then call resurrect ' +
-        'again with the same source, resume: true and answer set to what they said. Do not answer for them, and do not ' +
+        'again with the same source, resume: true and answer set to what they said (for a choice, its text, not its number). ' +
+        'Do not answer for them, and do not ' +
         'ask them for passwords, keys or other secrets.'
     : 'Show the user the fix and what it would change (risks), and ask whether to apply it. Then call resurrect again ' +
         'with the same source, resume: true and approve: true to apply it, or approve: false to decline it and look for ' +

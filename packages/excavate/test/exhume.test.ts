@@ -93,7 +93,9 @@ describe('exhume', () => {
       { name: 'jade', importedBy: 0, importers: [], referencedBy: ['server.js'], referenceCount: 1 },
     ]);
     expect(report.externalPackages[0]).not.toHaveProperty('referencedBy');
-    expect(report.stats.externalPackages).toBe(3);
+    // Counts every listed package, referenced-only ones included.
+    expect(report.stats.externalPackages).toBe(report.externalPackages.length);
+    expect(report.stats.externalPackages).toBe(4);
     expect(report.manifests[0]).toMatchObject({ name: 'old-app', engines: { node: '0.10.x' }, scripts: { postinstall: expect.any(String) } });
     expect(report.graph.edges).toContainEqual(['routes/users.js', 'lib/db.js']);
     expect(report.graph.nodes.find((n) => n.id === 'test/users.test.js')).toMatchObject({ isTest: true, cluster: -1, score: null });

@@ -337,7 +337,8 @@ necromancer resurrect <repo> --resume --answer "stub it"
 A resumed run keeps the paused run's settings (model or `--no-llm`, limits,
 `--keep-images`, `--workdir`, `--build-proxy`, `--health-timeout`); only the
 flags you type again change them, and `--no-build-proxy` turns the proxy off.
-Claude turns your answer into a fix, so `--answer` needs an API key.
+Claude turns your answer into a fix, so `--answer` needs an API key. When the
+question lists numbered choices, `--answer 2` picks the second one.
 
 Through MCP, the agent you're talking to asks you instead and carries on
 with your answer.
