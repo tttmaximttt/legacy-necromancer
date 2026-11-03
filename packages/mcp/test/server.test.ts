@@ -304,6 +304,26 @@ describe('necromancer MCP resurrect', () => {
     expect(lastResume()).toMatchObject({ approve: true, maxIterations: 6, tokenBudget: 0 });
   });
 
+  it('decides on a model from the paused run\'s budget on resume', async () => {
+    const root = await deadApp(expressMongoApp);
+    const store = new ReportStore(path.join(await mkdtemp(path.join(os.tmpdir(), 'necro-mcp-')), 'reports'));
+    const lastModel = () => vi.mocked(resurrect).mock.calls.at(-1)![1].model;
+    const pause = async () =>
+      (await connect({ store, model: new ScriptedModel(), sandbox: new FakeSandbox({ install: [{ ok: false, log: NODE_GYP_LOG }] }) })).callTool({
+        name: 'resurrect',
+        arguments: { source: root, tokenBudget: 0 },
+      });
+    const client = await connect({ store, model: new ScriptedModel(), sandbox: new FakeSandbox({}) });
+
+    await pause();
+    await client.callTool({ name: 'resurrect', arguments: { source: root, resume: true, approve: true } });
+    expect(lastModel()).toBeNull();
+
+    await pause();
+    await client.callTool({ name: 'resurrect', arguments: { source: root, resume: true, approve: true, tokenBudget: 1000 } });
+    expect(lastModel()).toBeInstanceOf(ScriptedModel);
+  });
+
   it('pauses on a question and passes the answer on when resumed', async () => {
     const root = await deadApp(expressMongoApp);
     // A store of its own, so the model fix it learns stays out of the shared fix cache.
@@ -329,6 +349,12 @@ describe('necromancer MCP resurrect', () => {
 
     const model = new ScriptedModel({ diagnosis: 'stub it', decision: 'fix', ops: [{ op: 'setEnv', name: 'ACME_STUB', value: '1' }], blockedReason: null, question: null, choices: [] });
     const client = await connect({ store, sandbox: new FakeSandbox({}), model });
+    for (const blank of ['', '  ']) {
+      const empty = await client.callTool({ name: 'resurrect', arguments: { source: root, resume: true, answer: blank } });
+      expect(empty.isError).toBe(true);
+      expect(text(empty)).toContain('answer is empty');
+    }
+    expect((await store.load(path.basename(root)))!.resurrect!.outcome).toBe('needs-you');
     const resumed = JSON.parse(text(await client.callTool({ name: 'resurrect', arguments: { source: root, resume: true, answer: 'stub it' } })));
     expect(resumed.outcome).toBe('RESURRECTED');
     expect(model.requests[0]!.prompt).toContain('The owner answered your question: stub it');

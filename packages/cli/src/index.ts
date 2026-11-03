@@ -6,7 +6,7 @@ import { createRequire } from 'node:module';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 import { Command } from 'commander';
-import { ReportStore, shellArg, slugFor, type PendingDecision, type ReportKind, type ResurrectReport } from '@necromancer/core';
+import { errorMessage, ReportStore, shellArg, slugFor, type PendingDecision, type ReportKind, type ResurrectReport } from '@necromancer/core';
 import { exhume } from '@necromancer/excavate';
 import { runStdio } from '@necromancer/mcp';
 import { graveyard } from '@necromancer/graveyard';
@@ -17,13 +17,16 @@ import {
   DEFAULT_MAX_ITERATIONS,
   DEFAULT_TOKEN_BUDGET,
   DockerSandbox,
+  checkResumable,
   firstError,
   FixCache,
   resurrect,
+  resumeSettings,
   type ApprovalAnswer,
   type ApprovalRequest,
   type OwnerQuestion,
   type ResumeInput,
+  type ResumeOverrides,
   type Sandbox,
 } from '@necromancer/resurrect';
 import { compareWitness, witness } from '@necromancer/witness';
@@ -222,51 +225,64 @@ export function createProgram(deps: ProgramDeps = {}): Command {
       ) => {
         if ((opts.approve || opts.reject || opts.answer !== undefined) && !opts.resume) throw new Error('--approve, --reject and --answer go with --resume');
         if (opts.approve && opts.reject) throw new Error('pass --approve or --reject, not both');
+        // A blank answer would otherwise read as "nobody answered" and exit 3, so a script would loop on it.
+        if (opts.answer !== undefined && !opts.answer.trim()) throw new Error('--answer is empty; pass the answer text');
+        if (opts.resume && opts.caFile !== undefined) throw new Error("--ca-file does not go with --resume: the paused run's CA file is reused");
         const store = new ReportStore(opts.reports);
         const saved = await store.load(slugFor(source));
         const io = terminalIo();
         const prompt = deps.prompt !== undefined ? deps.prompt : io.ask;
         try {
           const say = progress(opts, '☥');
-          // The paused run's limits stand unless -n or --token-budget is given again.
+          const noKey = () => say?.(`no Anthropic API key, so only known fixes will be tried (to add one, ${credentialsHint()})`);
+          // On a resume the paused run's settings stand, except for the flags typed again.
           const given = (name: string) => command.getOptionValueSource(name) === 'cli';
-          const limits = {
-            maxIterations: given('maxIterations') ? opts.maxIterations : undefined,
-            tokenBudget: given('tokenBudget') ? opts.tokenBudget : undefined,
-          };
-          // The budget the run will actually have: on a resume, the saved one unless overridden.
-          const budget = opts.resume ? (limits.tokenBudget ?? saved?.resurrect?.resume?.tokenBudget ?? opts.tokenBudget) : opts.tokenBudget;
-          const model =
-            budget > 0 ? chooseModel(opts, deps, () => say?.(`no Anthropic API key, so only known fixes will be tried (to add one, ${credentialsHint()})`)) : null;
+          let model: StructuredModel | null;
+          let sandbox: Sandbox;
           let resume: ResumeInput | undefined;
           if (opts.resume) {
             const from = saved?.resurrect;
             if (!from) throw new Error(`no resurrect report for ${source}; run \`necromancer resurrect ${shellArg(source)}\` first`);
+            const overrides: ResumeOverrides = {
+              maxIterations: given('maxIterations') ? opts.maxIterations : undefined,
+              tokenBudget: given('tokenBudget') ? opts.tokenBudget : undefined,
+              limits: {
+                cpus: given('cpus') ? opts.cpus : undefined,
+                memoryMb: given('memory') ? opts.memory : undefined,
+                stepTimeoutSec: given('stepTimeout') ? opts.stepTimeout : undefined,
+              },
+            };
+            // Older reports did not save every setting; the flags' values stand in for what is missing.
+            const fallback = { maxIterations: opts.maxIterations, tokenBudget: opts.tokenBudget };
+            const settings = resumeSettings(from, overrides, fallback);
+            // A pending question always needs a model, so the check below can say whether it is the key or the budget that is missing.
+            model = settings.tokenBudget > 0 || from.pending?.kind === 'question' ? chooseModel(opts, deps, noKey) : null;
             // Everything that can stop the resume is checked before asking, so an answer is never thrown away.
-            if (from.outcome !== 'needs-you' || !from.pending || !from.resume) {
-              throw new Error(
-                from.outcome === 'needs-you'
-                  ? `the saved run is missing the state it needs to carry on; run \`necromancer resurrect ${shellArg(source)}\` without --resume to start again`
-                  : `the saved run is not waiting on you (it ended ${from.outcome}); run \`necromancer resurrect ${shellArg(source)}\` without --resume to start again`,
-              );
-            }
-            if (from.pending.kind === 'question') {
-              if (budget <= from.resume.tokens) {
-                throw new Error(`answering the pending question needs a model, but the token budget of ${budget} is already spent (${from.resume.tokens} used); pass a larger --token-budget`);
-              }
-              if (!model) throw new Error('answering the pending question needs a model to turn the answer into a fix; set an Anthropic API key and drop --no-llm');
+            try {
+              checkResumable(from, { model, ...fallback, resume: overrides });
+            } catch (err) {
+              throw new Error(`${errorMessage(err)}${resumeHint(source, from, model)}`);
             }
             const decision = await resumeDecision(from, opts, prompt);
             if (!decision) {
               // Nobody answered (no terminal, or the owner chose to pause): still waiting, so the same exit as a fresh pause.
-              process.stderr.write(needsYou(source, from.pending, opts));
+              process.stderr.write(needsYou(source, from.pending!, opts));
               process.exitCode = 3;
               return;
             }
-            resume = { from, ...decision, ...limits };
+            sandbox =
+              deps.sandbox ??
+              new DockerSandbox({
+                buildProxy: given('buildProxy') ? opts.buildProxy : settings.sandbox?.buildProxy,
+                healthTimeoutSec: given('healthTimeout') ? opts.healthTimeout : (settings.sandbox?.healthTimeoutSec ?? opts.healthTimeout),
+              });
+            resume = { from, ...decision, ...overrides };
+          } else {
+            model = opts.tokenBudget > 0 ? chooseModel(opts, deps, noKey) : null;
+            sandbox = chooseSandbox(opts, deps);
           }
           const report = await resurrect(source, {
-            sandbox: chooseSandbox(opts, deps),
+            sandbox,
             model,
             maxIterations: opts.maxIterations,
             tokenBudget: opts.tokenBudget,
@@ -275,7 +291,8 @@ export function createProgram(deps: ProgramDeps = {}): Command {
             graveyard: saved?.graveyard,
             interview: saved?.interview,
             fixCache: new FixCache(path.join(path.dirname(store.dir), 'fix-cache.json')),
-            caFile: opts.caFile,
+            // Saved with the report for a resume, so made absolute.
+            caFile: opts.caFile === undefined ? undefined : path.resolve(opts.caFile),
             workdir: opts.workdir,
             keepImages: opts.keepImages,
             onProgress: say,
@@ -450,7 +467,7 @@ async function resumeDecision(
     return verdict === 'pause' ? null : { approve: verdict === 'approve' };
   }
   if (opts.approve || opts.reject) throw new Error('the saved run is waiting on a question, not a fix; pass --answer "…"');
-  if (opts.answer?.trim()) return { answer: opts.answer };
+  if (opts.answer !== undefined) return { answer: opts.answer };
   if (!prompt) return null;
   const answer = await askQuestion({ ...pending, attempt: from.resume?.failure.attempt ?? 0 }, prompt);
   return answer === null ? null : { answer };
@@ -479,6 +496,15 @@ async function askQuestion(question: OwnerQuestion, prompt: Prompt): Promise<str
   if (!reply) return null;
   const n = Number(reply);
   return Number.isInteger(n) && n >= 1 && n <= question.choices.length ? question.choices[n - 1]! : reply;
+}
+
+/** The flags that get past a failed `checkResumable`, to add to its message. */
+function resumeHint(source: string, from: ResurrectReport, model: StructuredModel | null): string {
+  if (from.outcome !== 'needs-you' || !from.pending || !from.resume) {
+    return ` (\`necromancer resurrect ${shellArg(source)}\` without --resume starts a new run)`;
+  }
+  if (from.pending.kind !== 'question') return '';
+  return model ? '; pass a larger --token-budget' : '; set an Anthropic API key and drop --no-llm';
 }
 
 /** The NEEDS YOU block: what the run is waiting on and the exact commands that carry it on. */

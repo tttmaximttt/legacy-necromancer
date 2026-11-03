@@ -1,4 +1,5 @@
 import type { BuildRecipe, FixRisk, RecipeOp } from '@necromancer/core';
+import { nodeLine } from '@necromancer/core';
 
 /** Install flags that change what gets installed or skip its safety checks. Others (--legacy-peer-deps, --ignore-engines) only relax resolution. */
 const RISKY_FLAGS: Record<string, string> = {
@@ -9,24 +10,26 @@ const RISKY_FLAGS: Record<string, string> = {
   '--unsafe-perm': 'runs install scripts as root',
 };
 
-/** Variables that change where or how packages are installed, or how Node runs everything. */
-const RISKY_ENV = /^npm_config_|^yarn_|^NODE_TLS_REJECT_UNAUTHORIZED$|^NODE_OPTIONS$/i;
+/** Variables that change what gets installed, how Node runs, or which programs and libraries every process loads. */
+const RISKY_ENV: Record<string, string> = {
+  NODE_ENV: 'changes what gets installed and how the app runs (production skips devDependencies)',
+  NODE_OPTIONS: 'changes how Node runs every script',
+  NODE_TLS_REJECT_UNAUTHORIZED: 'turns off TLS certificate checks',
+  NODE_PATH: 'changes where Node looks for modules',
+  NODE_EXTRA_CA_CERTS: 'changes which TLS certificates Node trusts',
+  PATH: 'changes which programs every command runs',
+  LD_PRELOAD: 'loads a library into every process',
+  LD_LIBRARY_PATH: 'changes which shared libraries every process loads',
+};
 
-function envRisk(name: string): string {
-  if (/^NODE_TLS_REJECT_UNAUTHORIZED$/i.test(name)) return 'turns off TLS certificate checks';
-  if (/^NODE_OPTIONS$/i.test(name)) return 'changes how Node runs every script';
-  return 'changes how npm installs';
-}
-
-/**
- * The Node release line an image tag is on: the major ("14" for "14.21-slim"), or for 0.x the minor too, since
- * 0.10 and 0.12 are different lines ("0.10" for "node:0.10.48-slim"). null for tags that name no version, like
- * "lts", "latest" or codenames such as "argon".
- */
-export function nodeLine(image: string): string | null {
-  const m = /^(?:node:)?(\d+)(?:\.(\d+))?/.exec(image);
-  if (!m) return null;
-  return m[1] === '0' ? (m[2] === undefined ? null : `0.${Number(m[2])}`) : String(Number(m[1]));
+/** Why setting a variable needs the owner's OK, or null when it only tunes the sandbox. Also flags any npm_config_*, yarn_* or NODE_* variable. */
+function envRisk(name: string): string | null {
+  const upper = name.toUpperCase();
+  if (Object.hasOwn(RISKY_ENV, upper)) return RISKY_ENV[upper]!;
+  if (upper.startsWith('NPM_CONFIG_')) return 'changes how npm installs';
+  if (upper.startsWith('YARN_')) return 'changes how yarn installs';
+  if (upper.startsWith('NODE_')) return 'changes how Node runs';
+  return null;
 }
 
 /** Whether moving between two image tags changes the Node release line. A tag with no version counts as a change unless it is the same tag. */
@@ -82,9 +85,11 @@ export function fixRisks(recipe: BuildRecipe, ops: RecipeOp[]): FixRisk[] {
       case 'setStartCommand':
         add(op, op.command === null ? 'stops booting the app and only loads it as a library' : `changes the start command to: ${op.command}`);
         break;
-      case 'setEnv':
-        if (RISKY_ENV.test(op.name)) add(op, `${envRisk(op.name)}: ${op.name}=${op.value}`);
+      case 'setEnv': {
+        const reason = envRisk(op.name);
+        if (reason) add(op, `${reason}: ${op.name}=${op.value}`);
         break;
+      }
       case 'setPort':
       case 'useDebianArchive':
         break;

@@ -20,7 +20,7 @@ import { graveyard as runGraveyard, type GraveyardOptions } from '@necromancer/g
 import { buildPlan, renderPlanMarkdown } from '@necromancer/plan';
 import { answerInterview, interviewBrief, proposeIntent, ProposalSchema, recordProposal } from '@necromancer/interview';
 import { ClaudeModel, credentialsHint, hasCredentials, type StructuredModel } from '@necromancer/llm';
-import { DEFAULT_MAX_ITERATIONS, DEFAULT_TOKEN_BUDGET, DockerSandbox, FixCache, resurrect, type ResumeInput, type Sandbox } from '@necromancer/resurrect';
+import { DEFAULT_MAX_ITERATIONS, DEFAULT_TOKEN_BUDGET, DockerSandbox, FixCache, resumeSettings, resurrect, type ResumeInput, type RunSettings, type Sandbox } from '@necromancer/resurrect';
 import { compareWitness, witness } from '@necromancer/witness';
 
 export interface ServerOptions {
@@ -285,15 +285,20 @@ export function createServer(options: ServerOptions = {}): McpServer {
       try {
         const saved = await loadSaved(source);
         let from: ResumeInput | undefined;
+        let settings: RunSettings | undefined;
         if (resume) {
+          // A blank answer is an empty reply, not the user's answer: say so rather than pausing again.
+          if (answer !== undefined && !answer.trim()) throw new Error('answer is empty; pass what the user said, or ask them again.');
           if (!saved?.resurrect) throw new Error('No resurrect report for this source; call `resurrect` without resume first.');
           // Limits the caller did not give stay as the paused run had them.
           from = { from: saved.resurrect, approve, answer, maxIterations, tokenBudget };
+          settings = resumeSettings(saved.resurrect, { maxIterations, tokenBudget });
         }
-        const budget = tokenBudget ?? (from ? (from.from.resume?.tokenBudget ?? DEFAULT_TOKEN_BUDGET) : DEFAULT_TOKEN_BUDGET);
+        const budget = settings ? settings.tokenBudget : (tokenBudget ?? DEFAULT_TOKEN_BUDGET);
         const model = budget > 0 ? defaultModel() : null;
         const report = await resurrect(source, {
-          sandbox: defaultSandbox(),
+          // A resumed run's sandbox is set up as the paused run's was.
+          sandbox: settings ? (options.sandbox ?? new DockerSandbox(settings.sandbox ?? {})) : defaultSandbox(),
           model,
           maxIterations: maxIterations ?? DEFAULT_MAX_ITERATIONS,
           tokenBudget: tokenBudget ?? DEFAULT_TOKEN_BUDGET,

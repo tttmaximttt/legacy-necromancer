@@ -153,9 +153,9 @@ export const KNOWN_FIXES: KnownFix[] = [
   },
 ];
 
-/** The first known fix that matches and changes something, leaving out the ids in `skip` (e.g. fixes the owner declined). */
-export function findKnownFix(ctx: FailureContext, skip?: ReadonlySet<string>): KnownFix | null {
-  return KNOWN_FIXES.find((f) => !skip?.has(f.id) && f.matches(ctx) && changesRecipe(ctx.recipe, f.ops(ctx))) ?? null;
+/** The first known fix that matches the failure and changes the recipe, passing over any that `skip` turns down. */
+export function findKnownFix(ctx: FailureContext, skip?: (fix: KnownFix, ops: RecipeOp[]) => boolean): KnownFix | null {
+  return KNOWN_FIXES.find((f) => f.matches(ctx) && changesRecipe(ctx.recipe, f.ops(ctx)) && !skip?.(f, f.ops(ctx))) ?? null;
 }
 
 // eslint-disable-next-line no-control-regex

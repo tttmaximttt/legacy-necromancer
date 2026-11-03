@@ -211,6 +211,15 @@ describe('buildPlan', () => {
     expect(fromEra.why.join(' ')).toContain('The project targets Node 0.10; this starts from Node 0.10, before the 4.x line.');
   });
 
+  it('falls back to the era release when the image tag names no Node line', () => {
+    const era = { ...graveyard, era: { ...graveyard.era, node: { range: '>=6', release: '6', released: '2016-04' } } };
+    for (const nodeImage of ['node:lts', 'node:0']) {
+      const tagged = { ...resurrect, recipe: { ...resurrect.recipe, nodeImage } } as ResurrectReport;
+      const node = step(buildPlan({ ...all, graveyard: era, resurrect: tagged }, { now: NOW }), `upgrade-node:${TARGET_NODE}`);
+      expect(node.change).toEqual([{ name: 'node', from: '6', to: TARGET_NODE }]);
+    }
+  });
+
   it('never plans an upgrade to the version it is already on', () => {
     const cases = [
       tomb('exact', { status: 'ailing', declared: '1.2.3', resolved: null, latest: '1.2.3', causes: [{ kind: 'outdated', detail: 'x' }] }),

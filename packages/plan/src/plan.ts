@@ -1,24 +1,17 @@
 import type {
   ExhumeReport,
-  GraveyardReport,
-  InterviewReport,
   PlanCheck,
   PlanReport,
   PlanStep,
   ResurrectReport,
+  StoredReports,
   Tombstone,
   WitnessReport,
 } from '@necromancer/core';
-import { shellArg } from '@necromancer/core';
+import { nodeLine, shellArg } from '@necromancer/core';
 
 /** The saved reports a plan is built from. Only graveyard is required. */
-export interface PlanInputs {
-  exhume: ExhumeReport | null;
-  graveyard: GraveyardReport | null;
-  interview: InterviewReport | null;
-  resurrect: ResurrectReport | null;
-  witness: WitnessReport | null;
-}
+export type PlanInputs = Omit<StoredReports, 'plan'>;
 
 export interface PlanOptions {
   /** Source to name in check commands; defaults to the graveyard report's. */
@@ -308,16 +301,6 @@ function resurrectEvidence(resurrect: ResurrectReport | null): Map<string, strin
     }
   }
   return out;
-}
-
-/**
- * The Node release line in an image tag, a version or a release name ("node:8-stretch", "registry/v2/node:8",
- * "v8.9.0", "8", "node:0.10"), or null: the major from 4 on, and "0.<minor>" for the 0.x lines before it.
- */
-function nodeLine(value: string | null | undefined): string | null {
-  const m = value?.match(/(?:^|\bnode:)v?(\d+)(?:\.(\d+))?/);
-  if (!m) return null;
-  return m[1] === '0' && m[2] !== undefined ? `0.${m[2]}` : m[1]!;
 }
 
 /** Looks up what exhume knows about a package. Without exhume, or for a package it never saw declared, nothing is known. */

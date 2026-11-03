@@ -59,8 +59,11 @@ owner's OK, whichever source they came from. These are risky:
   lockfile;
 - install flags that skip safety checks or change where packages come from:
   `--ignore-scripts`, `--force`/`-f`, `--registry`, `--unsafe-perm`;
-- variables that change how packages are installed or how Node runs:
-  `npm_config_*`, `yarn_*`, `NODE_TLS_REJECT_UNAUTHORIZED`, `NODE_OPTIONS`;
+- variables that change what or how packages are installed, how Node runs,
+  or which programs and libraries every process loads: `NODE_ENV` (with
+  `production`, npm skips devDependencies), every other `NODE_*` (such as
+  `NODE_OPTIONS`, `NODE_TLS_REJECT_UNAUTHORIZED`, `NODE_PATH`),
+  `npm_config_*`, `yarn_*`, `PATH`, `LD_PRELOAD` and `LD_LIBRARY_PATH`;
 - running a command before install, or changing or skipping the build or
   start command.
 
@@ -68,21 +71,33 @@ Other variables, the port, the Debian archive mirrors, a different image of
 the same Node line and flags that only relax resolution
 (`--legacy-peer-deps`, `--ignore-engines`) are applied without asking.
 
-When the owner declines a fix, the loop looks for another one and doesn't
-offer the declined one again. When the model asks a question, the owner's
-answer goes into the next request, and a fix built on that answer is kept
-out of the shared fix cache, since it is a choice about this project.
+When the owner declines a fix, the loop looks for another one. A declined
+fix is not offered again for the rest of the run, for this failure or any
+later one, whichever source it would come from: fixes are matched by their
+ops (in any order), so the model can't bring back a declined known or cached
+fix either, and a fix declined before a pause stays declined after
+`--resume`, even when risky fixes are otherwise applied without asking. When
+the model asks a question, the owner's answer goes into the next request.
+From the first answer on, no model fix from that run goes into the shared
+fix cache, since any of them may rest on a choice about this project.
 
 With nobody to ask (no terminal, or the MCP host's turn ended), the run
 stops as `needs-you` and the report holds the pending fix or question and
 the state to carry on from. `resurrect --resume` with an approval, a
-rejection or an answer continues with the next attempt, keeping the attempt
-count and limit, the token spend and budget, and the fixes already declined.
-A resume can set a new limit or budget; either way it gets at least one
-attempt to try the fix it settles on. Answering a question
-needs a model, so a resume with an answer and no model fails before
-anything runs. If the repo moved to another commit since the pause, the
-report warns that the saved recipe was worked out against the old one.
+rejection or an answer continues with the next attempt as the same run: the
+attempt count and limit, the token spend and budget, the sandbox limits, the
+CA file, the sandbox setup (build proxy, health timeout), the era, the
+services and the fixes already declined all come from the paused run, never
+from the options or reports of the resuming call. A resume can set a new
+attempt limit, token budget or sandbox limits; either way it gets at least
+one attempt to try the fix it settles on. `checkResumable` checks a saved
+report before anyone is asked anything and returns the settings the resumed
+run will have, so a front-end can set up its sandbox the same way (the
+resume warns if the sandbox it is handed is set up differently). Answering
+a question needs a model and budget left, so a resume with an answer and no
+model fails before anything runs. If the repo moved to another commit since
+the pause, the report warns that the saved recipe was worked out against the
+old one.
 
 ## Sandbox
 

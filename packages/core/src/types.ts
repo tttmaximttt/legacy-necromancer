@@ -326,6 +326,14 @@ export interface SandboxLimits {
   stepTimeoutSec: number;
 }
 
+/** How the sandbox itself was set up, beyond the per-container limits; a resume rebuilds it the same way. */
+export interface SandboxSettings {
+  /** The host's HTTP(S)_PROXY was passed to the install step. */
+  buildProxy: boolean;
+  /** How long boot waited for a health signal. */
+  healthTimeoutSec: number;
+}
+
 /** One change to the build recipe. Fixes, known or proposed by the model, are lists of these. */
 export type RecipeOp =
   | { op: 'setNodeImage'; tag: string }
@@ -434,9 +442,14 @@ export interface ResurrectRunState {
   seen: Record<string, number>;
   tokens: number;
   calls: number;
-  /** Fixes the owner declined for this failure: known/cache fix ids and model op lists. */
+  /**
+   * Every fix the owner declined in this run, from any source, by `opsKey` of its ops; none is offered again.
+   * Missing in older reports.
+   */
+  declinedFixes?: string[];
+  /** Before `declinedFixes`: what was declined for the pending failure only, as known/cache fix ids and op keys. Read from older reports only. */
   skip?: string[];
-  /** The declined fixes, as shown in the blocked message. */
+  /** The fixes declined for the pending failure, as shown in the blocked message. */
   declined?: string[];
   /** The owner's latest answer about this failure. */
   answer?: string | null;
@@ -450,6 +463,10 @@ export interface ResurrectRunState {
   maxIterations?: number;
   /** The run's token budget; a resume keeps it unless told otherwise. Missing in older reports. */
   tokenBudget?: number;
+  /** The CA certificate the install step trusted, or null for none; a resume uses it again. Missing in older reports. */
+  caFile?: string | null;
+  /** How the sandbox was set up, when it said; a resume should rebuild it the same way. Missing in older reports. */
+  sandbox?: SandboxSettings | null;
 }
 
 export interface ResurrectReport {
