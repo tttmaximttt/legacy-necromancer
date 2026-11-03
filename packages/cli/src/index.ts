@@ -34,7 +34,7 @@ import {
   type Sandbox,
 } from '@necromancer/resurrect';
 import { compareWitness, witness } from '@necromancer/witness';
-import { runInterview, terminalIo, type InterviewOptions } from './interview.js';
+import { InputClosed, runInterview, terminalIo, type InterviewOptions } from './interview.js';
 import { createUiServer } from './server.js';
 
 interface OutputOptions {
@@ -491,7 +491,10 @@ async function askApproval(request: ApprovalRequest, prompt: Prompt): Promise<Ap
       `It needs your OK because it:\n${request.risks.map((r) => `  - ${r.reason}`).join('\n')}\n`,
   );
   for (;;) {
-    const reply = (await prompt('Apply it? [y]es / [n]o, look for another fix / [p]ause and exit: ')).trim().toLowerCase();
+    const answered = await promptOrEof(prompt, 'Apply it? [y]es / [n]o, look for another fix / [p]ause and exit: ');
+    // The input ended (Ctrl-D): nobody is left to answer, so the run pauses and is saved as needs-you.
+    if (answered === null) return 'pause';
+    const reply = answered.trim().toLowerCase();
     if (reply === 'y' || reply === 'yes') return 'approve';
     if (reply === 'n' || reply === 'no') return 'reject';
     if (reply === 'p' || reply === 'pause') return 'pause';
@@ -502,8 +505,23 @@ async function askApproval(request: ApprovalRequest, prompt: Prompt): Promise<Ap
 /** Shows a question with numbered choices; a number picks a choice, other text is the answer, empty pauses. */
 async function askQuestion(question: OwnerQuestion, prompt: Prompt): Promise<string | null> {
   process.stderr.write(`\n${question.question}\n${question.context ? `  ${question.context}\n` : ''}${question.choices.map((c, i) => `  ${i + 1}. ${c}\n`).join('')}`);
-  const reply = (await prompt(question.choices.length ? 'Pick a number or type your answer (Enter to pause and exit): ' : 'Your answer (Enter to pause and exit): ')).trim();
+  const answered = await promptOrEof(
+    prompt,
+    question.choices.length ? 'Pick a number or type your answer (Enter to pause and exit): ' : 'Your answer (Enter to pause and exit): ',
+  );
+  // An ended input (Ctrl-D) pauses, as an empty answer does.
+  const reply = answered?.trim();
   return reply ? pickChoice(reply, question.choices) : null;
+}
+
+/** The reply to `question`, or null once the input has ended. */
+async function promptOrEof(prompt: Prompt, question: string): Promise<string | null> {
+  try {
+    return await prompt(question);
+  } catch (err) {
+    if (err instanceof InputClosed) return null;
+    throw err;
+  }
 }
 
 /** A reply of 1 to n picks that choice, as NEEDS YOU and the prompt number them; any other reply is the answer. */

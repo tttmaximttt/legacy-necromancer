@@ -2,6 +2,7 @@ import { createHash } from 'node:crypto';
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import type { BuildRecipe, RecipeOp, ResurrectPhase } from '@necromancer/core';
+import { imageTag, nodeLine } from '@necromancer/core';
 import { changesRecipe } from './recipe.js';
 
 export interface FailureContext {
@@ -24,15 +25,14 @@ export interface KnownFix {
 
 /** Debian-based images up to node 10 ship release names whose mirrors moved to archive.debian.org. */
 function oldDebian(image: string): boolean {
-  const tag = image.replace(/^node:/, '');
-  if (/(jessie|stretch|wheezy|buster)/.test(tag)) return true;
-  const major = Number(/^(\d+)/.exec(tag)?.[1]);
-  return tag.startsWith('0.') || (major > 0 && major <= 16);
+  if (/(jessie|stretch|wheezy|buster)/.test(imageTag(image)!)) return true;
+  const line = nodeLine(image);
+  return line !== null && Number(line) <= 16;
 }
 
 /** Python 2 package name differs across Debian releases; `python` is python2 on everything up to buster. */
 function pythonFor(image: string): string[] {
-  const major = Number(/^node:(\d+)/.exec(image)?.[1]);
+  const major = Number(nodeLine(image));
   return major >= 16 ? ['python3', 'make', 'g++'] : ['python', 'make', 'g++'];
 }
 
@@ -71,7 +71,7 @@ export const KNOWN_FIXES: KnownFix[] = [
   {
     id: 'fibers-node16',
     description: 'fibers does not build on Node 16 or later; use the Node 14 image',
-    matches: ({ log, recipe, dependencies }) => 'fibers' in dependencies && /fibers/i.test(log) && Number(/^node:(\d+)/.exec(recipe.nodeImage)?.[1]) >= 16,
+    matches: ({ log, recipe, dependencies }) => 'fibers' in dependencies && /fibers/i.test(log) && Number(nodeLine(recipe.nodeImage)) >= 16,
     ops: () => [{ op: 'setNodeImage', tag: '14' }],
   },
   {

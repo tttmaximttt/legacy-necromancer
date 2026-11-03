@@ -267,7 +267,8 @@ export function createServer(options: ServerOptions = {}): McpServer {
         '"ask", a cache or Claude fix that changes dependencies, the Node version or base image, system packages, install ' +
         'flags or environment variables (beyond a short allow-list of harmless ones), or what runs pauses the run with ' +
         'outcome NEEDS YOU, and so does a question only the user can answer: ask the user, ' +
-        'then call resurrect again with resume: true and approve or answer. A paused run is always saved, since resume reads it. ' +
+        'then call resurrect again with resume: true and approve or answer. A paused run is always saved, since resume reads it, ' +
+        'and so is any run that replaces a paused one (even with save: false), so resume never carries on a superseded run. ' +
         'Sandbox: network only while installing dependencies, no host mounts, no credentials, CPU/memory/process/time ' +
         'limits. Takes minutes. Needs Docker on the machine running this server.',
       inputSchema: {
@@ -292,7 +293,10 @@ export function createServer(options: ServerOptions = {}): McpServer {
         resume: z.boolean().default(false).describe('Carry on from the saved run that ended NEEDS YOU, with approve or answer'),
         approve: z.boolean().optional().describe('With resume, for a pending fix: true applies it, false declines it and looks for another'),
         answer: z.string().optional().describe("With resume, for a pending question: the user's answer"),
-        save: z.boolean().default(true).describe('Save the report so the user can browse it with `necromancer ui`'),
+        save: z
+          .boolean()
+          .default(true)
+          .describe('Save the report so the user can browse it with `necromancer ui`; a run that pauses, resumes or replaces a paused run is saved regardless'),
       },
       annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: true },
     },
@@ -375,8 +379,9 @@ export function createServer(options: ServerOptions = {}): McpServer {
           dockerfile: report.dockerfile,
           compose: report.compose,
           ...(noKey && { note: `No Anthropic API key, so only known fixes were tried. To add one, ${credentialsHint()}.` }),
-          // A resumed run replaces the saved needs-you report, which resume would otherwise read again.
-          ...((save || paused || resume) && (await saveNote('resurrect', report))),
+          // A resumed run, or a fresh one after a paused run, replaces the saved needs-you report, which resume would
+          // otherwise read again and carry on a run this one superseded.
+          ...((save || paused || resume || saved?.resurrect?.outcome === 'needs-you') && (await saveNote('resurrect', report))),
         });
       } catch (err) {
         return failure('resurrect', err, err instanceof ResumeError ? resumeHint(err) : '');

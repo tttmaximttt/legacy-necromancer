@@ -319,14 +319,18 @@ export async function resurrect(source: string, options: ResurrectOptions): Prom
 
     const attempts: ResurrectAttempt[] = resumed ? structuredClone(resumed.from.attempts) : [];
     const warnings: string[] = resumed ? [...resumed.from.warnings] : [];
+    // A resume keeps the paused run's warnings, so one found again on each resume is listed once.
+    const warnOnce = (warning: string) => {
+      if (!warnings.includes(warning)) warnings.push(warning);
+    };
     if (resumed && settings.sandbox && sandbox.settings && !sameSandbox(settings.sandbox, sandbox.settings)) {
-      warnings.push(
+      warnOnce(
         `the sandbox is set up differently from the paused run's (${describeSandbox(sandbox.settings)}, was ${describeSandbox(settings.sandbox)})`,
       );
     }
     const pausedAt = resumed?.from.repo.commit ?? null;
     if (pausedAt && commit && pausedAt !== commit) {
-      warnings.push(
+      warnOnce(
         `the repo changed since the run paused (${pausedAt.slice(0, 7)} → ${commit.slice(0, 7)}); the saved recipe was diagnosed against the old commit`,
       );
     }
@@ -421,7 +425,8 @@ export async function resurrect(source: string, options: ResurrectOptions): Prom
           ? `the owner declined ${turn.declined.at(-1)} and there is no other fix for: ${lastError}`
           : passedOver
             ? `the owner declined ${passedOver} earlier in this run and there is no other fix for: ${lastError}`
-            : `${f.phase} failed and no known fix matches (no model configured): ${lastError}`;
+            : // A budget of 0 is why no model is asked, whether or not one is configured.
+              `${f.phase} failed and no known fix matches (${budget <= 0 ? `the token budget is ${budget}, so no model was asked` : 'no model configured'}): ${lastError}`;
         return { kind: 'blocked', reason };
       }
       let rejected = turn.rejected;
@@ -719,7 +724,8 @@ function runSettings(options: SettingsOptions): RunSettings {
     tokenBudget,
     limits: { ...DEFAULT_LIMITS, ...defined(options.limits) },
     model: tokenBudget > 0 ? (options.model?.name ?? null) : null,
-    caFile: options.caFile ?? null,
+    // Saved with the report for a resume, so made absolute.
+    caFile: options.caFile ? path.resolve(options.caFile) : null,
     sandbox: options.sandbox?.settings ?? null,
     keepImages: options.keepImages ?? false,
     // Saved with the report for a resume, so made absolute.

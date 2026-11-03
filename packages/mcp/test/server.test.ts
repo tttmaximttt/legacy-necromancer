@@ -323,6 +323,22 @@ describe('necromancer MCP resurrect', () => {
     expect(body.decisions).toMatchObject([{ kind: 'approval', subject: CACHE_FIX, answer: 'approved', by: 'auto' }]);
   });
 
+  it('replaces a paused run with a fresh one even with save: false, so resume cannot carry on the stale run', async () => {
+    const root = await deadApp(expressMongoApp);
+    const store = await storeWithRiskyCache();
+    await (await connect({ store, sandbox: pausing() })).callTool({ name: 'resurrect', arguments: { source: root, tokenBudget: 0 } });
+    expect((await store.load(path.basename(root)))!.resurrect!.outcome).toBe('needs-you');
+
+    const fresh = await connect({ store, sandbox: new FakeSandbox({ boot: [{ ok: false, log: 'Error: Cannot find module ./secret' }] }) });
+    const body = JSON.parse(text(await fresh.callTool({ name: 'resurrect', arguments: { source: root, tokenBudget: 0, save: false } })));
+    expect(body.outcome).toMatch(/^BLOCKED/);
+    expect(body.savedTo).toBe(path.join(store.dir, path.basename(root), 'resurrect.json'));
+    expect((await store.load(path.basename(root)))!.resurrect!.outcome).toBe('blocked');
+    const resumed = await fresh.callTool({ name: 'resurrect', arguments: { source: root, resume: true, approve: true } });
+    expect(resumed.isError).toBe(true);
+    expect(text(resumed)).toMatch(/this one ended blocked/);
+  });
+
   it('refuses approve or answer without resume, and both together, leaving the paused run as it was', async () => {
     const root = await deadApp(expressMongoApp);
     const store = await storeWithRiskyCache();

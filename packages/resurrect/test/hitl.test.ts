@@ -13,6 +13,7 @@ import {
   DEFAULT_HEALTH_TIMEOUT_SEC,
   errorSignature,
   FixCache,
+  changesNodeLine,
   fixRisks,
   KNOWN_FIXES,
   ResumeError,
@@ -105,6 +106,17 @@ describe('fixRisks', () => {
       ]),
     ).toEqual([]);
     expect(fixRisks(recipe, [{ op: 'addInstallFlags', flags: ['--force'] }])[0]!.reason).toMatch(/^installs with --force/);
+  });
+
+  it('classifies 0.x and registry-prefixed images like the known fixes do', () => {
+    expect(changesNodeLine('node:0.10-slim', 'node:0.12')).toBe(true);
+    expect(changesNodeLine('node:0.10-slim', 'registry.example/node:0.10')).toBe(false);
+    expect(changesNodeLine('registry.example/node:8', 'node:8-slim')).toBe(false);
+    expect(changesNodeLine('registry.example/node:8', 'node:10')).toBe(true);
+    const at = (nodeImage: string, tag: string) => fixRisks({ nodeImage } as BuildRecipe, [{ op: 'setNodeImage', tag }]).map((r) => r.reason);
+    expect(at('registry.example/node:8', '8')).toEqual([]);
+    expect(at('registry.example/node:8-slim', '8-alpine')).toEqual(['changes the base image\'s OS: registry.example/node:8-slim → node:8-alpine']);
+    expect(at('node:0.10-slim', '0.10')).toEqual(["changes the base image's OS: node:0.10-slim → node:0.10"]);
   });
 
   it('flags the known fixes that change the project, and only those (they are applied without asking all the same)', () => {
@@ -755,14 +767,14 @@ describe('resume', () => {
     expect(report.attempts[0]!.fix).toMatchObject({ ops: [{ op: 'setEnv', name: 'CI' }] });
   });
 
-  it('warns when the repo moved on since the pause', async () => {
+  it('warns when the repo moved on since the pause, once however often it is resumed', async () => {
     const { root, report: paused1 } = await paused();
-    const from = { ...paused1, repo: { ...paused1.repo, commit: 'a'.repeat(40) } };
+    const moved = `the repo changed since the run paused (aaaaaaa → ${paused1.repo.commit!.slice(0, 7)}); the saved recipe was diagnosed against the old commit`;
+    // As a run resumed and paused before would have saved it: the warning is already there.
+    const from = { ...paused1, repo: { ...paused1.repo, commit: 'a'.repeat(40) }, warnings: [...paused1.warnings, moved] };
     const report = await resurrect(root, { sandbox: new FakeSandbox({}), resume: resumeOf(from, { approve: true }) });
     expect(report.outcome).toBe('resurrected');
-    expect(report.warnings).toContain(
-      `the repo changed since the run paused (aaaaaaa → ${report.repo.commit!.slice(0, 7)}); the saved recipe was diagnosed against the old commit`,
-    );
+    expect(report.warnings.filter((w) => w === moved)).toHaveLength(1);
   });
 
   it('passes the answer to the model on resume', async () => {
@@ -855,6 +867,18 @@ describe('a resumed run keeps the paused run’s settings', () => {
     return { root, from, caFile };
   }
 
+  it('saves a relative CA file as an absolute path', async () => {
+    const caFile = path.join(await mkdtemp(path.join(os.tmpdir(), 'necro-ca-')), 'proxy.crt');
+    await writeFile(caFile, '-----BEGIN CERTIFICATE-----\n');
+    const from = await resurrect(await deadApp(expressMongoApp), {
+      sandbox: new FakeSandbox({ boot: [{ ok: false, log: UNKNOWN }] }),
+      fixCache: await riskyCache(),
+      caFile: path.relative(process.cwd(), caFile),
+      approve: async () => 'pause',
+    });
+    expect(from.resume!.settings.caFile).toBe(caFile);
+  });
+
   it('saves the CA file and sandbox setup, and resumes with the saved limits, CA, services and era', async () => {
     const { root, from, caFile } = await pausedWith();
     expect(from.resume).toMatchObject({ settings: { caFile, sandbox: { buildProxy: true, healthTimeoutSec: 30 } } });
@@ -892,12 +916,13 @@ describe('a resumed run keeps the paused run’s settings', () => {
     expect(report.limits.memoryMb).toBe(1024);
   });
 
-  it('warns when the sandbox it is handed is set up differently', async () => {
+  it('warns when the sandbox it is handed is set up differently, once however often it is resumed', async () => {
     const { root, from } = await pausedWith();
-    const report = await resurrect(root, { sandbox: sandboxWith({ buildProxy: false, healthTimeoutSec: 90 }), resume: resumeOf(from, { approve: true }) });
-    expect(report.warnings).toContain(
-      "the sandbox is set up differently from the paused run's (without the build proxy, 90s health timeout, was with the build proxy, 30s health timeout)",
-    );
+    const differs =
+      "the sandbox is set up differently from the paused run's (without the build proxy, 90s health timeout, was with the build proxy, 30s health timeout)";
+    const again = { ...from, warnings: [...from.warnings, differs] };
+    const report = await resurrect(root, { sandbox: sandboxWith({ buildProxy: false, healthTimeoutSec: 90 }), resume: resumeOf(again, { approve: true }) });
+    expect(report.warnings.filter((w) => w === differs)).toHaveLength(1);
   });
 
   it('tells a front-end everything it needs before it asks the owner', async () => {

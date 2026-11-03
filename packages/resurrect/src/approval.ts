@@ -1,5 +1,5 @@
 import type { BuildRecipe, FixRisk, RecipeOp } from '@necromancer/core';
-import { nodeLine } from '@necromancer/core';
+import { imageTag, imageVariant, nodeLine } from '@necromancer/core';
 
 const SKIPS_DEV = 'skips devDependencies';
 const LOCKFILE = 'ignores or rewrites the lockfile';
@@ -139,14 +139,11 @@ function envRisk(name: string, value: string): string | null {
   return `sets ${name} for install, build and run: ${name}=${value}`;
 }
 
-/** The variant part of an image tag (`alpine`, `stretch-slim`), or '' for the default image of that version. */
-const variant = (tag: string): string => /^[^-]*-(.*)$/.exec(tag.replace(/^node:/, ''))?.[1] ?? '';
-
 /** Whether moving between two image tags changes the Node release line. A tag with no version counts as a change unless it is the same tag. */
 export function changesNodeLine(from: string, to: string): boolean {
   const a = nodeLine(from);
   const b = nodeLine(to);
-  if (a === null || b === null) return from.replace(/^node:/, '') !== to.replace(/^node:/, '');
+  if (a === null || b === null) return imageTag(from) !== imageTag(to);
   return a !== b;
 }
 
@@ -161,9 +158,9 @@ export function fixRisks(recipe: BuildRecipe, ops: RecipeOp[]): FixRisk[] {
     switch (op.op) {
       case 'setNodeImage': {
         if (changesNodeLine(recipe.nodeImage, op.tag)) {
-          const from = nodeLine(recipe.nodeImage) ?? recipe.nodeImage.replace(/^node:/, '');
+          const from = nodeLine(recipe.nodeImage) ?? imageTag(recipe.nodeImage);
           add(op, `moves Node from ${from} to ${nodeLine(op.tag) ?? op.tag} (node:${op.tag})`);
-        } else if (variant(recipe.nodeImage) !== variant(op.tag)) {
+        } else if (imageVariant(recipe.nodeImage) !== imageVariant(op.tag)) {
           add(op, `changes the base image's OS: ${recipe.nodeImage} → node:${op.tag}`);
         }
         break;

@@ -4,7 +4,9 @@ import os from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { ReportStore } from '@necromancer/core';
+import { PassThrough } from 'node:stream';
 import { createProgram } from '../src/index.js';
+import { InputClosed, terminalIo } from '../src/interview.js';
 import { ScriptedModel } from '@necromancer/llm';
 import { DEFAULT_LIMITS, errorSignature, resurrect } from '@necromancer/resurrect';
 import { deadApp, expressMongoApp, FakeSandbox, NODE_GYP_LOG } from '../../resurrect/test/helpers.js';
@@ -151,6 +153,39 @@ describe('necromancer resurrect', () => {
     const report = (await new ReportStore(reports).load(path.basename(root)))!.resurrect!;
     expect(report.outcome).toBe('resurrected');
     expect(report.decisions).toMatchObject([{ kind: 'approval', subject: CACHE_FIX, answer: 'approved', by: 'auto' }]);
+  });
+
+  it('pauses and saves the run when the input ends at the prompt (Ctrl-D)', async () => {
+    const root = await deadApp(expressMongoApp);
+    const reports = path.join(await mkdtemp(path.join(os.tmpdir(), 'necro-cli-res-')), 'reports');
+    const stderr = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+    /** A terminal whose input has already ended. */
+    const ended = () => {
+      const input = new PassThrough();
+      input.end();
+      return terminalIo({ input, output: new PassThrough() }).ask!;
+    };
+    const cli = (sandbox: FakeSandbox, ...args: string[]) =>
+      createProgram({ sandbox, prompt: ended() }).parseAsync(['node', 'necromancer', 'resurrect', root, '--reports', reports, '--no-llm', '-q', ...args]);
+
+    await cli(pausing(reports));
+    expect(process.exitCode).toBe(3);
+    expect(stderr.mock.calls.map((c) => String(c[0])).join('')).toContain('NEEDS YOU: apply this fix?');
+    expect((await new ReportStore(reports).load(path.basename(root)))!.resurrect!.outcome).toBe('needs-you');
+    // On --resume too: still waiting, so NEEDS YOU and exit 3 again rather than an error.
+    process.exitCode = undefined;
+    await cli(new FakeSandbox({}), '--resume');
+    expect(process.exitCode).toBe(3);
+    expect((await new ReportStore(reports).load(path.basename(root)))!.resurrect!.outcome).toBe('needs-you');
+  });
+
+  it('rejects a question, and every later one, with InputClosed once the input ends', async () => {
+    const input = new PassThrough();
+    const ask = terminalIo({ input, output: new PassThrough() }).ask!;
+    const pending = ask('first? ');
+    input.end();
+    await expect(pending).rejects.toBeInstanceOf(InputClosed);
+    await expect(ask('second? ')).rejects.toBeInstanceOf(InputClosed);
   });
 
   it('asks about risky fixes on a terminal', async () => {

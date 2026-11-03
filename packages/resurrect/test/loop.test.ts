@@ -115,6 +115,17 @@ describe('resurrect loop', () => {
       expect(report.blockedReason).toBe("boot failed and no known fix matches (no model configured): Error: Cannot find module './config/local.json'");
     });
 
+    it('says a budget of 0 is why no model was asked', async () => {
+      const report = await resurrect(await deadApp(expressMongoApp), {
+        sandbox: new FakeSandbox({ boot: [{ ok: false, log: UNKNOWN }] }),
+        model: new ScriptedModel(),
+        tokenBudget: 0,
+      });
+      expect(report.blockedReason).toBe(
+        "boot failed and no known fix matches (the token budget is 0, so no model was asked): Error: Cannot find module './config/local.json'",
+      );
+    });
+
     it('when the model says nothing anyone could say would fix it', async () => {
       const model = new ScriptedModel({
         diagnosis: 'the build calls phantomjs',
