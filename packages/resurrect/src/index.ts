@@ -8,6 +8,7 @@ export {
   MAX_OWNER_DECLINES,
   opsKey,
   checkResumable,
+  prepareResume,
   resumeSettings,
   ResumeError,
   type ResurrectOptions,

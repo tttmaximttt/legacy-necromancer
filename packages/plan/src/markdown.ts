@@ -29,9 +29,11 @@ function renderStep(step: PlanStep): string[] {
   if (step.why.length) out.push('Why:', '', ...step.why.map((w) => `- ${w}`), '');
   if (step.goals.length) out.push(`Serves: ${step.goals.join('; ')}`, '');
   if (step.touches.length) {
-    const shown = step.touches.slice(0, MAX_TOUCHES).map((f) => `\`${f}\``).join(', ');
-    const more = step.touches.length > MAX_TOUCHES ? ` and ${step.touches.length - MAX_TOUCHES} more` : '';
-    out.push(`Touches: ${shown}${more}.`, '');
+    // `touches` is capped per package, so the full count comes from touchCount when the plan has it.
+    const total = Math.max(step.touchCount ?? 0, step.touches.length);
+    const listed = step.touches.slice(0, MAX_TOUCHES);
+    const shown = listed.map((f) => `\`${f}\``).join(', ');
+    out.push(total > listed.length ? `Touches ${total} files; the first ${listed.length}: ${shown}.` : `Touches: ${shown}.`, '');
   }
   out.push(`Then check: \`${step.check.command}\`. ${step.check.passes}`, '');
   return out;

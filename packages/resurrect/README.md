@@ -50,8 +50,11 @@ inside Docker, on the Node version of its era.
 
 ## The owner's part
 
-Some fixes change the project rather than the sandbox, so they wait for the
-owner's OK, whichever source they came from. These are risky:
+Built-in fixes from the known-fix table are applied without asking. Fixes
+from the cache or the model that change the project rather than the sandbox
+wait for the owner's OK. The same rules (`fixRisks`) flag a known fix too:
+it is still applied, and the progress log and the report's `decisions` say
+what it changed. These are risky:
 
 - moving to another Node major (for 0.x, another release line: 0.10 to 0.12
   counts), or to a tag with no version in it, like `lts` or `argon`;
@@ -103,25 +106,34 @@ Applied without asking:
   end-of-life, where the regular mirrors no longer have it.
 
 Of the known fixes, only `debian-archive`, `husky`, `peer-deps` and
-`yarn-engines` go through without asking. `phantomjs-cdn` asks, since it
-sets `PHANTOMJS_CDNURL`, which changes where a binary is downloaded from.
+`yarn-engines` pass these rules. The rest, such as `node-gyp-python`
+(Debian packages) or `phantomjs-cdn` (`PHANTOMJS_CDNURL` changes where a
+binary is downloaded from), are flagged but not held: each is recorded in
+`decisions` as approved `by: "auto"`, with its risks. So are the fixes a
+blanket approval lets through (the `approve` callback answering
+`'auto-approve'`, as `--yes` does) and every risky fix in a run with no
+`approve` callback. Decisions the owner made are `by: "owner"`; only those
+are shown to the model as the owner's.
 
 When the owner declines a fix, the loop looks for another one. A declined
 fix is not offered again for the rest of the run, for this failure or any
-later one, whichever source it would come from. Fixes are matched by their
-effect on the recipe: optional fields count as their defaults (`dev` as
+later one, whichever source it would come from, and a known fix with the
+same effect is passed over too. Fixes are matched only by their effect on
+the recipe, never by id, since a known fix's ops depend on the recipe and
+the cache may learn another fix for the same error: optional fields count as their defaults (`dev` as
 false), apt packages and install flags count as one set however they are
 split across ops or ordered, a repeated op counts once, of the ops that set
 one thing (the image, a variable, a dependency, a command, the port) only
 the last counts, and the order of the ops doesn't matter, except for the
 commands run before install, which run in sequence. So the model can't
-bring back a declined known or cached fix in another form: the `node-sass`
-fix (`removeDependency node-sass`, `setDependency sass ^1.32.0`) stays
-declined when the model proposes `setDependency sass ^1.32.0` then
-`removeDependency node-sass`. A fix declined before a pause stays declined
+bring back a declined fix in another form: a declined
+`removeDependency node-sass`, `setDependency sass ^1.32.0` stays declined
+when the model proposes `setDependency sass ^1.32.0` then
+`removeDependency node-sass`, and the known `node-sass` fix, which makes
+the same change, is passed over. A fix declined before a pause stays declined
 after `--resume`, even when risky fixes are otherwise applied without
 asking. When the model asks a question, the owner's answer goes into the
-next request. From the first answer on, no model fix from that run goes
+next request. From the owner's first answer on, no model fix from that run goes
 into the shared fix cache, since any of them may rest on a choice about
 this project.
 
@@ -140,11 +152,18 @@ budget, sandbox limits, sandbox setup, model (or none), image cleanup or
 workdir; what it sets is saved again if the run pauses later. Either way it
 gets at least one attempt to try the fix it settles on.
 
-`resumeSettings` and `checkResumable` return the settings the resumed run
-will have, so a front-end can build its sandbox and the model they name
-(none when it is null) the same way. `checkResumable` checks a saved report
-before anyone is asked anything, and throws a `ResumeError` whose `code`
-says what is wrong, so a front-end can say what to change:
+`resumeSettings` returns the settings the resumed run will have, so a
+front-end can build its sandbox and the model they name (none when it is
+null) first. `checkResumable(from, { model, resume: overrides })` then
+checks the saved report once, before anyone is asked anything, and returns
+a `ResumableRun`: the report (`from`), what it waits on, its state and the
+resolved settings. `resurrect` takes it as `resume: { run, approve }` or
+`resume: { run, answer }` and does not check it again; it only checks that
+the answer fits what the run waits on and that it is handed the model
+`run.settings` names. `prepareResume(from, { model, overrides, approve,
+answer })` does both checks in one call and returns that input. Both throw
+a `ResumeError` whose `code` says what is wrong, so a front-end can say
+what to change:
 
 | code | the resume |
 |---|---|
@@ -159,7 +178,8 @@ says what is wrong, so a front-end can say what to change:
 | `needs-approve` | has no approve true or false for a pending fix |
 | `needs-answer` | has no answer for a pending question |
 
-`resurrect` throws the same errors, and checks the last three too. A resume
+`checkResumable` checks all but the last three; `prepareResume` checks all
+of them, and `resurrect` the model ones and the last three. A resume
 handed a sandbox set up differently from its settings (the paused run's,
 with any the resume changes) warns. If the repo moved to another commit
 since the pause, the report warns that the saved recipe was worked out

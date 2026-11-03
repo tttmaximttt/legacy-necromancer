@@ -28,10 +28,10 @@ async function makeRepo(): Promise<string> {
       name: 'old-app',
       main: 'server.js',
       engines: { node: '0.10.x' },
-      dependencies: { express: '3.x', 'node-sass': '^3.4.0' },
+      dependencies: { express: '3.x', jade: '*', 'node-sass': '^3.4.0' },
       scripts: { postinstall: 'curl -s http://get.example.com/setup.sh | sh' },
     }),
-    'server.js': "var express = require('express');\nvar routes = require('./routes');\napp.use(routes);\n",
+    'server.js': "var express = require('express');\nvar routes = require('./routes');\napp.set('view engine', 'jade');\napp.use(routes);\n",
     'routes/index.js': "var users = require('./users');\nvar db = require('../lib/db');\nmodule.exports = users;\n",
     'routes/users.js': "var db = require('../lib/db');\nvar User = require('../models/user');\n",
     'models/user.js': "var db = require('../lib/db');\nvar Util = require('../lib/Util');\n",
@@ -89,7 +89,11 @@ describe('exhume', () => {
       { name: 'express', importedBy: 1, importers: ['server.js'] },
       { name: 'mongodb', importedBy: 1, importers: ['lib/db.js'] },
       { name: 'should', importedBy: 1, importers: ['test/users.test.js'] },
+      // Named in a string, never imported; the `require('express')` specifier is not a reference.
+      { name: 'jade', importedBy: 0, importers: [], referencedBy: ['server.js'], referenceCount: 1 },
     ]);
+    expect(report.externalPackages[0]).not.toHaveProperty('referencedBy');
+    expect(report.stats.externalPackages).toBe(3);
     expect(report.manifests[0]).toMatchObject({ name: 'old-app', engines: { node: '0.10.x' }, scripts: { postinstall: expect.any(String) } });
     expect(report.graph.edges).toContainEqual(['routes/users.js', 'lib/db.js']);
     expect(report.graph.nodes.find((n) => n.id === 'test/users.test.js')).toMatchObject({ isTest: true, cluster: -1, score: null });

@@ -314,7 +314,8 @@ describe('buildPlan', () => {
     // exhume saw test files, but there is no test script to run them.
     expect(check(withTest(undefined))).toMatchObject({ kind: 'resurrect', command: 'necromancer resurrect my/repo' });
     expect(check(withTest('echo "Error: no test specified" && exit 1'))).toMatchObject({ kind: 'resurrect' });
-    expect(check(withTest('mocha', 'pnpm'))).toEqual({ kind: 'tests', command: 'pnpm test', passes: "The project's own tests pass." });
+    // No witness test run, so nothing says the tests passed before.
+    expect(check(withTest('mocha', 'pnpm'))).toEqual({ kind: 'tests', command: 'pnpm test', passes: 'The test script passes.' });
     const yarnRecipe = { ...resurrect, recipe: { ...resurrect.recipe, packageManager: 'yarn' } } as ResurrectReport;
     expect(check(withTest('mocha', 'npm'), yarnRecipe)).toMatchObject({ kind: 'tests', command: 'yarn test' });
     expect(check(withTest('mocha', 'bower'))).toMatchObject({ kind: 'tests', command: 'npm test' });
@@ -338,6 +339,90 @@ describe('buildPlan', () => {
     const plain = { ...manifest, scripts: { start: 'cd lib && NODE_ENV=x node server.js', build: './build.sh; rm -rf dist', lint: 'npx jshint lib' } };
     const removed = buildPlan({ ...all, graveyard: { ...graveyard, tombstones: [...tombstones, coffee] }, exhume: { ...exhume, manifests: [plain] } }, { now: NOW });
     expect(ids(removed)).toEqual(expect.arrayContaining(['remove:coffee-script', 'remove:left-pad']));
+  });
+
+  it('does not use tests that already failed when witnessed as the check', () => {
+    const tests = { command: 'npm test', ok: false, summary: '40 passing, 2 failing', durationMs: 1, logTail: '' };
+    const warning = 'The project\'s tests already failed when witnessed ("40 passing, 2 failing"), so they can\'t be used to check steps until they\'re fixed.';
+
+    const noSnapshots = buildPlan({ ...all, witness: { snapshots: [], tests } as unknown as WitnessReport }, { now: NOW, source: 'my/repo' });
+    expect(noSnapshots.baseline).toMatchObject({ kind: 'resurrect', command: 'necromancer resurrect my/repo' });
+    expect(noSnapshots.warnings).toContain(warning);
+
+    const withSnapshots = buildPlan({ ...all, witness: { snapshots: [{}], tests } as unknown as WitnessReport }, { now: NOW });
+    expect(withSnapshots.baseline.kind).toBe('witness');
+    expect(withSnapshots.warnings).toContain(warning);
+
+    const passed = buildPlan({ ...all, witness: { snapshots: [], tests: { ...tests, ok: true } } as unknown as WitnessReport }, { now: NOW });
+    expect(passed.baseline).toEqual({ kind: 'tests', command: 'npm test', passes: "The project's own tests pass, as they did when witnessed." });
+    expect(passed.warnings.join(' ')).not.toMatch(/already failed/);
+
+    const noSummary = buildPlan({ ...all, witness: { snapshots: [], tests: { ...tests, summary: null } } as unknown as WitnessReport }, { now: NOW });
+    expect(noSummary.warnings).toContain('The project\'s tests already failed when witnessed (`npm test` failed), so they can\'t be used to check steps until they\'re fixed.');
+  });
+
+  it('splits scripts like a shell, so keywords and builtins do not block removals', () => {
+    const coffee = tomb('coffee-script', { status: 'dead', causes: [{ kind: 'deprecated', detail: 'Deprecated' }] });
+    const planWith = (scripts: Record<string, string>) => {
+      const manifest = { ...exhume.manifests[0]!, dependencies: { ...exhume.manifests[0]!.dependencies, 'coffee-script': '^1.12.0' }, scripts };
+      return buildPlan({ ...all, graveyard: { ...graveyard, tombstones: [...tombstones, coffee] }, exhume: { ...exhume, manifests: [manifest] } }, { now: NOW });
+    };
+    const removed = planWith({
+      postinstall: 'if [ -d x ]; then cp -r x y; fi',
+      build: 'for f in a b; do echo "$f; coffee"; done',
+      check: '[[ -f a ]] || { echo missing >&2; exit 1; }',
+      start: 'NODE_ENV=production DEBUG=x node server.js 2>&1 | cat &\nwait',
+      sub: '(cd lib && node build.js) && test -n "$CI" && : ok',
+    });
+    expect(ids(removed)).toEqual(expect.arrayContaining(['remove:coffee-script', 'remove:left-pad']));
+
+    for (const [script, cmd] of [
+      ['(cd lib && coffee -c .)', 'coffee'],
+      ['if [ -d x ]; then grunt build; fi', 'grunt'],
+      ['node a.js & gulp watch', 'gulp'],
+      ['FOO=1 BAR=2 bower install', 'bower'],
+      ['NODE_ENV="production" brunch build', 'brunch'],
+      ["MSG='a; b' karma start", 'karma'],
+    ]) {
+      const kept = planWith({ build: script! });
+      expect(ids(kept)).not.toContain('remove:coffee-script');
+      expect(kept.leftAlone.find((l) => l.name === 'coffee-script')!.reason).toContain(`a script runs \`${cmd}\``);
+    }
+  });
+
+  it('does not remove a package that is loaded by name, and lists those files', () => {
+    const jade = tomb('jade', { status: 'dead', causes: [{ kind: 'deprecated', detail: 'Deprecated: renamed to pug' }] });
+    const manifest = { ...exhume.manifests[0]!, dependencies: { ...exhume.manifests[0]!.dependencies, jade: '^1.11.0' } };
+    const packages = [
+      ...exhume.externalPackages,
+      { name: 'jade', importedBy: 0, importers: [], referencedBy: ['app.js', 'lib/views.js'], referenceCount: 2 },
+    ];
+    const plan = buildPlan(
+      { ...all, graveyard: { ...graveyard, tombstones: [...tombstones, jade] }, exhume: { ...exhume, manifests: [manifest], externalPackages: packages } },
+      { now: NOW },
+    );
+    expect(ids(plan)).not.toContain('remove:jade');
+    expect(plan.leftAlone.find((l) => l.name === 'jade')!.reason).toBe(
+      'Nothing imports it, but it is loaded by name in app.js and lib/views.js; check before removing it.',
+    );
+
+    // A package that is both imported and named lists both kinds of file in touches.
+    const named = packages.map((p) => (p.name === 'lodash' ? { ...p, referencedBy: ['config.js', 'lib/a.js'], referenceCount: 2 } : p));
+    const lodash = step(buildPlan({ ...all, exhume: { ...exhume, externalPackages: named } }, { now: NOW }), 'upgrade:lodash');
+    expect(lodash.touches).toEqual(['config.js', 'lib/a.js', 'lib/b.js']);
+    expect(lodash.why).toContain('Loaded by name (a string literal, not an import) in 2 files.');
+  });
+
+  it('counts every touched file, not just the listed ones', () => {
+    const importers = Array.from({ length: 20 }, (_, i) => `lib/f${String(i).padStart(2, '0')}.js`);
+    const packages = exhume.externalPackages.map((p) => (p.name === 'lodash' ? { name: 'lodash', importedBy: 150, importers } : p));
+    const plan = buildPlan({ ...all, exhume: { ...exhume, externalPackages: packages } }, { now: NOW });
+    const lodash = step(plan, 'upgrade:lodash');
+    expect(lodash).toMatchObject({ touches: importers, touchCount: 150 });
+    expect(lodash.why).toContain('Imported by 150 files.');
+    const md = renderPlanMarkdown(plan);
+    expect(md).toContain(`Touches 150 files; the first 10: ${importers.slice(0, 10).map((f) => `\`${f}\``).join(', ')}.`);
+    expect(md).not.toMatch(/and 10 more/);
   });
 
   it('maps goals to steps by keyword and package name', () => {
@@ -374,6 +459,7 @@ describe('renderPlanMarkdown', () => {
   it('caps the touched files', () => {
     const plan = buildPlan(all, { now: NOW });
     plan.steps[0]!.touches = Array.from({ length: 15 }, (_, i) => `f${i}.js`);
-    expect(renderPlanMarkdown(plan)).toContain('and 5 more');
+    expect(renderPlanMarkdown(plan)).toContain('Touches 15 files; the first 10: `f0.js`,');
+    expect(renderPlanMarkdown(plan)).toContain('Touches 32 files; the first 2: `lib/a.js`, `lib/b.js`.');
   });
 });

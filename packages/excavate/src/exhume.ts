@@ -10,7 +10,7 @@ import { auditManifests } from './install-scripts.js';
 import { ImportParser, joinRoute, languageFor } from './parser.js';
 import { ImportResolver } from './resolve.js';
 
-/** Importing files listed per external package; `importedBy` has the full count. */
+/** Importing (or naming) files listed per external package; `importedBy` (`referenceCount`) has the full count. */
 const MAX_IMPORTERS = 20;
 
 export interface ExhumeOptions {
@@ -41,6 +41,7 @@ export async function exhume(source: string, options: ExhumeOptions = {}): Promi
     const parser = await ImportParser.create();
     const resolver = new ImportResolver(allFiles, await readMains(repo.root, allFiles));
     const files: SourceFile[] = [];
+    const namesByFile = new Map<string, string[]>();
     const routesByFile = new Map<string, RawRoute[]>();
     const mountsByFile = new Map<string, Array<RawMount & { target: string }>>();
     try {
@@ -58,6 +59,7 @@ export async function exhume(source: string, options: ExhumeOptions = {}): Promi
           isTest: isTestFile(rel),
           imports: parsed.imports.map((imp) => resolver.resolve(rel, imp)),
         });
+        if (parsed.names.length) namesByFile.set(rel, parsed.names);
         if (parsed.routes.length && !isTestFile(rel)) routesByFile.set(rel, parsed.routes);
         const mounts = parsed.mounts.flatMap((m) => {
           const r = resolver.resolve(rel, { specifier: m.specifier, kind: 'require', line: m.line });
@@ -100,6 +102,19 @@ export async function exhume(source: string, options: ExhumeOptions = {}): Promi
       }
     }
 
+    // Packages loaded by name rather than imported: `app.set('view engine', 'jade')`, `require.resolve('x')`.
+    const declared = new Set(manifests.flatMap((m) => [...Object.keys(m.dependencies), ...Object.keys(m.devDependencies)]));
+    const referenced = new Map<string, Set<string>>();
+    for (const [file, names] of namesByFile) {
+      for (const name of names) {
+        if (!declared.has(name)) continue;
+        let files = referenced.get(name);
+        if (!files) referenced.set(name, (files = new Set()));
+        files.add(file);
+      }
+    }
+    const packageNames = [...new Set([...external.keys(), ...referenced.keys()])];
+
     const { files: _perFile, ...historySummary } = history;
     const report: ExhumeReport & { root?: string } = {
       repo: {
@@ -122,8 +137,17 @@ export async function exhume(source: string, options: ExhumeOptions = {}): Promi
       clusters: analysis.clusters,
       loadBearing: analysis.loadBearing,
       orphans: analysis.orphans,
-      externalPackages: [...external]
-        .map(([name, importers]) => ({ name, importedBy: importers.size, importers: [...importers].sort().slice(0, MAX_IMPORTERS) }))
+      externalPackages: packageNames
+        .map((name) => {
+          const importers = external.get(name) ?? new Set<string>();
+          const refs = referenced.get(name);
+          return {
+            name,
+            importedBy: importers.size,
+            importers: [...importers].sort().slice(0, MAX_IMPORTERS),
+            ...(refs ? { referencedBy: [...refs].sort().slice(0, MAX_IMPORTERS), referenceCount: refs.size } : {}),
+          };
+        })
         .sort((a, b) => b.importedBy - a.importedBy || a.name.localeCompare(b.name)),
       caseMismatches,
       manifests,

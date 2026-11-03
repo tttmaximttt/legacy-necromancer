@@ -70,6 +70,11 @@ describe('ImportParser', () => {
     expect(result.imports[0]?.line).toBe(3);
     expect(result.parseErrors).toBeGreaterThan(0);
   });
+
+  it('collects package-like string literals outside import specifiers', () => {
+    const src = `import a from 'pkg-a';\nimport b = require('pkg-b');\nconst c = await import('pkg-c');\napp.set('view engine', 'jade');\nuse(\`@scope/plug\`, \`x-\${y}\`, 'jade', "not a name");`;
+    expect(parser.parse(src, 'typescript').names).toEqual(['jade', '@scope/plug']);
+  });
 });
 
 describe('languageFor', () => {

@@ -27,6 +27,7 @@ import {
   type ApprovalAnswer,
   type ApprovalRequest,
   type OwnerQuestion,
+  type ResumableRun,
   type ResumeInput,
   type ResumeOverrides,
   type RunSettings,
@@ -180,9 +181,10 @@ export function createProgram(deps: ProgramDeps = {}): Command {
     .command('resurrect')
     .description(
       'Get the project installing, building and booting in a Docker sandbox pinned to its era. Known fixes first, then ' +
-        'Claude (if an Anthropic API key is set); stops with BLOCKED: <reason> when it cannot get further. Fixes that change ' +
-        'dependencies, the Node version or base image, system packages, install flags, environment variables or what runs ' +
-        'wait for your OK (except a short allow-list of harmless flags and variables), and questions only you can answer ' +
+        'Claude (if an Anthropic API key is set); stops with BLOCKED: <reason> when it cannot get further. Built-in known ' +
+        'fixes apply without asking and are listed in the report. Cache and Claude fixes that change dependencies, the ' +
+        'Node version or base image, system packages, install flags, environment variables or what runs wait for your OK ' +
+        '(except a short allow-list of harmless flags and variables), and questions only you can answer ' +
         'are asked; without a terminal to ask on, the run stops with NEEDS YOU (exit code 3) and `--resume` carries on. Needs Docker.',
     )
     .argument('<source>', 'git URL or local path')
@@ -200,7 +202,7 @@ export function createProgram(deps: ProgramDeps = {}): Command {
     .option('--no-build-proxy', "with --resume: don't pass the proxy, though the saved run did")
     .option('--keep-images', 'keep the built images')
     .option('--no-keep-images', "with --resume: remove the built images, though the saved run kept them")
-    .option('-y, --yes', 'apply risky fixes without asking (with --resume, not the one it is waiting on: pass --approve or --reject)')
+    .option('-y, --yes', 'apply risky cache and model fixes without asking (with --resume, not the one it is waiting on: pass --approve or --reject)')
     .option('--resume', 'carry on from the saved run that is waiting on you')
     .option('--approve', 'with --resume: apply the fix it is waiting on')
     .option('--reject', 'with --resume: decline that fix and look for another')
@@ -267,25 +269,28 @@ export function createProgram(deps: ProgramDeps = {}): Command {
             };
             // Everything that can stop the resume is checked before asking, so an answer is never thrown away.
             let settings: RunSettings | undefined;
+            let run: ResumableRun;
             model = null;
             try {
+              // Only to know which model to build; checkResumable below does the checks, once.
               settings = resumeSettings(from, overrides);
               // The model the paused run asked, or the one named again; none when there is no key, which the check reports.
               model = settings.model === null ? null : (deps.model ?? (hasCredentials() ? new ClaudeModel({ model: settings.model }) : null));
-              checkResumable(from, { model, resume: overrides });
+              run = checkResumable(from, { model, resume: overrides });
             } catch (err) {
               throw new Error(`${errorMessage(err)}${resumeHint(source, from, err, settings)}`);
             }
-            const decision = await resumeDecision(from, opts, prompt);
+            const decision = await resumeDecision(run, opts, prompt);
             if (!decision) {
               // Nobody answered (no terminal, or the owner chose to pause): still waiting, so the same exit as a fresh pause.
-              process.stderr.write(needsYou(source, from.pending!, opts));
+              process.stderr.write(needsYou(source, run.pending, opts));
               process.exitCode = 3;
               return;
             }
             // The paused run's sandbox, with any --build-proxy or --health-timeout typed again already merged in.
-            sandbox = deps.sandbox ?? new DockerSandbox(settings!.sandbox ?? {});
-            resume = { from, ...decision, ...overrides };
+            sandbox = deps.sandbox ?? new DockerSandbox(run.settings.sandbox ?? {});
+            // The overrides are already in run.settings.
+            resume = { run, ...decision };
           } else {
             model = opts.tokenBudget > 0 ? chooseModel(opts, deps, noKey) : null;
             sandbox = chooseSandbox(opts, deps);
@@ -305,7 +310,7 @@ export function createProgram(deps: ProgramDeps = {}): Command {
             workdir: opts.workdir,
             keepImages: opts.keepImages,
             onProgress: say,
-            approve: opts.yes ? async () => 'approve' : prompt ? (request) => askApproval(request, prompt) : async () => 'pause',
+            approve: opts.yes ? async () => 'auto-approve' : prompt ? (request) => askApproval(request, prompt) : async () => 'pause',
             ask: prompt ? (question) => askQuestion(question, prompt) : undefined,
             resume,
           });
@@ -460,11 +465,10 @@ interface ResumeFlags {
 
 /** The owner's answer to the pending decision of a needs-you report, from flags or the terminal; null to stay paused. */
 async function resumeDecision(
-  from: ResurrectReport,
+  { from, pending }: ResumableRun,
   opts: ResumeFlags,
   prompt: Prompt | null,
 ): Promise<Pick<ResumeInput, 'approve' | 'answer'> | null> {
-  const pending = from.pending!;
   if (pending.kind === 'approval') {
     if (opts.answer !== undefined) throw new Error('the saved run is waiting on a fix, not a question; pass --approve or --reject');
     // --yes covers risky fixes found later in the run, never the one the owner is asked about: that takes --approve,

@@ -310,15 +310,19 @@ including the sandbox, are in the [package README](packages/resurrect/README.md)
 Some fixes change the project rather than the sandbox: a dependency
 version, the Node major, system packages, where and how packages are
 installed (install flags, a registry, npm settings), environment
-variables, or the build or start command. A short allow-list of harmless
-install flags and variables (such as `--legacy-peer-deps` or `CI`) is
-applied without asking; the rest wait for your OK. In a terminal you see
+variables, or the build or start command. Built-in fixes from the table
+are applied without asking, and the report lists each one that changed the
+project. Fixes from the cache or from Claude that change the project wait
+for your OK, except a short allow-list of harmless install flags and
+variables (such as `--legacy-peer-deps` or `CI`). In a terminal you see
 the fix, what it would change and the error it is for, and answer `y` to
 apply it, `n` to look for another fix, or `p` to stop. When Claude needs something only you
 know, such as what to do about a private package, it asks, with numbered
 suggestions; type a number or your own answer, or press Enter to stop.
-`--yes` applies every fix without asking, except the one a `--resume` is
-waiting on: that takes `--approve` or `--reject`.
+Only cache and Claude fixes are ever asked about. `--yes` applies those
+without asking too (the report records them as approved automatically),
+except the one a `--resume` is waiting on: that takes `--approve` or
+`--reject`.
 
 Without a terminal to ask on (in CI, or piped), the run stops at the first
 such fix or question with `NEEDS YOU`, saves where it got to, prints the

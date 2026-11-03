@@ -2,7 +2,7 @@ import { mkdtemp, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { describe, expect, it } from 'vitest';
-import type { BuildRecipe, GraveyardReport, RecipeOp, SandboxSettings } from '@necromancer/core';
+import type { BuildRecipe, GraveyardReport, RecipeOp, ResurrectReport, SandboxSettings } from '@necromancer/core';
 import { nodeLine } from '@necromancer/core';
 import { ScriptedModel, type StructuredModel } from '@necromancer/llm';
 import {
@@ -11,16 +11,19 @@ import {
   DEFAULT_LIMITS,
   DEFAULT_TOKEN_BUDGET,
   DEFAULT_HEALTH_TIMEOUT_SEC,
+  errorSignature,
   FixCache,
   fixRisks,
   KNOWN_FIXES,
   ResumeError,
   NO_MORE_QUESTIONS,
   opsKey,
+  prepareResume,
   resurrect,
   type ApprovalRequest,
   type FixProposal,
   type OwnerQuestion,
+  type ResumeOverrides,
 } from '@necromancer/resurrect';
 import { deadApp, expressMongoApp, FakeSandbox, NODE_GYP_LOG } from './helpers.js';
 
@@ -38,6 +41,19 @@ const question = (q = 'Is there a public replacement for @acme/core?'): FixPropo
 });
 
 const recipe = { nodeImage: 'node:6' } as BuildRecipe;
+
+/** A risky fix the cache holds for the UNKNOWN boot failure: known fixes never wait for the owner, cached ones do. */
+const CONFIG_FIX = { description: 'add the config package', ops: [{ op: 'setDependency', name: 'config', version: '^1.0.0' }] as RecipeOp[] };
+const CACHE_ID = `cache:${errorSignature('boot', UNKNOWN)}`;
+async function riskyCache(): Promise<FixCache> {
+  const cache = new FixCache(null);
+  await cache.remember(errorSignature('boot', UNKNOWN), CONFIG_FIX);
+  return cache;
+}
+
+/** The checked resume of `from` with the owner's answer, for a resumed run handed `model`. */
+const resumeOf = (from: ResurrectReport, decision: { approve?: boolean; answer?: string }, model: StructuredModel | null = null, overrides?: ResumeOverrides) =>
+  prepareResume(from, { model, overrides, ...decision });
 
 describe('fixRisks', () => {
   it('flags changes to dependencies, Node majors, system packages and what runs', () => {
@@ -91,7 +107,7 @@ describe('fixRisks', () => {
     expect(fixRisks(recipe, [{ op: 'addInstallFlags', flags: ['--force'] }])[0]!.reason).toMatch(/^installs with --force/);
   });
 
-  it('asks about the known fixes that change the project, and only those', () => {
+  it('flags the known fixes that change the project, and only those (they are applied without asking all the same)', () => {
     const ctx = { phase: 'install' as const, log: '', recipe: { nodeImage: 'node:16' } as BuildRecipe, dependencies: {}, devOnly: new Set<string>() };
     const gated = KNOWN_FIXES.filter((k) => fixRisks(ctx.recipe, k.ops(ctx)).length).map((k) => k.id);
     expect(KNOWN_FIXES.map((k) => k.id).filter((id) => !gated.includes(id))).toEqual(['debian-archive', 'husky', 'peer-deps', 'yarn-engines']);
@@ -281,26 +297,28 @@ describe('declined fix keys', () => {
     expect(opsKey([a, b])).not.toBe(opsKey([b, a]));
   });
 
-  it('refuses a model fix with the same effect as the declined node-sass fix', async () => {
+  it('passes over a known fix with the same effect as a model fix the owner declined', async () => {
     const manifest = { name: 'dead-styles', main: 'server.js', scripts: { start: 'node server.js' }, dependencies: { express: '^4.15.0', 'node-sass': '^4.5.0' } };
     const root = await deadApp({ ...expressMongoApp, 'package.json': JSON.stringify(manifest) });
-    const reordered = fix(
+    const swap = fix(
       [
         { op: 'setDependency', name: 'sass', version: '^1.32.0' },
         { op: 'removeDependency', name: 'node-sass' },
       ],
       'swap node-sass for sass',
     );
-    const model = new ScriptedModel(reordered, fix([{ op: 'setEnv', name: 'CI', value: 'true' }]));
+    const model = new ScriptedModel(swap, fix([{ op: 'setEnv', name: 'CI', value: 'true' }]), fix([{ op: 'setEnv', name: 'TZ', value: 'UTC' }]));
     const verdicts: string[] = [];
-    const report = await resurrect(root, {
-      sandbox: new FakeSandbox({ install: [{ ok: false, log: 'npm ERR! node-sass@4.5.0 postinstall: `node scripts/build.js`\nError: Node Sass does not yet support your current environment' }] }),
-      model,
-      approve: async (r) => (verdicts.push(r.fix.id), 'reject'),
+    const sandbox = new FakeSandbox({
+      // The swap is declined at boot; when node-sass then fails to install, the known fix would make the same change.
+      boot: [{ ok: false, log: UNKNOWN }],
+      install: [{ ok: true }, { ok: false, log: 'npm ERR! node-sass@4.5.0 postinstall: `node scripts/build.js`\nError: Node Sass does not yet support your current environment' }],
     });
-    expect(verdicts).toEqual(['node-sass']);
-    expect(report.warnings).toContain('attempt 1: rejected a proposed fix (the owner already declined that fix)');
+    const report = await resurrect(root, { sandbox, model, approve: async (r) => (verdicts.push(r.fix.description), 'reject') });
+    expect(verdicts).toEqual(['swap node-sass for sass']);
     expect(report.outcome).toBe('resurrected');
+    expect(report.attempts.map((a) => a.fix?.source ?? null)).toEqual(['llm', 'llm', null]);
+    expect(sandbox.manifests.at(-1)!.dependencies).toHaveProperty('node-sass');
   });
 
   it('refuses a declined model fix that comes back reordered', async () => {
@@ -320,33 +338,87 @@ describe('declined fix keys', () => {
 });
 
 describe('owner approval', () => {
-  it('asks before a risky known fix and applies it when approved', async () => {
-    const requests: ApprovalRequest[] = [];
+  it('applies a risky known fix without asking, and records that it did', async () => {
+    let asked = 0;
+    const progress: string[] = [];
     const report = await resurrect(await deadApp(expressMongoApp), {
       sandbox: new FakeSandbox({ install: [{ ok: false, log: NODE_GYP_LOG }] }),
+      approve: async () => (asked++, 'pause'),
+      onProgress: (m) => progress.push(m),
+    });
+    expect(report.outcome).toBe('resurrected');
+    expect(asked).toBe(0);
+    expect(report.attempts[0]!.fix).toMatchObject({ source: 'known', id: 'node-gyp-python' });
+    expect(progress).toContain('attempt 1: applying known fix node-gyp-python without asking, though it installs Debian packages: python, make, g++');
+    expect(report.decisions).toEqual([
+      {
+        attempt: 1,
+        kind: 'approval',
+        by: 'auto',
+        subject: 'node-gyp-python',
+        answer: 'approved',
+        description: 'A native module needs node-gyp, which needs Python and a C++ toolchain',
+        risks: [{ op: 'aptInstall', reason: 'installs Debian packages: python, make, g++' }],
+        at: expect.any(String),
+      },
+    ]);
+    expect(report.pending).toBeNull();
+  });
+
+  it('asks before a risky cached fix and applies it when approved', async () => {
+    const requests: ApprovalRequest[] = [];
+    const report = await resurrect(await deadApp(expressMongoApp), {
+      sandbox: new FakeSandbox({ boot: [{ ok: false, log: UNKNOWN }] }),
+      fixCache: await riskyCache(),
       approve: async (r) => (requests.push(r), 'approve'),
     });
     expect(report.outcome).toBe('resurrected');
     expect(requests).toHaveLength(1);
     expect(requests[0]).toMatchObject({
       attempt: 1,
-      phase: 'install',
-      fix: { source: 'known', id: 'node-gyp-python' },
-      risks: [{ op: 'aptInstall', reason: 'installs Debian packages: python, make, g++' }],
+      phase: 'boot',
+      fix: { source: 'cache', id: CACHE_ID },
+      risks: [{ op: 'setDependency', reason: 'changes package.json: sets config to ^1.0.0' }],
     });
-    expect(requests[0]!.errorExcerpt).toContain("Can't find Python");
+    expect(requests[0]!.errorExcerpt).toContain('Cannot find module');
     expect(report.decisions).toEqual([
       {
         attempt: 1,
         kind: 'approval',
-        subject: 'node-gyp-python',
+        by: 'owner',
+        subject: CACHE_ID,
         answer: 'approved',
-        description: 'A native module needs node-gyp, which needs Python and a C++ toolchain',
+        description: 'add the config package',
+        risks: [{ op: 'setDependency', reason: 'changes package.json: sets config to ^1.0.0' }],
         at: expect.any(String),
       },
     ]);
     expect(report.pending).toBeNull();
     expect(report.resume).toBeNull();
+  });
+
+  it('records a blanket approval as automatic, and never shows the model an automatic decision as the owner’s', async () => {
+    const model = new ScriptedModel(
+      fix([{ op: 'setDependency', name: 'config', version: '^1.0.0' }], 'add the config package'),
+      fix([{ op: 'setEnv', name: 'CI', value: 'true' }]),
+    );
+    const cache = new FixCache(null);
+    const report = await resurrect(await deadApp(expressMongoApp), {
+      // A known fix, then a model fix approved by --yes, then a failure the model is asked about again.
+      sandbox: new FakeSandbox({ install: [{ ok: false, log: NODE_GYP_LOG }], boot: [{ ok: false, log: UNKNOWN }, { ok: false, log: `${UNKNOWN}\nError: variant` }] }),
+      model,
+      fixCache: cache,
+      approve: async () => 'auto-approve',
+    });
+    expect(report.outcome).toBe('resurrected');
+    expect(report.decisions).toMatchObject([
+      { attempt: 1, by: 'auto', subject: 'node-gyp-python', answer: 'approved' },
+      { attempt: 2, by: 'auto', subject: expect.stringMatching(/^llm:/), answer: 'approved', description: 'add the config package' },
+    ]);
+    for (const request of model.requests) expect(request.prompt).not.toContain('owner');
+    expect(model.requests[1]!.prompt).toContain('applied llm:');
+    // Nobody answered a question, so the model fix that got past its error is cached.
+    expect(await cache.get(report.attempts[1]!.signature!)).toMatchObject({ description: 'add the config package' });
   });
 
   it('does not ask about safe fixes', async () => {
@@ -361,30 +433,32 @@ describe('owner approval', () => {
     expect(report.decisions).toEqual([]);
   });
 
-  it('blocks when the owner declines a known fix and nothing else fits', async () => {
+  it('blocks when the owner declines a cached fix and nothing else fits', async () => {
     const report = await resurrect(await deadApp(expressMongoApp), {
-      sandbox: new FakeSandbox({ install: [{ ok: false, log: NODE_GYP_LOG }] }),
+      sandbox: new FakeSandbox({ boot: [{ ok: false, log: UNKNOWN }] }),
+      fixCache: await riskyCache(),
       model: null,
       approve: async () => 'reject',
     });
     expect(report.outcome).toBe('blocked');
-    expect(report.blockedReason).toMatch(/^the owner declined node-gyp-python and there is no other fix for: gyp ERR! stack Error: Can't find Python/);
-    expect(report.decisions).toMatchObject([{ kind: 'approval', subject: 'node-gyp-python', answer: 'rejected' }]);
+    expect(report.blockedReason).toBe(`the owner declined ${CACHE_ID} and there is no other fix for: Error: Cannot find module './config/local.json'`);
+    expect(report.decisions).toMatchObject([{ kind: 'approval', by: 'owner', subject: CACHE_ID, answer: 'rejected' }]);
     expect(report.attempts[0]!.fix).toBeNull();
   });
 
-  it('asks the model for something else when the owner declines a known fix', async () => {
+  it('asks the model for something else when the owner declines a cached fix', async () => {
     const model = new ScriptedModel(fix([{ op: 'setEnv', name: 'CI', value: 'true' }], 'skip the source build'));
     const report = await resurrect(await deadApp(expressMongoApp), {
-      sandbox: new FakeSandbox({ install: [{ ok: false, log: NODE_GYP_LOG }] }),
+      sandbox: new FakeSandbox({ boot: [{ ok: false, log: UNKNOWN }] }),
+      fixCache: await riskyCache(),
       model,
       approve: async () => 'reject',
     });
     expect(report.outcome).toBe('resurrected');
     expect(report.attempts[0]!.fix).toMatchObject({ source: 'llm' });
     const prompt = model.requests[0]!.prompt;
-    expect(prompt).toContain('Your previous proposal was rejected: the owner declined it: A native module needs node-gyp');
-    expect(prompt).toContain('- attempt 1: the owner rejected fix node-gyp-python');
+    expect(prompt).toContain('Your previous proposal was rejected: the owner declined it: add the config package');
+    expect(prompt).toContain(`The owner's decisions so far:\n- attempt 1: the owner rejected fix ${CACHE_ID}`);
   });
 
   it('re-asks the model when the owner declines its fix, and refuses the same fix twice', async () => {
@@ -418,23 +492,28 @@ describe('owner approval', () => {
 
   it('pauses as needs-you with the pending fix and the state to resume from', async () => {
     const progress: string[] = [];
-    const sandbox = new FakeSandbox({ install: [{ ok: false, log: NODE_GYP_LOG }] });
-    const report = await resurrect(await deadApp(expressMongoApp), { sandbox, approve: async () => 'pause', onProgress: (m) => progress.push(m) });
+    const sandbox = new FakeSandbox({ boot: [{ ok: false, log: UNKNOWN }] });
+    const report = await resurrect(await deadApp(expressMongoApp), {
+      sandbox,
+      fixCache: await riskyCache(),
+      approve: async () => 'pause',
+      onProgress: (m) => progress.push(m),
+    });
     expect(report.outcome).toBe('needs-you');
     expect(report.blockedReason).toBeNull();
-    expect(report.pending).toMatchObject({ kind: 'approval', fix: { id: 'node-gyp-python' }, risks: [{ op: 'aptInstall' }] });
+    expect(report.pending).toMatchObject({ kind: 'approval', fix: { source: 'cache', id: CACHE_ID }, risks: [{ op: 'setDependency' }] });
     expect(report.resume).toMatchObject({
       nextAttempt: 2,
-      failure: { attempt: 1, phase: 'install', signature: report.attempts[0]!.signature },
+      failure: { attempt: 1, phase: 'boot', signature: report.attempts[0]!.signature },
       seen: { [report.attempts[0]!.signature!]: 1 },
       tokens: 0,
       calls: 0,
     });
-    expect(report.resume!.failure.log).toContain("Can't find Python");
+    expect(report.resume!.failure.log).toContain('Cannot find module');
     expect(report.attempts[0]!.fix).toBeNull();
-    expect(report.recipe.aptPackages).toEqual([]);
+    expect(report.decisions).toEqual([]);
     expect(sandbox.cleaned).toBe(1);
-    expect(progress.at(-1)).toBe('NEEDS YOU: approve A native module needs node-gyp, which needs Python and a C++ toolchain');
+    expect(progress.at(-1)).toBe('NEEDS YOU: approve add the config package');
   });
 });
 
@@ -541,7 +620,7 @@ describe('questions', () => {
     expect(from.outcome).toBe('needs-you');
     expect(from.pending).toMatchObject({ kind: 'approval', fix: { description: 'stub @acme/core' } });
     expect(from.resume).toMatchObject({ questions: 3, declines: 0 });
-    const report = await resurrect(root, { sandbox: new FakeSandbox({}), resume: { from, approve: true, model: null } });
+    const report = await resurrect(root, { sandbox: new FakeSandbox({}), resume: resumeOf(from, { approve: true }, null, { model: null }) });
     expect(report.outcome).toBe('resurrected');
   });
 
@@ -616,9 +695,9 @@ describe('questions', () => {
 });
 
 describe('resume', () => {
-  async function paused(log = NODE_GYP_LOG) {
+  async function paused() {
     const root = await deadApp(expressMongoApp);
-    const report = await resurrect(root, { sandbox: new FakeSandbox({ install: [{ ok: false, log }] }), approve: async () => 'pause' });
+    const report = await resurrect(root, { sandbox: new FakeSandbox({ boot: [{ ok: false, log: UNKNOWN }] }), fixCache: await riskyCache(), approve: async () => 'pause' });
     expect(report.outcome).toBe('needs-you');
     return { root, report };
   }
@@ -626,29 +705,35 @@ describe('resume', () => {
   it('applies the approved fix and carries on with the next attempt', async () => {
     const { root, report: from } = await paused();
     const sandbox = new FakeSandbox({});
-    const report = await resurrect(root, { sandbox, resume: { from, approve: true } });
+    const report = await resurrect(root, { sandbox, resume: resumeOf(from, { approve: true }) });
     expect(report.outcome).toBe('resurrected');
     expect(report.attempts.map((a) => [a.n, a.ok])).toEqual([
       [1, false],
       [2, true],
     ]);
-    expect(report.attempts[0]!.fix).toMatchObject({ id: 'node-gyp-python' });
-    expect(report.recipe.aptPackages).toEqual(['python', 'make', 'g++']);
-    expect(sandbox.dockerfiles[0]).toContain('apt-get install -y --no-install-recommends python make g++');
+    expect(report.attempts[0]!.fix).toMatchObject({ source: 'cache', id: CACHE_ID });
+    expect(sandbox.manifests[0]!.dependencies).toMatchObject({ config: '^1.0.0' });
     expect(sandbox.calls[0]!.image).toMatch(/:attempt-2$/);
-    expect(report.decisions).toMatchObject([{ attempt: 1, kind: 'approval', subject: 'node-gyp-python', answer: 'approved' }]);
+    expect(report.decisions).toMatchObject([{ attempt: 1, kind: 'approval', by: 'owner', subject: CACHE_ID, answer: 'approved', risks: [{ op: 'setDependency' }] }]);
     expect(report.pending).toBeNull();
     expect(report.resume).toBeNull();
   });
 
+  it('reads decisions saved before `by` existed as the owner’s', async () => {
+    const { root, report: paused1 } = await paused();
+    const from = { ...paused1, decisions: [{ attempt: 1, kind: 'question', subject: 'Stub it?', answer: 'yes', at: '2026-01-01T00:00:00Z' }] } as ResurrectReport;
+    const report = await resurrect(root, { sandbox: new FakeSandbox({}), resume: resumeOf(from, { approve: true }) });
+    expect(report.decisions).toMatchObject([{ kind: 'question', by: 'owner' }, { kind: 'approval', by: 'owner' }]);
+  });
+
   it('asks the model again when the owner declines on resume', async () => {
     const { root, report: from } = await paused();
-    const model = new ScriptedModel(fix([{ op: 'setEnv', name: 'npm_config_build_from_source', value: 'false' }]));
-    const report = await resurrect(root, { sandbox: new FakeSandbox({}), model, resume: { from, approve: false, model: 'scripted' } });
+    const model = new ScriptedModel(fix([{ op: 'setEnv', name: 'CI', value: 'true' }]));
+    const report = await resurrect(root, { sandbox: new FakeSandbox({}), model, resume: resumeOf(from, { approve: false }, model, { model: 'scripted' }) });
     expect(report.outcome).toBe('resurrected');
-    expect(model.requests[0]!.prompt).toContain('the owner declined it: A native module needs node-gyp');
+    expect(model.requests[0]!.prompt).toContain('the owner declined it: add the config package');
     expect(report.attempts[0]!.fix).toMatchObject({ source: 'llm' });
-    expect(report.decisions).toMatchObject([{ subject: 'node-gyp-python', answer: 'rejected' }]);
+    expect(report.decisions).toMatchObject([{ subject: CACHE_ID, answer: 'rejected' }]);
   });
 
   it('remembers model fixes the owner declined before the pause', async () => {
@@ -664,7 +749,7 @@ describe('resume', () => {
     expect(from.outcome).toBe('needs-you');
     expect(from.resume).toMatchObject({ declined: ['"add the config package"'], questions: 0, declines: 1, answer: null });
     const model = new ScriptedModel(a, fix([{ op: 'setEnv', name: 'CI', value: 'true' }]));
-    const report = await resurrect(root, { sandbox: new FakeSandbox({}), model, approve: async () => 'reject', resume: { from, approve: false } });
+    const report = await resurrect(root, { sandbox: new FakeSandbox({}), model, approve: async () => 'reject', resume: resumeOf(from, { approve: false }, model) });
     expect(report.outcome).toBe('resurrected');
     expect(report.warnings).toContain('attempt 1: rejected a proposed fix (the owner already declined that fix)');
     expect(report.attempts[0]!.fix).toMatchObject({ ops: [{ op: 'setEnv', name: 'CI' }] });
@@ -673,7 +758,7 @@ describe('resume', () => {
   it('warns when the repo moved on since the pause', async () => {
     const { root, report: paused1 } = await paused();
     const from = { ...paused1, repo: { ...paused1.repo, commit: 'a'.repeat(40) } };
-    const report = await resurrect(root, { sandbox: new FakeSandbox({}), resume: { from, approve: true } });
+    const report = await resurrect(root, { sandbox: new FakeSandbox({}), resume: resumeOf(from, { approve: true }) });
     expect(report.outcome).toBe('resurrected');
     expect(report.warnings).toContain(
       `the repo changed since the run paused (aaaaaaa → ${report.repo.commit!.slice(0, 7)}); the saved recipe was diagnosed against the old commit`,
@@ -685,7 +770,7 @@ describe('resume', () => {
     const from = await resurrect(root, { sandbox: new FakeSandbox({ install: [{ ok: false, log: PRIVATE }] }), model: new ScriptedModel(question()) });
     expect(from.outcome).toBe('needs-you');
     const model = new ScriptedModel(fix([{ op: 'setEnv', name: 'LANG', value: 'C.UTF-8' }]));
-    const report = await resurrect(root, { sandbox: new FakeSandbox({}), model, resume: { from, answer: 'stub it' } });
+    const report = await resurrect(root, { sandbox: new FakeSandbox({}), model, resume: resumeOf(from, { answer: 'stub it' }, model) });
     expect(report.outcome).toBe('resurrected');
     expect(model.requests[0]!.prompt).toContain('The owner answered your question: stub it');
     expect(report.llm.calls).toBe(2);
@@ -697,7 +782,7 @@ describe('resume', () => {
     const report = await resurrect(root, {
       sandbox: new FakeSandbox({ boot: [{ ok: false, log: UNKNOWN }] }),
       model: null,
-      resume: { from, approve: true, maxIterations: 2 },
+      resume: resumeOf(from, { approve: true }, null, { maxIterations: 2 }),
     });
     expect(report.blockedReason).toMatch(/^still failing after 2 attempts/);
   });
@@ -719,7 +804,7 @@ describe('resume', () => {
     });
     expect(from.outcome).toBe('needs-you');
     expect(from.resume).toMatchObject({ nextAttempt: 13, settings: { maxIterations: 20, tokenBudget: 500_000, model: 'scripted' } });
-    const report = await resurrect(root, { sandbox: new FakeSandbox({}), model: null, resume: { from, approve: true, model: null } });
+    const report = await resurrect(root, { sandbox: new FakeSandbox({}), model: null, resume: resumeOf(from, { approve: true }, null, { model: null }) });
     expect(report.outcome).toBe('resurrected');
     expect(report.attempts.at(-1)).toMatchObject({ n: 13, ok: true });
     expect(report.llm.budget).toBe(500_000);
@@ -727,7 +812,7 @@ describe('resume', () => {
 
   it('always tries the fix a resume settles on, even past a lower limit', async () => {
     const { root, report: from } = await paused();
-    const report = await resurrect(root, { sandbox: new FakeSandbox({}), maxIterations: 1, resume: { from, approve: true, maxIterations: 1 } });
+    const report = await resurrect(root, { sandbox: new FakeSandbox({}), maxIterations: 1, resume: resumeOf(from, { approve: true }, null, { maxIterations: 1 }) });
     expect(report.outcome).toBe('resurrected');
     expect(report.attempts.map((a) => a.n)).toEqual([1, 2]);
   });
@@ -735,24 +820,18 @@ describe('resume', () => {
   it('refuses a report that is not waiting, or a resume without the answer it needs', async () => {
     const root = await deadApp(expressMongoApp);
     const done = await resurrect(root, { sandbox: new FakeSandbox({}) });
-    await expect(resurrect(root, { sandbox: new FakeSandbox({}), resume: { from: done, approve: true } })).rejects.toThrow(/needs-you.*ended resurrected/);
+    expect(() => prepareResume(done, { approve: true })).toThrow(/needs-you.*ended resurrected/);
 
     const { report: approval } = await paused();
-    await expect(resurrect(root, { sandbox: new FakeSandbox({}), resume: { from: approval } })).rejects.toThrow(/approve or reject node-gyp-python/);
-    await expect(resurrect(root, { sandbox: new FakeSandbox({}), resume: { from: approval, answer: 'yes' } })).rejects.toThrow(
-      'the run is waiting on a fix approval, not a question; pass approve true or false for node-gyp-python',
-    );
+    expect(() => prepareResume(approval)).toThrow(`approve or reject ${CACHE_ID}`);
+    expect(() => prepareResume(approval, { answer: 'yes' })).toThrow(`the run is waiting on a fix approval, not a question; pass approve true or false for ${CACHE_ID}`);
+    // resurrect checks the answer too, for a run checked without one.
+    await expect(resurrect(root, { sandbox: new FakeSandbox({}), resume: { run: checkResumable(approval) } })).rejects.toThrow(`approve or reject ${CACHE_ID}`);
     const asking = await resurrect(root, { sandbox: new FakeSandbox({ install: [{ ok: false, log: PRIVATE }] }), model: new ScriptedModel(question()) });
-    await expect(resurrect(root, { sandbox: new FakeSandbox({}), model: new ScriptedModel(), resume: { from: asking, answer: ' ' } })).rejects.toThrow(
-      /needs an answer to the pending question: Is there a public replacement/,
-    );
-    await expect(resurrect(root, { sandbox: new FakeSandbox({}), model: new ScriptedModel(), resume: { from: asking, approve: true } })).rejects.toThrow(
-      /^the run is waiting on an answer to a question, not a fix approval/,
-    );
-    for (const options of [{ model: null, resume: {} }, { model: new ScriptedModel(), resume: { tokenBudget: 0 } }]) {
-      await expect(resurrect(root, { sandbox: new FakeSandbox({}), model: options.model, resume: { from: asking, answer: 'stub it', ...options.resume } })).rejects.toThrow(
-        /answering the pending question needs a model/,
-      );
+    expect(() => prepareResume(asking, { model: new ScriptedModel(), answer: ' ' })).toThrow(/needs an answer to the pending question: Is there a public replacement/);
+    expect(() => prepareResume(asking, { model: new ScriptedModel(), approve: true })).toThrow(/^the run is waiting on an answer to a question, not a fix approval/);
+    for (const options of [{ model: null, overrides: {} }, { model: new ScriptedModel(), overrides: { tokenBudget: 0 } }]) {
+      expect(() => prepareResume(asking, { ...options, answer: 'stub it' })).toThrow(/answering the pending question needs a model/);
     }
   });
 });
@@ -766,7 +845,8 @@ describe('a resumed run keeps the paused run’s settings', () => {
     const caFile = path.join(await mkdtemp(path.join(os.tmpdir(), 'necro-ca-')), 'proxy.crt');
     await writeFile(caFile, '-----BEGIN CERTIFICATE-----\n');
     const from = await resurrect(root, {
-      sandbox: sandboxWith({ buildProxy: true, healthTimeoutSec: 30 }, { install: [{ ok: false, log: NODE_GYP_LOG }] }),
+      sandbox: sandboxWith({ buildProxy: true, healthTimeoutSec: 30 }, { boot: [{ ok: false, log: UNKNOWN }] }),
+      fixCache: await riskyCache(),
       limits: { cpus: 1, memoryMb: 512, stepTimeoutSec: 60 },
       caFile,
       approve: async () => 'pause',
@@ -790,7 +870,7 @@ describe('a resumed run keeps the paused run’s settings', () => {
       sandbox,
       graveyard,
       limits: { cpus: 4, memoryMb: 8192, stepTimeoutSec: 900 },
-      resume: { from: saved, approve: true },
+      resume: resumeOf(saved, { approve: true }),
     });
     expect(report.outcome).toBe('resurrected');
     const limits = { ...DEFAULT_LIMITS, cpus: 1, memoryMb: 512, stepTimeoutSec: 60 };
@@ -807,14 +887,14 @@ describe('a resumed run keeps the paused run’s settings', () => {
   it('changes only the limits the resume names', async () => {
     const { root, from } = await pausedWith();
     const sandbox = sandboxWith({ buildProxy: true, healthTimeoutSec: 30 });
-    const report = await resurrect(root, { sandbox, resume: { from, approve: true, limits: { memoryMb: 1024, cpus: undefined } } });
+    const report = await resurrect(root, { sandbox, resume: resumeOf(from, { approve: true }, null, { limits: { memoryMb: 1024, cpus: undefined } }) });
     expect(sandbox.calls[0]!.limits).toEqual({ ...DEFAULT_LIMITS, cpus: 1, memoryMb: 1024, stepTimeoutSec: 60 });
     expect(report.limits.memoryMb).toBe(1024);
   });
 
   it('warns when the sandbox it is handed is set up differently', async () => {
     const { root, from } = await pausedWith();
-    const report = await resurrect(root, { sandbox: sandboxWith({ buildProxy: false, healthTimeoutSec: 90 }), resume: { from, approve: true } });
+    const report = await resurrect(root, { sandbox: sandboxWith({ buildProxy: false, healthTimeoutSec: 90 }), resume: resumeOf(from, { approve: true }) });
     expect(report.warnings).toContain(
       "the sandbox is set up differently from the paused run's (without the build proxy, 90s health timeout, was with the build proxy, 30s health timeout)",
     );
@@ -823,7 +903,8 @@ describe('a resumed run keeps the paused run’s settings', () => {
   it('tells a front-end everything it needs before it asks the owner', async () => {
     const { from, caFile } = await pausedWith();
     const run = checkResumable(from, { resume: { maxIterations: 4, limits: { pids: 64 } } });
-    expect(run.pending).toMatchObject({ kind: 'approval', fix: { id: 'node-gyp-python' } });
+    expect(run.from).toBe(from);
+    expect(run.pending).toMatchObject({ kind: 'approval', fix: { id: CACHE_ID } });
     expect(run.state.nextAttempt).toBe(2);
     expect(run.settings).toEqual({
       maxIterations: 4,
@@ -893,12 +974,13 @@ describe('a resumed run restores the model, image cleanup and workdir', () => {
     const elsewhere = await mkdtemp(path.join(os.tmpdir(), 'necro-elsewhere-'));
     const { root, from } = await pausedOn({ keepImages: true, workdir });
     const sandbox = new ContextSandbox({});
+    const model = new ScriptedModel();
     const report = await resurrect(root, {
       sandbox,
-      model: new ScriptedModel(),
+      model,
       keepImages: false,
       workdir: elsewhere,
-      resume: { from, approve: true },
+      resume: resumeOf(from, { approve: true }, model),
     });
     expect(report.outcome).toBe('resurrected');
     expect(sandbox.cleaned).toBe(0);
@@ -912,7 +994,7 @@ describe('a resumed run restores the model, image cleanup and workdir', () => {
     expect(resumeSettings(from, { model: null, keepImages: false, workdir: null })).toMatchObject({ model: null, keepImages: false, workdir: null });
     expect(resumeSettings(from, { tokenBudget: 0 }).model).toBeNull();
     const sandbox = new ContextSandbox({});
-    const report = await resurrect(root, { sandbox, resume: { from, approve: true, model: null, keepImages: false, workdir: null } });
+    const report = await resurrect(root, { sandbox, resume: resumeOf(from, { approve: true }, null, { model: null, keepImages: false, workdir: null }) });
     expect(report.outcome).toBe('resurrected');
     expect(sandbox.cleaned).toBe(1);
     expect(path.dirname(sandbox.contexts[0]!)).toBe(os.tmpdir());
@@ -922,85 +1004,89 @@ describe('a resumed run restores the model, image cleanup and workdir', () => {
   it('refuses a model other than the one the resumed run names', async () => {
     const { root, from } = await pausedOn();
     const other: StructuredModel = Object.assign(new ScriptedModel(), { name: 'other' });
-    const run = (model: StructuredModel | null, resume: object = {}) =>
-      resurrect(root, { sandbox: new FakeSandbox({}), model, resume: { from, approve: true, ...resume } });
-    await expect(run(other)).rejects.toThrow('the resumed run asks scripted for fixes, but was handed the model other');
-    await expect(run(null)).rejects.toThrow('the resumed run asks scripted for fixes, but was handed no model');
-    await expect(run(new ScriptedModel(), { model: null })).rejects.toThrow('the resumed run uses known and cached fixes only, but was handed the model scripted');
+    const check = (model: StructuredModel | null, overrides: ResumeOverrides = {}) => () => prepareResume(from, { model, overrides, approve: true });
+    expect(check(other)).toThrow('the resumed run asks scripted for fixes, but was handed the model other');
+    expect(check(null)).toThrow('the resumed run asks scripted for fixes, but was handed no model');
+    expect(check(new ScriptedModel(), { model: null })).toThrow('the resumed run uses known and cached fixes only, but was handed the model scripted');
     expect(() => checkResumable(from, { model: other })).toThrow(/handed the model other/);
     expect(checkResumable(from, { model: other, resume: { model: 'other' } }).settings.model).toBe('other');
-    const known = await resurrect(root, { sandbox: new FakeSandbox({ install: [{ ok: false, log: NODE_GYP_LOG }] }), approve: async () => 'pause' });
-    expect(known.resume!.settings.model).toBeNull();
-    await expect(resurrect(root, { sandbox: new FakeSandbox({}), model: new ScriptedModel(), resume: { from: known, approve: true } })).rejects.toThrow(
-      /uses known and cached fixes only/,
+    // resurrect takes the checked run as it is, but must be handed the model it was checked with.
+    const run = checkResumable(from, { model: new ScriptedModel() });
+    await expect(resurrect(root, { sandbox: new FakeSandbox({}), model: other, resume: { run, approve: true } })).rejects.toThrow(
+      'the resumed run asks scripted for fixes, but was handed the model other',
     );
+    await expect(resurrect(root, { sandbox: new FakeSandbox({}), resume: { run, approve: true } })).rejects.toThrow(/but was handed no model/);
+    const cached = await resurrect(root, { sandbox: new FakeSandbox({ boot: [{ ok: false, log: UNKNOWN }] }), fixCache: await riskyCache(), approve: async () => 'pause' });
+    expect(cached.resume!.settings.model).toBeNull();
+    expect(() => prepareResume(cached, { model: new ScriptedModel(), approve: true })).toThrow(/uses known and cached fixes only/);
   });
 });
 
 describe('a declined fix stays declined for the whole run', () => {
-  it('does not offer a declined known fix again on a later failure', async () => {
+  it('does not offer a declined cached fix again on a later failure', async () => {
     const shown: string[] = [];
     const report = await resurrect(await deadApp(expressMongoApp), {
-      sandbox: new FakeSandbox({ install: [{ ok: false, log: NODE_GYP_LOG }, { ok: false, log: NODE_GYP_LOG }] }),
+      sandbox: new FakeSandbox({ boot: [{ ok: false, log: UNKNOWN }, { ok: false, log: UNKNOWN }] }),
+      fixCache: await riskyCache(),
       model: new ScriptedModel(fix([{ op: 'setEnv', name: 'TZ', value: 'try-a' }], 'try a'), fix([{ op: 'setEnv', name: 'TZ', value: 'try-b' }], 'try b')),
       approve: async (r) => (shown.push(r.fix.id), 'reject'),
     });
     expect(report.outcome).toBe('resurrected');
-    expect(shown).toEqual(['node-gyp-python']);
+    expect(shown).toEqual([CACHE_ID]);
     expect(report.attempts.map((a) => a.fix?.id ?? null)).toEqual([expect.stringMatching(/^llm:/), expect.stringMatching(/^llm:/), null]);
   });
 
-  it('refuses a model fix with the same ops as a declined known fix', async () => {
-    const shown: string[] = [];
-    const model = new ScriptedModel(
-      fix([{ op: 'aptInstall', packages: ['g++', 'make', 'python'] }], 'install the toolchain'),
-      fix([{ op: 'setEnv', name: 'CI', value: 'true' }], 'skip the source build'),
-    );
-    const report = await resurrect(await deadApp(expressMongoApp), {
-      sandbox: new FakeSandbox({ install: [{ ok: false, log: NODE_GYP_LOG }] }),
-      model,
-      approve: async (r) => (shown.push(r.fix.description), 'reject'),
+  it('matches declined fixes by what they would do now, never by id', async () => {
+    const root = await deadApp(expressMongoApp);
+    const paused1 = await resurrect(root, { sandbox: new FakeSandbox({ boot: [{ ok: false, log: UNKNOWN }] }), fixCache: await riskyCache(), approve: async () => 'pause' });
+    // Runs from before this rule also saved the ids of declined known and cached fixes.
+    const from = { ...paused1, resume: { ...paused1.resume!, declinedFixes: ['node-gyp-python', CACHE_ID] } };
+    // The cache has since learned another fix for the boot error, under the same id.
+    const cache = new FixCache(null);
+    await cache.remember(errorSignature('boot', UNKNOWN), { description: 'set the time zone', ops: [{ op: 'setEnv', name: 'TZ', value: 'UTC' }] });
+    const report = await resurrect(root, {
+      sandbox: new FakeSandbox({ install: [{ ok: false, log: NODE_GYP_LOG }], boot: [{ ok: false, log: UNKNOWN }] }),
+      fixCache: cache,
+      resume: resumeOf(from, { approve: true }),
     });
     expect(report.outcome).toBe('resurrected');
-    expect(shown).toEqual(['A native module needs node-gyp, which needs Python and a C++ toolchain']);
-    expect(report.warnings).toEqual(['attempt 1: rejected a proposed fix (the owner already declined that fix)']);
-    expect(report.attempts[0]!.fix).toMatchObject({ description: 'skip the source build' });
+    expect(report.attempts.map((a) => a.fix?.id ?? null)).toEqual([CACHE_ID, 'node-gyp-python', CACHE_ID, null]);
+    expect(report.attempts[2]!.fix).toMatchObject({ ops: [{ op: 'setEnv', name: 'TZ', value: 'UTC' }] });
   });
 
   it('keeps fixes declined before a pause declined after it, even with nobody to ask', async () => {
     const root = await deadApp(expressMongoApp);
-    const from = await resurrect(root, { sandbox: new FakeSandbox({ install: [{ ok: false, log: NODE_GYP_LOG }] }), approve: async () => 'pause' });
-    const report = await resurrect(root, {
-      // The same failure comes back after the model's fix; with no approve callback a known fix would just be applied.
-      sandbox: new FakeSandbox({ install: [{ ok: false, log: NODE_GYP_LOG }] }),
-      model: new ScriptedModel(fix([{ op: 'setEnv', name: 'TZ', value: 'try-a' }], 'try a'), fix([{ op: 'setEnv', name: 'TZ', value: 'try-b' }], 'try b')),
-      resume: { from, approve: false, model: 'scripted' },
-    });
+    const cache = await riskyCache();
+    const from = await resurrect(root, { sandbox: new FakeSandbox({ boot: [{ ok: false, log: UNKNOWN }] }), fixCache: cache, approve: async () => 'pause' });
+    const model = new ScriptedModel(fix([{ op: 'setEnv', name: 'TZ', value: 'try-a' }], 'try a'), fix([{ op: 'setEnv', name: 'TZ', value: 'try-b' }], 'try b'));
+    // The same failure comes back after the model's fix; with no approve callback the cached fix would just be applied.
+    const sandbox = new FakeSandbox({ boot: [{ ok: false, log: UNKNOWN }] });
+    const report = await resurrect(root, { sandbox, fixCache: cache, model, resume: resumeOf(from, { approve: false }, model, { model: 'scripted' }) });
     expect(report.outcome).toBe('resurrected');
     expect(report.attempts.map((a) => a.fix?.source ?? null)).toEqual(['llm', 'llm', null]);
-    expect(report.recipe.aptPackages).toEqual([]);
+    for (const manifest of sandbox.manifests) expect(manifest.dependencies).not.toHaveProperty('config');
   });
 
   it('saves the declined fixes with a paused run and blocks on them without a model', async () => {
     const root = await deadApp(expressMongoApp);
     const verdicts: Array<'reject' | 'pause'> = ['reject', 'pause'];
     const from = await resurrect(root, {
-      sandbox: new FakeSandbox({ install: [{ ok: false, log: NODE_GYP_LOG }, { ok: false, log: PRIVATE }] }),
+      sandbox: new FakeSandbox({ boot: [{ ok: false, log: UNKNOWN }], install: [{ ok: true }, { ok: false, log: PRIVATE }] }),
+      fixCache: await riskyCache(),
       model: new ScriptedModel(fix([{ op: 'setEnv', name: 'TZ', value: 'try-a' }], 'try a'), fix([{ op: 'setDependency', name: '@acme/core', version: 'file:./stub' }], 'stub')),
       approve: async () => verdicts.shift()!,
     });
     expect(from.outcome).toBe('needs-you');
-    expect(from.resume!.declinedFixes).toEqual(
-      expect.arrayContaining([opsKey([{ op: 'aptInstall', packages: ['python', 'make', 'g++'] }]), 'node-gyp-python']),
-    );
-    // Declining the pending fix, the next failure is the gyp one again: its known fix stays declined.
+    expect(from.resume!.declinedFixes).toEqual([opsKey(CONFIG_FIX.ops)]);
+    // Approving the pending fix, the next failure is the boot one again: its cached fix stays declined.
     const report = await resurrect(root, {
-      sandbox: new FakeSandbox({ install: [{ ok: false, log: NODE_GYP_LOG }] }),
+      sandbox: new FakeSandbox({ boot: [{ ok: false, log: UNKNOWN }] }),
+      fixCache: await riskyCache(),
       model: null,
-      resume: { from, approve: true, model: null },
+      resume: resumeOf(from, { approve: true }, null, { model: null }),
     });
     expect(report.outcome).toBe('blocked');
-    expect(report.blockedReason).toMatch(/^the owner declined node-gyp-python earlier in this run and there is no other fix for: gyp ERR!/);
+    expect(report.blockedReason).toBe(`the owner declined ${CACHE_ID} earlier in this run and there is no other fix for: Error: Cannot find module './config/local.json'`);
   });
 });
 
@@ -1022,11 +1108,12 @@ describe('the shared fix cache after an answer', () => {
     const root = await deadApp(expressMongoApp);
     const from = await resurrect(root, { sandbox: new FakeSandbox({ install: [{ ok: false, log: PRIVATE }] }), model: new ScriptedModel(question()) });
     const cache = new FixCache(null);
+    const model = new ScriptedModel(fix([{ op: 'setEnv', name: 'LANG', value: 'C.UTF-8' }]), fix([{ op: 'setEnv', name: 'CI', value: 'true' }]));
     const report = await resurrect(root, {
       sandbox: new FakeSandbox({ boot: [{ ok: false, log: UNKNOWN }] }),
-      model: new ScriptedModel(fix([{ op: 'setEnv', name: 'LANG', value: 'C.UTF-8' }]), fix([{ op: 'setEnv', name: 'CI', value: 'true' }])),
+      model,
       fixCache: cache,
-      resume: { from, answer: 'stub it' },
+      resume: resumeOf(from, { answer: 'stub it' }, model),
     });
     expect(report.outcome).toBe('resurrected');
     for (const a of report.attempts.slice(0, 2)) expect(await cache.get(a.signature!)).toBeNull();
@@ -1047,27 +1134,29 @@ describe('the shared fix cache after an answer', () => {
 describe('resume settings the paused run saves for later', () => {
   const sandboxWith = (settings: SandboxSettings, script: ConstructorParameters<typeof FakeSandbox>[0] = {}) =>
     Object.assign(new FakeSandbox(script), { settings });
-  const risky = () => fix([{ op: 'setDependency', name: 'config', version: '^1.0.0' }], 'add the config package');
+  const risky = () => fix([{ op: 'setDependency', name: 'dotenv', version: '^4.0.0' }], 'add dotenv');
 
   it('takes the sandbox setup a resume names, without warning, and saves it on a later pause', async () => {
     const root = await deadApp(expressMongoApp);
     const from = await resurrect(root, {
-      sandbox: sandboxWith({ buildProxy: true, healthTimeoutSec: 30 }, { install: [{ ok: false, log: NODE_GYP_LOG }] }),
+      sandbox: sandboxWith({ buildProxy: true, healthTimeoutSec: 30 }, { boot: [{ ok: false, log: UNKNOWN }] }),
+      fixCache: await riskyCache(),
       approve: async () => 'pause',
     });
     expect(resumeSettings(from, { sandbox: { healthTimeoutSec: 120, buildProxy: undefined } }).sandbox).toEqual({ buildProxy: true, healthTimeoutSec: 120 });
     expect(resumeSettings(from, { sandbox: {} }).sandbox).toEqual({ buildProxy: true, healthTimeoutSec: 30 });
+    const model = new ScriptedModel(risky());
     const report = await resurrect(root, {
-      sandbox: sandboxWith({ buildProxy: true, healthTimeoutSec: 120 }, { boot: [{ ok: false, log: UNKNOWN }] }),
-      model: new ScriptedModel(risky()),
+      sandbox: sandboxWith({ buildProxy: true, healthTimeoutSec: 120 }, { boot: [{ ok: false, log: PRIVATE }] }),
+      model,
       approve: async () => 'pause',
-      resume: { from, approve: true, model: 'scripted', sandbox: { healthTimeoutSec: 120 } },
+      resume: resumeOf(from, { approve: true }, model, { model: 'scripted', sandbox: { healthTimeoutSec: 120 } }),
     });
     expect(report.outcome).toBe('needs-you');
     expect(report.warnings).toEqual([]);
     expect(report.resume!.settings.sandbox).toEqual({ buildProxy: true, healthTimeoutSec: 120 });
     // A paused run whose sandbox did not say counts as the defaults.
-    const unknown = await resurrect(root, { sandbox: new FakeSandbox({ install: [{ ok: false, log: NODE_GYP_LOG }] }), approve: async () => 'pause' });
+    const unknown = await resurrect(root, { sandbox: new FakeSandbox({ boot: [{ ok: false, log: UNKNOWN }] }), fixCache: await riskyCache(), approve: async () => 'pause' });
     expect(resumeSettings(unknown, { sandbox: { buildProxy: true } }).sandbox).toEqual({ buildProxy: true, healthTimeoutSec: DEFAULT_HEALTH_TIMEOUT_SEC });
   });
 
@@ -1085,7 +1174,7 @@ describe('resume settings the paused run saves for later', () => {
       sandbox: new FakeSandbox({}),
       model,
       interview: interview('A chat bot', 'Rewrite it in Rust'),
-      resume: { from, answer: 'stub it' },
+      resume: resumeOf(from, { answer: 'stub it' }, model),
     });
     expect(report.outcome).toBe('resurrected');
     expect(model.requests[0]!.prompt).toContain("What the project is for: A notes API\nOwner's goals: Keep the REST API identical");
@@ -1094,7 +1183,7 @@ describe('resume settings the paused run saves for later', () => {
     const none = await resurrect(root, { sandbox: new FakeSandbox({ install: [{ ok: false, log: PRIVATE }] }), model: new ScriptedModel(question()) });
     expect(none.resume!.interview).toBeNull();
     const later = new ScriptedModel(fix([{ op: 'setEnv', name: 'CI', value: 'true' }]));
-    await resurrect(root, { sandbox: new FakeSandbox({}), model: later, interview: interview('A chat bot', 'Rewrite it in Rust'), resume: { from: none, answer: 'stub it' } });
+    await resurrect(root, { sandbox: new FakeSandbox({}), model: later, interview: interview('A chat bot', 'Rewrite it in Rust'), resume: resumeOf(none, { answer: 'stub it' }, later) });
     expect(later.requests[0]!.prompt).not.toContain('What the project is for');
   });
 });
@@ -1133,12 +1222,19 @@ describe('resume errors', () => {
     expect(code(() => checkResumable(approval, { model: new ScriptedModel(), resume: { model: null } }))).toBe('model-mismatch');
     expect(code(() => checkResumable(approval, { model: new ScriptedModel() }))).toBeNull();
 
-    const resume = (r: Record<string, unknown>, model: StructuredModel | null = new ScriptedModel()) =>
-      asyncCode(resurrect(root, { sandbox: new FakeSandbox({}), model, resume: { from: approval, ...r } }));
+    expect(code(() => prepareResume(approval, { model: new ScriptedModel() }))).toBe('needs-approve');
+    expect(code(() => prepareResume(approval, { model: new ScriptedModel(), answer: 'yes' }))).toBe('wrong-kind');
+    expect(code(() => prepareResume(asking, { model: new ScriptedModel(), approve: true }))).toBe('wrong-kind');
+    expect(code(() => prepareResume(asking, { model: new ScriptedModel(), answer: ' ' }))).toBe('needs-answer');
+
+    // resurrect checks only the answer and the model against a run checked before.
+    const run = checkResumable(approval, { model: new ScriptedModel() });
+    const resume = (r: { approve?: boolean; answer?: string }, model: StructuredModel | null = new ScriptedModel()) =>
+      asyncCode(resurrect(root, { sandbox: new FakeSandbox({}), model, resume: { run, ...r } }));
     expect(await resume({})).toBe('needs-approve');
     expect(await resume({ answer: 'yes' })).toBe('wrong-kind');
-    expect(await asyncCode(resurrect(root, { sandbox: new FakeSandbox({}), model: new ScriptedModel(), resume: { from: asking, approve: true } }))).toBe('wrong-kind');
-    expect(await asyncCode(resurrect(root, { sandbox: new FakeSandbox({}), model: new ScriptedModel(), resume: { from: asking, answer: ' ' } }))).toBe('needs-answer');
+    expect(await resume({ approve: true }, other)).toBe('model-mismatch');
+    expect(await resume({ approve: true }, null)).toBe('model-null');
   });
 
   it('refuse a resume that names a model with a token budget of 0', async () => {
@@ -1151,10 +1247,14 @@ describe('resume errors', () => {
     expect(code(() => checkResumable(from, { model: new ScriptedModel(), resume: { model: 'scripted', tokenBudget: 0 } }))).toBe('model-without-budget');
     // Without naming one, a budget of 0 still just means no model.
     expect(checkResumable(from, { resume: { tokenBudget: 0 } }).settings.model).toBeNull();
-    const zero = await resurrect(root, { sandbox: new FakeSandbox({ install: [{ ok: false, log: NODE_GYP_LOG }] }), tokenBudget: 0, approve: async () => 'pause' });
+    const zero = await resurrect(root, {
+      sandbox: new FakeSandbox({ boot: [{ ok: false, log: UNKNOWN }] }),
+      fixCache: await riskyCache(),
+      tokenBudget: 0,
+      approve: async () => 'pause',
+    });
+    expect(zero.outcome).toBe('needs-you');
     expect(code(() => checkResumable(zero, { model: new ScriptedModel(), resume: { model: 'scripted' } }))).toBe('model-without-budget');
-    expect(await asyncCode(resurrect(root, { sandbox: new FakeSandbox({}), model: new ScriptedModel(), resume: { from: zero, approve: true, model: 'scripted' } }))).toBe(
-      'model-without-budget',
-    );
+    expect(code(() => prepareResume(zero, { model: new ScriptedModel(), approve: true, overrides: { model: 'scripted' } }))).toBe('model-without-budget');
   });
 });

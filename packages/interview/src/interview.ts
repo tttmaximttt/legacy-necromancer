@@ -134,7 +134,7 @@ export function buildPrompt(report: ExhumeReport, pack: EvidencePack): string {
     h.firstCommit && h.lastCommit ? `History: ${h.commits} commits by ${h.authors} authors, ${h.firstCommit.slice(0, 10)} to ${h.lastCommit.slice(0, 10)}` : null,
     `Size: ${report.stats.files} source files, ${report.stats.loc} lines of code, ${report.stats.testFiles} test files`,
     `Module clusters (from the import graph): ${report.clusters.map((c) => `${c.label} (${c.size})`).join(', ') || 'none'}`,
-    `Most-imported packages: ${report.externalPackages.slice(0, 15).map((p) => p.name).join(', ') || 'none'}`,
+    `Most-imported packages: ${report.externalPackages.filter((p) => p.importedBy > 0).slice(0, 15).map((p) => p.name).join(', ') || 'none'}`,
     Object.keys(engines).length ? `engines: ${JSON.stringify(engines)}` : null,
   ].filter(Boolean);
   return `${facts.join('\n')}\n\n${renderEvidence(pack)}\n\nWhat is this project for? Answer in the requested format, citing the files above.`;

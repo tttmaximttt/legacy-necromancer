@@ -135,8 +135,13 @@ export interface ExhumeReport {
   loadBearing: LoadBearingFile[];
   /** Files with no internal imports in either direction: dead code, scripts, or entrypoints. */
   orphans: string[];
-  /** `importers`: the files that import the package, sorted, at most 20. Missing in older reports. */
-  externalPackages: Array<{ name: string; importedBy: number; importers?: string[] }>;
+  /**
+   * `importers`: the files that import the package, sorted, at most 20. Missing in older reports.
+   * `referencedBy`/`referenceCount`: the files whose code names a declared dependency in a string literal outside an
+   * import (`app.set('view engine', 'jade')`), sorted, at most 20, and their full count. Set only when there are some.
+   * A declared dependency that is only named, never imported, is listed with `importedBy` 0.
+   */
+  externalPackages: Array<{ name: string; importedBy: number; importers?: string[]; referencedBy?: string[]; referenceCount?: number }>;
   /** Imports whose casing doesn't match the file on disk; they break on Linux. */
   caseMismatches: Array<{ from: string; specifier: string; line: number; target: string }>;
   manifests: DependencySummary[];
@@ -418,17 +423,24 @@ export interface PendingQuestion {
 
 export type PendingDecision = PendingApproval | PendingQuestion;
 
-/** An answer given to the owner's earlier decisions, kept so the history shows who chose what. */
+/** A decision on a risky fix or a question during a run, kept so the history shows who chose what. */
 export interface OwnerDecision {
   /** The attempt whose failure the decision was about. */
   attempt: number;
   kind: 'approval' | 'question';
+  /**
+   * "owner" when the owner answered; "auto" when a risky fix was applied without asking: a built-in known fix, a
+   * blanket approval such as `--yes`, or a run with nobody set up to approve. Reports from before this field are read as "owner".
+   */
+  by: 'owner' | 'auto';
   /** For approvals: the fix id. For questions: the question. */
   subject: string;
   /** "approved", "rejected", or the owner's answer. */
   answer: string;
   /** For approvals: what the fix does. */
   description?: string;
+  /** For approvals: why the fix needed an OK (`fixRisks`). Missing in reports from before this field. */
+  risks?: FixRisk[];
   at: string;
 }
 
@@ -442,7 +454,10 @@ export interface ResurrectRunState {
   seen: Record<string, number>;
   tokens: number;
   calls: number;
-  /** Every fix the owner declined in this run, from any source, by `opsKey` of its ops; none is offered again. */
+  /**
+   * Every fix the owner declined in this run, from any source, by `opsKey` of its ops; none is offered again. Reports
+   * from before this rule may also hold known-fix ids, which are ignored.
+   */
   declinedFixes: string[];
   /** The fixes declined for the pending failure, as shown in the blocked message. */
   declined: string[];
@@ -595,8 +610,10 @@ export interface PlanStep {
   change: Array<{ name: string; from: string | null; to: string | null }>;
   /** Why this step, with evidence: tombstone causes, advisories, Resurrect fixes. */
   why: string[];
-  /** Repo files that import the packages involved, so the change can be scoped. */
+  /** Repo files that import or name the packages involved, so the change can be scoped. At most 20 per package. */
   touches: string[];
+  /** How many files import or name the packages involved; more than `touches` lists when it is capped. Missing in older plans. */
+  touchCount?: number;
   risk: 'low' | 'medium' | 'high';
   /** The owner's goals (from the interview) this step serves. */
   goals: string[];

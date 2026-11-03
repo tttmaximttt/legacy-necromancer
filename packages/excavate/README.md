@@ -8,7 +8,7 @@ repo.
 | --- | --- |
 | `clone.ts` | Partial clone with `core.symlinks=false`, or use a local path as is |
 | `files.ts` | `git ls-files`, minus vendored, built and minified code |
-| `parser.ts` | tree-sitter (JS, TS, TSX grammars as wasm) → raw import specifiers |
+| `parser.ts` | tree-sitter (JS, TS, TSX grammars as wasm) → raw import specifiers, plus string literals that look like package names (for packages loaded by name) |
 | `resolve.ts` | Specifier → internal file, npm package, Node builtin or unresolved; no filesystem access |
 | `graph.ts` | Import graph, Louvain clusters, load-bearing ranking, orphans |
 | `churn.ts` | One `git log` pass → commits and authors per file |

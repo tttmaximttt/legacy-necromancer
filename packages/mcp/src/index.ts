@@ -20,7 +20,19 @@ import { graveyard as runGraveyard, type GraveyardOptions } from '@necromancer/g
 import { buildPlan, renderPlanMarkdown } from '@necromancer/plan';
 import { answerInterview, interviewBrief, proposeIntent, ProposalSchema, recordProposal } from '@necromancer/interview';
 import { ClaudeModel, credentialsHint, hasCredentials, type StructuredModel } from '@necromancer/llm';
-import { DEFAULT_MAX_ITERATIONS, DEFAULT_TOKEN_BUDGET, DockerSandbox, FixCache, ResumeError, resumeSettings, resurrect, type ResumeInput, type RunSettings, type Sandbox } from '@necromancer/resurrect';
+import {
+  DEFAULT_MAX_ITERATIONS,
+  DEFAULT_TOKEN_BUDGET,
+  DockerSandbox,
+  FixCache,
+  prepareResume,
+  ResumeError,
+  resumeSettings,
+  resurrect,
+  type ResumeInput,
+  type RunSettings,
+  type Sandbox,
+} from '@necromancer/resurrect';
 import { compareWitness, witness } from '@necromancer/witness';
 
 export interface ServerOptions {
@@ -250,8 +262,10 @@ export function createServer(options: ServerOptions = {}): McpServer {
         'Phase 5. Builds the project in Docker on the Node version of its era, with its databases (Mongo, Redis, Postgres, ' +
         'MySQL…) as sidecars, and boots it until a port answers. Failures are fixed from a table of known fixes, then by ' +
         'Claude if an Anthropic API key is set, for at most maxIterations attempts and tokenBudget tokens; otherwise it ends ' +
-        'with BLOCKED and a reason. With approvals "ask", a fix that changes dependencies, the Node version or base image, ' +
-        'system packages, install flags or environment variables (beyond a short allow-list of harmless ones), or what runs pauses the run with outcome NEEDS YOU, and so does a question only the user can answer: ask the user, ' +
+        'with BLOCKED and a reason. Built-in known fixes apply without asking and are listed in decisions. With approvals ' +
+        '"ask", a cache or Claude fix that changes dependencies, the Node version or base image, system packages, install ' +
+        'flags or environment variables (beyond a short allow-list of harmless ones), or what runs pauses the run with ' +
+        'outcome NEEDS YOU, and so does a question only the user can answer: ask the user, ' +
         'then call resurrect again with resume: true and approve or answer. A paused run is always saved, since resume reads it. ' +
         'Sandbox: network only while installing dependencies, no host mounts, no credentials, CPU/memory/process/time ' +
         'limits. Takes minutes. Needs Docker on the machine running this server.',
@@ -273,7 +287,7 @@ export function createServer(options: ServerOptions = {}): McpServer {
         approvals: z
           .enum(['ask', 'all'])
           .default('ask')
-          .describe('"ask" pauses on risky fixes so you can ask the user; "all" applies every fix without asking, except that with resume the pending fix still needs approve'),
+          .describe('"ask" pauses on risky cache and Claude fixes so you can ask the user (built-in known fixes never wait); "all" applies them without asking, except that with resume the pending fix still needs approve'),
         resume: z.boolean().default(false).describe('Carry on from the saved run that ended NEEDS YOU, with approve or answer'),
         approve: z.boolean().optional().describe('With resume, for a pending fix: true applies it, false declines it and looks for another'),
         answer: z.string().optional().describe("With resume, for a pending question: the user's answer"),
@@ -287,14 +301,12 @@ export function createServer(options: ServerOptions = {}): McpServer {
         if ((approve !== undefined || answer !== undefined) && !resume) throw new Error('approve and answer go with resume: true; without it the paused run would be replaced by a new one.');
         if (approve !== undefined && answer !== undefined) throw new Error('pass approve for a pending fix or answer for a pending question, not both.');
         const saved = await loadSaved(source);
-        let from: ResumeInput | undefined;
         let settings: RunSettings | undefined;
         if (resume) {
           // A blank answer is an empty reply, not the user's answer: say so rather than pausing again.
           if (answer !== undefined && !answer.trim()) throw new Error('answer is empty; pass what the user said, or ask them again.');
           if (!saved?.resurrect) throw new Error('No resurrect report for this source; call `resurrect` without resume first.');
-          // Limits the caller did not give stay as the paused run had them.
-          from = { from: saved.resurrect, approve, answer, maxIterations, tokenBudget };
+          // Only to know which model to build; prepareResume below does the checks, once.
           settings = resumeSettings(saved.resurrect, { maxIterations, tokenBudget });
         }
         // A resumed run asks the model the paused run asked, or none when it asked none.
@@ -306,9 +318,13 @@ export function createServer(options: ServerOptions = {}): McpServer {
               (saved!.resurrect!.pending?.kind === 'approval' ? ', or call again with tokenBudget: 0 to carry on with known and cached fixes only.' : '.'),
           );
         }
+        // Limits the caller did not give stay as the paused run had them.
+        const from: ResumeInput | undefined = settings
+          ? prepareResume(saved!.resurrect!, { model, overrides: { maxIterations, tokenBudget }, approve, answer })
+          : undefined;
         const report = await resurrect(source, {
           // A resumed run's sandbox is set up as the paused run's was.
-          sandbox: settings ? (options.sandbox ?? new DockerSandbox(settings.sandbox ?? {})) : defaultSandbox(),
+          sandbox: from ? (options.sandbox ?? new DockerSandbox(from.run.settings.sandbox ?? {})) : defaultSandbox(),
           model,
           maxIterations: maxIterations ?? DEFAULT_MAX_ITERATIONS,
           tokenBudget: tokenBudget ?? DEFAULT_TOKEN_BUDGET,
@@ -318,7 +334,7 @@ export function createServer(options: ServerOptions = {}): McpServer {
           fixCache: new FixCache(path.join(path.dirname(store.dir), 'fix-cache.json')),
           workdir: options.workdir,
           onProgress: progressReporter(extra),
-          approve: approvals === 'all' ? undefined : async () => 'pause',
+          approve: approvals === 'all' ? async () => 'auto-approve' : async () => 'pause',
           resume: from,
         });
         const paused = report.outcome === 'needs-you' && report.pending;
@@ -332,7 +348,7 @@ export function createServer(options: ServerOptions = {}): McpServer {
             ...a,
             ...(errorExcerpt && { errorExcerpt: errorExcerpt.split('\n').slice(-12).join('\n') }),
           })),
-          decisions: report.decisions ?? [],
+          decisions: (report.decisions ?? []).map(({ risks, ...d }) => ({ ...d, ...(risks && { risks: risks.map((r) => r.reason) }) })),
           llm: report.llm,
           warnings: report.warnings,
           dockerfile: report.dockerfile,
@@ -590,7 +606,10 @@ export function summarize({ graph: _graph, ...report }: ExhumeReport) {
       ...(files.length > SUMMARY_FILES_PER_CLUSTER && { moreFiles: files.length - SUMMARY_FILES_PER_CLUSTER }),
     })),
     orphans: report.orphans.slice(0, SUMMARY_ORPHANS),
-    externalPackages: report.externalPackages.slice(0, SUMMARY_EXTERNAL_PACKAGES),
+    // The file lists are for the plan, which reads the saved report; counts are enough here.
+    externalPackages: report.externalPackages
+      .slice(0, SUMMARY_EXTERNAL_PACKAGES)
+      .map(({ importers: _importers, referencedBy: _referencedBy, ...p }) => p),
     manifests: report.manifests.map(({ manifest, name, engines, dependencies, devDependencies }) => ({
       manifest,
       name,

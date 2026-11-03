@@ -52,11 +52,17 @@ const GOAL_RULES: Array<{ pattern: RegExp; matches: (d: Draft) => boolean }> = [
 const BUILT_IN = /built[ -]?in|native|no longer needed/i;
 const COMPATIBLE = /compatible|drop-in/i;
 
-/** What exhume knows about one package: how many files import it, which ones, and which npm scripts name it. */
+/**
+ * What exhume knows about one package: how many files import it, which ones, which files name it in a string
+ * (`app.set('view engine', 'jade')`), and which npm scripts name it.
+ */
 interface Usage {
   /** null when unknown: no exhume report, or a package exhume never saw declared. */
   importedBy: number | null;
   importers: string[];
+  /** Files that name the package in a string literal outside an import; 0 and [] when none or unknown. */
+  referenceCount: number;
+  referencedBy: string[];
   /** The first npm script that names the package, if any. */
   script: string | null;
 }
@@ -169,6 +175,10 @@ export function buildPlan(reports: PlanInputs, options: PlanOptions = {}): PlanR
   if (!witness) {
     warnings.push(`No witness report: run \`necromancer witness ${shellArg(source)}\` first so each step can be checked against recorded behaviour.`);
   }
+  if (witness?.tests && !witness.tests.ok) {
+    const how = witness.tests.summary ? `"${witness.tests.summary}"` : `\`${witness.tests.command}\` failed`;
+    warnings.push(`The project's tests already failed when witnessed (${how}), so they can't be used to check steps until they're fixed.`);
+  }
   if (!exhume) warnings.push('No exhume report: the plan cannot tell which packages are unused or how widely each is imported.');
   if (!interview) warnings.push('No interview report: steps are not tied to the owner\'s goals.');
   if (!resurrect) warnings.push('No resurrect report: the app has not been booted yet, so the starting Node version is a guess.');
@@ -203,7 +213,12 @@ function draftFor(t: Tombstone, use: Usage, fixes: string[], scriptCommand: stri
   const why = [...t.causes.map((c) => c.detail), ...t.advisories.map(advisoryLine), ...fixes];
   const security = t.advisories.length > 0;
   const { importedBy } = use;
-  const touches = use.importers;
+  const touches = [...new Set([...use.importers, ...use.referencedBy])].sort(compare);
+  // Exact when neither list was capped; otherwise files on both lists beyond the cap may be counted twice.
+  const touchCount =
+    use.importers.length === (importedBy ?? 0) && use.referencedBy.length === use.referenceCount
+      ? touches.length
+      : (importedBy ?? 0) + use.referenceCount - (use.importers.length + use.referencedBy.length - touches.length);
 
   if (t.status === 'unknown') {
     leftAlone.push({ name: t.name, reason: 'Its status is unknown (the registry lookup gave nothing); check it by hand.' });
@@ -217,6 +232,10 @@ function draftFor(t: Tombstone, use: Usage, fixes: string[], scriptCommand: stri
   if (t.status === 'alive' && !security) return null;
 
   if ((t.status === 'dead' || t.status === 'dying') && importedBy === 0 && !t.dev && !use.script) {
+    if (use.referenceCount > 0) {
+      leftAlone.push({ name: t.name, reason: `Nothing imports it, but it is loaded by name in ${fileList(use.referencedBy, use.referenceCount)}; check before removing it.` });
+      return null;
+    }
     if (scriptCommand) {
       leftAlone.push({ name: t.name, reason: `Nothing imports it, but a script runs \`${scriptCommand}\`, which may come from it; check before removing it.` });
       return null;
@@ -233,6 +252,7 @@ function draftFor(t: Tombstone, use: Usage, fixes: string[], scriptCommand: stri
           ...(t.replacement ? [`If something still needs it, ${t.replacement.name} replaces it (${t.replacement.reason}).`] : []),
         ],
         touches,
+        touchCount,
         risk: 'medium',
       },
       bucket: 'remove',
@@ -254,8 +274,9 @@ function draftFor(t: Tombstone, use: Usage, fixes: string[], scriptCommand: stri
           { name: t.name, from: current, to: null },
           ...(builtIn ? [] : [{ name: r.name, from: null, to: 'latest' }]),
         ],
-        why: [...why, `Suggested replacement: ${r.name}, ${r.reason}.`, ...importersLine(importedBy)],
+        why: [...why, `Suggested replacement: ${r.name}, ${r.reason}.`, ...usageLines(use)],
         touches,
+        touchCount,
         risk: COMPATIBLE.test(r.reason) ? 'medium' : 'high',
       },
       bucket: 'replace',
@@ -285,8 +306,9 @@ function draftFor(t: Tombstone, use: Usage, fixes: string[], scriptCommand: stri
       kind: 'upgrade-dependency',
       title: `Upgrade ${t.name}${t.dev ? ' (dev)' : ''} from ${current} to ${t.latest}`,
       change: [{ name: t.name, from: current, to: t.latest }],
-      why: [...why, ...(majors ? [`${majors} major${majors === 1 ? '' : 's'} behind.`] : []), ...importersLine(importedBy)],
+      why: [...why, ...(majors ? [`${majors} major${majors === 1 ? '' : 's'} behind.`] : []), ...usageLines(use)],
       touches,
+      touchCount,
       risk: majors === null ? 'medium' : majors >= 2 ? 'high' : majors === 1 ? 'medium' : 'low',
     },
     bucket: sameMajor ? 'same-major' : t.dev ? 'dev' : 'major',
@@ -305,8 +327,21 @@ function advisoryLine(a: Tombstone['advisories'][number]): string {
   return `Advisory ${a.id} (${a.severity}): ${a.title}${a.vulnerableVersions ? `, affects ${a.vulnerableVersions}` : ''}.`;
 }
 
-function importersLine(importedBy: number | null): string[] {
-  return importedBy ? [`Imported by ${importedBy} file${importedBy === 1 ? '' : 's'}.`] : [];
+const files = (n: number) => `${n} file${n === 1 ? '' : 's'}`;
+
+function usageLines(use: Usage): string[] {
+  return [
+    ...(use.importedBy ? [`Imported by ${files(use.importedBy)}.`] : []),
+    ...(use.referenceCount ? [`Loaded by name (a string literal, not an import) in ${files(use.referenceCount)}.`] : []),
+  ];
+}
+
+/** "a.js", "a.js and b.js", "a.js, b.js, c.js and 4 more". */
+function fileList(listed: string[], total: number): string {
+  const shown = listed.slice(0, 3);
+  const rest = total - shown.length;
+  if (rest > 0) return `${shown.join(', ')} and ${rest} more`;
+  return shown.length > 1 ? `${shown.slice(0, -1).join(', ')} and ${shown.at(-1)}` : shown.join('');
 }
 
 /** Lines about packages Resurrect had to pin or remove to boot the app, by package name. */
@@ -330,7 +365,7 @@ function resurrectEvidence(resurrect: ResurrectReport | null): Map<string, strin
 
 /** Looks up what exhume knows about a package. Without exhume, or for a package it never saw declared, nothing is known. */
 function usageOf(exhume: ExhumeReport | null): (name: string) => Usage {
-  if (!exhume) return () => ({ importedBy: null, importers: [], script: null });
+  if (!exhume) return () => ({ importedBy: null, importers: [], referenceCount: 0, referencedBy: [], script: null });
   const imported = new Map(exhume.externalPackages.map((p) => [p.name, p]));
   const declared = new Set(exhume.manifests.flatMap((m) => [...Object.keys(m.dependencies), ...Object.keys(m.devDependencies)]));
   const scripts = exhume.manifests.flatMap((m) => Object.entries(m.scripts ?? {}));
@@ -340,14 +375,18 @@ function usageOf(exhume: ExhumeReport | null): (name: string) => Usage {
     return {
       importedBy: p ? p.importedBy : declared.has(name) ? 0 : null,
       importers: [...(p?.importers ?? [])].sort(compare),
+      referenceCount: p?.referenceCount ?? p?.referencedBy?.length ?? 0,
+      referencedBy: [...(p?.referencedBy ?? [])].sort(compare),
       script: scripts.find(([, command]) => names.test(command))?.[0] ?? null,
     };
   };
 }
 
-/** Commands a script may run that need no package: shell builtins, common utilities, and Node's own tools. */
+/** Commands a script may run that need no package: shell keywords and builtins, common utilities, and Node's own tools. */
 const KNOWN_COMMANDS = new Set([
-  ...['cd', 'echo', 'exit', 'export', 'set', 'unset', 'true', 'false', 'test', '[', 'exec', 'source', '.', 'printf', 'sleep', 'env'],
+  ...['if', 'then', 'else', 'elif', 'fi', 'for', 'while', 'until', 'do', 'done', 'case', 'esac', 'in', 'function', '!'],
+  ...['[', '[[', ']]', 'test', 'true', 'false', ':', '.', 'source', 'export', 'set', 'unset', 'exit', 'return', 'cd'],
+  ...['echo', 'printf', 'eval', 'exec', 'shift', 'trap', 'wait', 'read', 'sleep', 'env'],
   ...['sh', 'bash', 'rm', 'cp', 'mv', 'mkdir', 'cat', 'ls', 'touch', 'chmod', 'ln', 'find', 'grep', 'sed', 'tar', 'git', 'make'],
   ...['node', 'npm', 'yarn', 'pnpm', 'npx'],
 ]);
@@ -356,9 +395,7 @@ const KNOWN_COMMANDS = new Set([
  * The first command a manifest script runs that is neither known (see KNOWN_COMMANDS) nor the name of a dependency,
  * else null. No saved report records which binaries a package installs, so a command like `coffee` (from
  * coffee-script) cannot be tied to its package. While such a command exists, any unimported runtime dependency may be
- * the one providing it, so none is proposed for removal. Each `&&`, `||`, `;` or `|` part counts, after any
- * `NAME=value` prefixes; `npx <cmd>` runs `<cmd>`, `node_modules/.bin/<cmd>` is `<cmd>`, and other paths are the
- * repo's own files.
+ * the one providing it, so none is proposed for removal. See scriptCommands for how a script is split.
  */
 function unexplainedScriptCommand(exhume: ExhumeReport | null, tombstones: Tombstone[]): string | null {
   if (!exhume) return null;
@@ -368,15 +405,38 @@ function unexplainedScriptCommand(exhume: ExhumeReport | null, tombstones: Tombs
   ]);
   for (const m of exhume.manifests) {
     for (const command of Object.values(m.scripts ?? {})) {
-      for (const part of command.split(/&&|\|\||;|\|/)) {
-        const words = part.trim().split(/\s+/).filter((w) => w && !/^\w+=/.test(w));
-        let cmd = words[0] === 'npx' ? words.slice(1).find((w) => !w.startsWith('-')) : words[0];
-        if (cmd?.startsWith('node_modules/.bin/')) cmd = cmd.slice('node_modules/.bin/'.length);
-        if (cmd && !cmd.includes('/') && !KNOWN_COMMANDS.has(cmd) && !packages.has(cmd)) return cmd;
+      for (const cmd of scriptCommands(command)) {
+        if (!KNOWN_COMMANDS.has(cmd) && !packages.has(cmd)) return cmd;
       }
     }
   }
   return null;
+}
+
+/** Shell words that start a command list rather than name a command: `if cmd`, `then cmd`, `! cmd`. */
+const LEADING_KEYWORDS = new Set(['if', 'then', 'else', 'elif', 'while', 'until', 'do', '!', 'time']);
+
+/**
+ * The command names an npm script runs, roughly as a POSIX shell would split it: quoted text is dropped, the script is
+ * cut at `;`, `&&`, `||`, `|`, `&`, newlines, parentheses and braces, and each simple command's name is its first word
+ * after any `NAME=value` prefixes (a quoted value stays part of its word, as in the shell) and leading keywords (`if`, `then`, ...). `npx <cmd>` runs `<cmd>`,
+ * `node_modules/.bin/<cmd>` is `<cmd>`, and other paths are the repo's own files, so they are left out, as are words
+ * the shell expands (`$x`, backquotes).
+ */
+function scriptCommands(script: string): string[] {
+  const unquoted = script
+    .replace(/'[^']*'|"(?:[^"\\]|\\.)*"/g, 'Q')
+    // Redirections such as `2>&1` and `&>file` are not command separators.
+    .replace(/\d*[<>]+&\d*-?|&>>?/g, ' ');
+  const out: string[] = [];
+  for (const part of unquoted.split(/&&|\|\||[;&|\n(){}]/)) {
+    const words = part.trim().split(/\s+/).filter(Boolean);
+    while (words.length && (/^\w+=/.test(words[0]!) || (words.length > 1 && LEADING_KEYWORDS.has(words[0]!)))) words.shift();
+    let cmd = words[0] === 'npx' ? words.slice(1).find((w) => !w.startsWith('-')) : words[0];
+    if (cmd?.startsWith('node_modules/.bin/')) cmd = cmd.slice('node_modules/.bin/'.length);
+    if (cmd && cmd !== 'Q' && !cmd.includes('/') && !/[$`\\]/.test(cmd)) out.push(cmd);
+  }
+  return out;
 }
 
 /** npm's placeholder for a package without tests, which always fails. */
@@ -390,14 +450,15 @@ function checkFor(source: string, exhume: ExhumeReport | null, resurrect: Resurr
       passes: 'Every recorded route answers the same as the golden snapshots.',
     };
   }
-  if (witness?.tests) {
+  // Tests that already failed when witnessed can never pass a step's check.
+  if (witness?.tests?.ok) {
     return { kind: 'tests', command: witness.tests.command, passes: 'The project\'s own tests pass, as they did when witnessed.' };
   }
   // `<pm> test` runs the root manifest's script, so only that one counts.
   const test = exhume?.manifests.find((m) => m.manifest === 'package.json')?.scripts?.test?.trim();
-  if (test && test !== NO_TEST_SCRIPT) {
+  if (!witness?.tests && test && test !== NO_TEST_SCRIPT) {
     const pm = resurrect?.recipe.packageManager ?? exhume!.repo.packageManager;
-    return { kind: 'tests', command: `${pm === 'yarn' || pm === 'pnpm' ? pm : 'npm'} test`, passes: 'The project\'s own tests pass.' };
+    return { kind: 'tests', command: `${pm === 'yarn' || pm === 'pnpm' ? pm : 'npm'} test`, passes: 'The test script passes.' };
   }
   return { kind: 'resurrect', command: `necromancer resurrect ${shellArg(source)}`, passes: 'The app still installs, builds and boots.' };
 }

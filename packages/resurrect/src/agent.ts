@@ -70,7 +70,7 @@ export interface ProposeInput {
   interview: ResurrectRunState['interview'];
   /** Why the previous proposal was rejected, when asking again in the same attempt. */
   rejected?: string;
-  /** The owner's approvals and answers so far in this run. */
+  /** The decisions so far in this run; only the owner's (by "owner") are shown, as theirs. */
   decisions?: OwnerDecision[];
   /** The owner's answer to the question the model asked about this failure. */
   answer?: string;
@@ -82,7 +82,8 @@ export function buildFixPrompt(input: ProposeInput): string {
   const tried = input.history
     .filter((a) => a.fix)
     .map((a) => `- attempt ${a.n} failed at ${a.phase}; applied ${a.fix!.id} (${a.fix!.source}): ${a.fix!.description}`);
-  const decisions = (input.decisions ?? []).map((d) =>
+  // Fixes applied without asking are already in "Already tried"; only what the owner chose is shown as theirs.
+  const decisions = (input.decisions ?? []).filter((d) => d.by !== 'auto').map((d) =>
     d.kind === 'question'
       ? `- attempt ${d.attempt}: asked "${d.subject}"; the owner answered: ${d.answer}`
       : `- attempt ${d.attempt}: the owner ${d.answer} fix ${d.subject.startsWith('llm:') && d.description ? `"${d.description}"` : d.subject}`,
