@@ -8,11 +8,18 @@ on:
     paths:
       - 'e2e/**'
       - '.github/workflows/e2e.yml'
+      - 'packages/cli/src/**'
+      - 'packages/excavate/src/**'
+      - 'packages/graveyard/src/**'
+      - 'packages/resurrect/src/**'
+      - 'packages/witness/src/**'
+      - 'packages/surgeon/src/**'
 permissions:
   contents: read
 jobs:
   e2e:
     runs-on: ubuntu-latest
+    # Above the sum of run.mjs's per-command limits (48 min), with room for install and build.
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4

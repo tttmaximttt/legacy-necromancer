@@ -2,6 +2,7 @@
 // checks what each stage saved. Opt-in (`pnpm e2e`): it needs Docker and the network (npm registry, advisories,
 // GitHub), and takes minutes. Run `pnpm build` first. GITHUB_TOKEN, if set, is passed on for graveyard's rate limit.
 import { execFile, spawn } from 'node:child_process';
+import { randomBytes } from 'node:crypto';
 import { existsSync } from 'node:fs';
 import { cp, mkdir, mkdtemp, readFile, rm } from 'node:fs/promises';
 import os from 'node:os';
@@ -14,8 +15,16 @@ const here = path.dirname(fileURLToPath(import.meta.url));
 const root = path.resolve(here, '..');
 const bin = path.join(root, 'packages/cli/dist/bin.js');
 const FIXTURE = 'express-era-app';
-/** Generous: the first resurrect pulls the era's Node image, and surgeon builds and boots every step twice. */
-const COMMAND_TIMEOUT_MS = 30 * 60 * 1000;
+/** The fixture's copy is named uniquely, so its report slug and image repository (necromancer/<NAME>) are this run's alone. */
+const NAME = `${FIXTURE}-e2e-${randomBytes(4).toString('hex')}`;
+const MINUTE = 60 * 1000;
+/**
+ * Per-command limits, in total well under the workflow's timeout-minutes, leaving room for install and build. The first
+ * resurrect pulls the era's Node image, and surgeon builds and boots every step twice.
+ */
+const TIMEOUT_MS = { exhume: 3 * MINUTE, graveyard: 5 * MINUTE, resurrect: 15 * MINUTE, witness: 5 * MINUTE, surgeon: 15 * MINUTE };
+/** How long a timed-out or interrupted child gets after SIGTERM before SIGKILL. */
+const KILL_GRACE_MS = 10 * 1000;
 /** The fixture's history: one commit, so graveyard dates it to 2018-06 and resurrect picks Node 8. */
 const COMMIT_DATE = '2018-06-15T12:00:00Z';
 const KEY_VARIABLES = ['NECROMANCER_ANTHROPIC_API_KEY', 'ANTHROPIC_API_KEY', 'ANTHROPIC_AUTH_TOKEN', 'ANTHROPIC_BASE_URL'];
@@ -31,18 +40,39 @@ if (!existsSync(bin)) throw new Error('packages/cli/dist/bin.js is missing; run 
 
 const started = Date.now();
 const tmp = await mkdtemp(path.join(os.tmpdir(), 'necromancer-e2e-'));
-const app = path.join(tmp, FIXTURE);
+const app = path.join(tmp, NAME);
 const home = path.join(tmp, 'home');
 const reports = path.join(tmp, 'reports');
 // An empty home and no key variables, so nothing can reach the Anthropic API; reports and the fix cache stay in tmp.
 const env = { ...process.env, HOME: home, USERPROFILE: home, NECROMANCER_REPORTS: reports };
 for (const name of KEY_VARIABLES) delete env[name];
+// The empty home hides Docker Desktop's per-user socket from docker-modem, which looks for ~/.docker/run/docker.sock
+// when DOCKER_HOST is unset. Point DOCKER_HOST at the real one; an existing DOCKER_HOST is passed through as is.
+const userSocket = path.join(os.homedir(), '.docker', 'run', 'docker.sock');
+if (!process.env.DOCKER_HOST && existsSync(userSocket)) env.DOCKER_HOST = `unix://${userSocket}`;
+/** The docker CLI used for cleanup talks to the same daemon as the CLI under test. */
+const dockerEnv = env.DOCKER_HOST ? { ...process.env, DOCKER_HOST: env.DOCKER_HOST } : process.env;
 
-/** Runs the CLI, streaming its stderr (progress) through, and returns the exit code and output. */
+/** The child running now, so a signal to this script can stop it. */
+let current = null;
+
+/** SIGTERM, then SIGKILL if it hasn't exited after the grace period. */
+function stop(child) {
+  if (child.exitCode !== null || child.signalCode !== null) return;
+  child.kill('SIGTERM');
+  const timer = setTimeout(() => child.kill('SIGKILL'), KILL_GRACE_MS);
+  child.once('close', () => clearTimeout(timer));
+}
+
+/** Runs the CLI, streaming its stderr (progress) through, and returns the exit code and output; rejects on a timeout. */
 function necromancer(...args) {
-  console.log(`\n$ necromancer ${args.join(' ')}`);
+  const command = `necromancer ${args.join(' ')}`;
+  const limit = TIMEOUT_MS[args[0]];
+  console.log(`\n$ ${command}`);
   return new Promise((resolve, reject) => {
     const child = spawn(process.execPath, [bin, ...args], { cwd: tmp, env, stdio: ['ignore', 'pipe', 'pipe'] });
+    current = child;
+    let timedOut = false;
     let stdout = '';
     let stderr = '';
     child.stdout.on('data', (d) => (stdout += d));
@@ -50,18 +80,47 @@ function necromancer(...args) {
       stderr += d;
       process.stderr.write(d);
     });
-    const timer = setTimeout(() => child.kill('SIGTERM'), COMMAND_TIMEOUT_MS);
+    const timer = setTimeout(() => {
+      timedOut = true;
+      console.error(`\n\`${command}\` hung: no exit after ${limit / MINUTE} min; stopping it`);
+      stop(child);
+    }, limit);
     child.on('error', reject);
     child.on('close', (code, signal) => {
       clearTimeout(timer);
-      resolve({ code: signal ? `killed by ${signal} (timeout ${COMMAND_TIMEOUT_MS / 60000} min?)` : code, stdout, stderr });
+      current = null;
+      if (timedOut) reject(new Error(`\`${command}\` timed out after ${limit / MINUTE} min`));
+      else resolve({ code: signal ? `killed by ${signal}` : code, stdout, stderr });
     });
   });
 }
 
-const report = async (kind) => JSON.parse(await readFile(path.join(reports, FIXTURE, `${kind}.json`), 'utf8'));
+const report = async (kind) => JSON.parse(await readFile(path.join(reports, NAME, `${kind}.json`), 'utf8'));
 
 let dockerFailure = null;
+let cleaning = null;
+/** Removes what this run left behind, once, whether the run ends, fails or is interrupted. */
+function cleanup() {
+  cleaning ??= (async () => {
+    if (!dockerFailure) await removeDockerLeftovers().catch((err) => console.error(`docker cleanup failed: ${err.message}`));
+    await rm(tmp, { recursive: true, force: true });
+  })();
+  return cleaning;
+}
+
+for (const [signal, code] of [['SIGINT', 130], ['SIGTERM', 143]]) {
+  process.on(signal, async () => {
+    console.error(`\n${signal}: stopping and cleaning up`);
+    if (current) {
+      const child = current;
+      const closed = new Promise((resolve) => child.once('close', resolve));
+      stop(child);
+      await closed;
+    }
+    await cleanup();
+    process.exit(code);
+  });
+}
 try {
   // The fixture gets its own repo, outside this one, so its git history (and so its era) is fixed.
   await cp(path.join(here, 'fixtures', FIXTURE), app, { recursive: true });
@@ -134,6 +193,7 @@ try {
 
   // 6. surgeon
   r = await necromancer('surgeon', app, '--no-llm');
+  check([0, 2, 3].includes(r.code), `surgeon exits 0, 2 or 3 (got ${r.code})`);
   const su = await report('surgeon');
   check(su.status === 'complete' || su.status === 'blocked', `surgeon ends COMPLETE or BLOCKED (got ${su.status}${su.blockedReason ? `: ${su.blockedReason}` : ''})`);
   const expected = su.status === 'complete' ? 0 : 2;
@@ -155,20 +215,44 @@ try {
   console.error(`e2e failed after ${passed} passing check(s) in ${Math.round((Date.now() - started) / 1000)}s`);
   process.exitCode = 1;
 } finally {
-  if (!dockerFailure) await removeDockerLeftovers();
-  await rm(tmp, { recursive: true, force: true });
+  await cleanup();
 }
 
-/** Containers and images of this fixture that a failed or killed run may have left; the CLI removes them itself otherwise. */
+/**
+ * Containers and images of this run that a failed or killed run may have left; the CLI removes them itself otherwise.
+ * Images: exactly the repository necromancer/<NAME>. Containers: those labelled necromancer.sandbox=1 (DockerSandbox
+ * labels every container it creates; it sets no name or compose project) that were created from that repository or
+ * one of its image IDs, plus the labelled containers sharing a network namespace with them, which is how database
+ * sidecars are linked to the app. Config.Image keeps the name the container was created from even after its tag
+ * moves, so containers of a re-tagged (dangling) image are still caught.
+ */
 async function removeDockerLeftovers() {
-  const docker = (...args) => exec('docker', args).then((r) => r.stdout.trim(), () => '');
-  const repo = `necromancer/${FIXTURE}`;
-  const containers = (await docker('ps', '-a', '--filter', 'label=necromancer.sandbox=1', '--format', '{{.ID}} {{.Image}}'))
+  const docker = (...args) => exec('docker', args, { env: dockerEnv }).then((r) => r.stdout.trim(), () => '');
+  const repo = `necromancer/${NAME}`;
+  const rows = (await docker('images', '--no-trunc', '--format', '{{.Repository}} {{.Tag}} {{.ID}}'))
     .split('\n')
-    .filter((line) => line.split(' ')[1]?.startsWith(repo))
-    .map((line) => line.split(' ')[0]);
-  if (containers.length) await docker('rm', '-f', ...containers);
-  const images = (await docker('images', '--filter', `reference=${repo}`, '-q')).split('\n').filter(Boolean);
-  if (images.length) await docker('rmi', '-f', ...new Set(images));
-  if (containers.length || images.length) console.log(`removed ${containers.length} container(s) and ${new Set(images).size} image(s) left behind`);
+    .map((line) => line.split(' '))
+    .filter(([repository, tag]) => repository === repo && tag !== '<none>');
+  // Removed by tag, never by ID, so an image that also carries a tag outside this repository only loses this run's tags.
+  const tags = new Set(rows.map(([, tag]) => `${repo}:${tag}`));
+  const images = new Set(rows.map(([, , id]) => id));
+  const ids = (await docker('ps', '-aq', '--no-trunc', '--filter', 'label=necromancer.sandbox=1')).split('\n').filter(Boolean);
+  const labelled = ids.length ? JSON.parse((await docker('inspect', ...ids)) || '[]') : [];
+  const ofRepo = (image) => image === repo || image?.startsWith(`${repo}:`);
+  const ours = new Set(labelled.filter((c) => ofRepo(c.Config?.Image) || images.has(c.Image)).map((c) => c.Id));
+  const joined = (c) => /^container:(.+)$/.exec(c.HostConfig?.NetworkMode ?? '')?.[1];
+  for (let grew = true; grew; ) {
+    grew = false;
+    for (const c of labelled) {
+      if (ours.has(c.Id)) continue;
+      const linked = ours.has(joined(c)) || labelled.some((o) => ours.has(o.Id) && joined(o) === c.Id);
+      if (linked) {
+        ours.add(c.Id);
+        grew = true;
+      }
+    }
+  }
+  if (ours.size) await docker('rm', '-f', ...ours);
+  if (tags.size) await docker('rmi', '-f', ...tags);
+  if (ours.size || tags.size) console.log(`removed ${ours.size} container(s) and ${tags.size} image tag(s) left behind`);
 }

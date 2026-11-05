@@ -27,7 +27,7 @@ pnpm e2e
 pnpm --filter @necromancer/ui dev
 ```
 
-CI (`.github/workflows/ci.yml`) runs install, build, typecheck, test, the bundle build and smoke, then `node .github/scripts/plugin-version.mjs check`. There is no linter. `.github/workflows/e2e.yml` runs `pnpm e2e` separately (on demand, nightly, and on PRs that touch `e2e/` or the workflow); it is not part of the CI gate.
+CI (`.github/workflows/ci.yml`) runs install, build, typecheck, test, the bundle build and smoke, then `node .github/scripts/plugin-version.mjs check`. There is no linter. `.github/workflows/e2e.yml` runs `pnpm e2e` separately (on demand, nightly, and on PRs that touch `e2e/`, the workflow, or the `src/` of cli, excavate, graveyard, resurrect, witness or surgeon); it is not part of the CI gate.
 
 Vitest aliases every `@necromancer/*` import to `packages/*/src/index.ts`, so tests don't need a build. `vitest.config.ts` also clears the Anthropic key variables and points `HOME` at an empty directory, so tests never reach the real API. Keep it that way: tests inject models and sandboxes instead.
 
