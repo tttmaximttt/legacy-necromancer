@@ -19,11 +19,15 @@ pnpm necromancer <command> ...   # run the built CLI (after pnpm build)
 pnpm --filter legacy-necromancer build
 pnpm --filter legacy-necromancer smoke
 
+# End-to-end test (needs pnpm build first): the built CLI on real Docker against e2e/fixtures, no model.
+# Needs Docker and the network, takes minutes, and is not part of `pnpm test`.
+pnpm e2e
+
 # UI dev server on :5173, proxying /api to a running `necromancer ui` (port 4173, or $NECROMANCER_PORT)
 pnpm --filter @necromancer/ui dev
 ```
 
-CI (`.github/workflows/ci.yml`) runs install, build, typecheck, test, the bundle build and smoke, then `node .github/scripts/plugin-version.mjs check`. There is no linter.
+CI (`.github/workflows/ci.yml`) runs install, build, typecheck, test, the bundle build and smoke, then `node .github/scripts/plugin-version.mjs check`. There is no linter. `.github/workflows/e2e.yml` runs `pnpm e2e` separately (on demand, nightly, and on PRs that touch `e2e/` or the workflow); it is not part of the CI gate.
 
 Vitest aliases every `@necromancer/*` import to `packages/*/src/index.ts`, so tests don't need a build. `vitest.config.ts` also clears the Anthropic key variables and points `HOME` at an empty directory, so tests never reach the real API. Keep it that way: tests inject models and sandboxes instead.
 

@@ -15,7 +15,7 @@ const run = promisify(execFile);
 const here = path.dirname(fileURLToPath(import.meta.url));
 const root = path.resolve(here, '../..');
 const manifest = JSON.parse(await readFile(path.join(here, 'package.json'), 'utf8'));
-const TOOLS = ['exhume', 'graveyard', 'interview', 'record_interview', 'resurrect', 'witness'];
+const TOOLS = ['exhume', 'graveyard', 'interview', 'record_interview', 'resurrect', 'witness', 'plan', 'surgeon'];
 
 function check(ok, message) {
   if (!ok) throw new Error(message);
