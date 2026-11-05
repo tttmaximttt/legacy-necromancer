@@ -112,18 +112,20 @@ The run ends when the app boots, or with `BLOCKED` after 10 attempts, a
 150,000-token budget, the same error coming back a third time, or no fix
 left to try.
 
-### Surgeon loop (in progress)
+### Surgeon loop
 
-Only the step planner is implemented so far; the loop below is not wired to
+The loop is implemented in
+[surgeon/src/surgeon.ts](packages/surgeon/src/surgeon.ts) but isn't wired to
 the CLI or MCP yet.
 
 ```mermaid
 flowchart TD
     A["Baseline: witness --check on the unchanged recipe"] -- differs --> X["Stop: blocked"]
     A -- matches --> P["Plan steps: dead, then dying, then ailing deps, Node last"]
-    P --> S["Apply one step's op to the recipe"]
+    P --> S["Apply one step's op to a copy of the recipe"]
     S --> R["resurrect"]
     R -- fails --> F["Try one fix"]
+    F -- "needs your OK, no terminal" --> Y["NEEDS YOU: saved, carry on with resume"]
     F -- still fails --> B["Roll back"]
     F -- boots --> W["witness --check"]
     R -- boots --> W
@@ -132,20 +134,22 @@ flowchart TD
     K --> N{"Steps, attempts or tokens left?"}
     B --> N
     N -- yes --> S
-    N -- no --> E["Stop"]
+    N -- no --> E["Stop: blocked, with the steps not reached"]
 ```
 
-Surgeon is meant to do the kind of upgrades `necromancer plan` describes
-([plan/src/plan.ts](packages/plan/src/plan.ts)), one at a time, and keep
-only those that don't change behaviour. It first checks that the
-unchanged recipe still matches the golden snapshots. The planner
+Surgeon makes the kind of upgrades `necromancer plan` describes
+([plan/src/plan.ts](packages/plan/src/plan.ts)) one at a time, and keeps
+only those that don't change behaviour. It first boots the unchanged recipe
+and checks it still matches the golden snapshots; if it doesn't, it stops
+before changing anything. The planner
 ([surgeon/src/plan.ts](packages/surgeon/src/plan.ts)) orders dead, dying
 and ailing dependencies, then the move to Node 24, one recipe op per step,
-and marks steps it already knows can't be done as skipped. Each step would
-be rebuilt with `resurrect` and compared with `witness --check`
-([compare.ts](packages/witness/src/compare.ts)); a step that fails, even
-after one fix, or changes a response is rolled back. The run stops when the
-steps, attempts or tokens run out.
+and marks steps it already knows can't be done as skipped. Each step is
+rebuilt with `resurrect`, with at most one fix that goes through the same
+approval as resurrect's, and compared with `witness --check`
+([compare.ts](packages/witness/src/compare.ts)); a step that still fails or
+changes a response is rolled back. The run stops when the steps (20),
+attempts (40, the baseline included) or tokens (150,000) run out.
 
 ## Commands
 
