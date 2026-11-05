@@ -25,6 +25,7 @@
     "semver": "^7.8.5"
   },
   "devDependencies": {
+    "@necromancer/excavate": "workspace:*",
     "@types/semver": "^7.8.0"
   }
 }

@@ -171,9 +171,9 @@ export async function runSurgeon(inputs: SurgeonInputs, deps: SurgeonDeps, optio
   const caFile = from ? (settings?.caFile ?? undefined) : options.caFile;
   const workdir = from ? (settings?.workdir ?? undefined) : options.workdir;
   const model = budgets.tokenBudget > 0 ? (deps.model ?? null) : null;
-  const steps = planSteps(saved, { targetNode: target });
   const basedOn: SurgeonReport['basedOn'] = { graveyard: null, resurrect: saved.resurrect.generatedAt, witness: golden.generatedAt };
-  if (from) checkUnchanged(from, basedOn, steps);
+  // A resume runs the paused run's own steps, once they are checked against a fresh plan from the reports now saved.
+  const steps = from ? checkUnchanged(from, basedOn, planSteps(saved, { targetNode: target })) : planSteps(saved, { targetNode: target });
 
   const warnings: string[] = from ? [...from.warnings] : [];
   const warn = (prefix: string, list: string[]) => {
@@ -253,7 +253,7 @@ export async function runSurgeon(inputs: SurgeonInputs, deps: SurgeonDeps, optio
     }
     // A fix that sets the step's change back (say, Node back to 14) boots the old recipe, not the step.
     if (changesRecipe(inner.recipe, [step.op])) {
-      const reason = `the only fix that boots it undoes the step: ${fix?.description ?? 'a fix'}`;
+      const reason = `the fix that booted it undoes the step: ${fix?.description ?? 'a fix'}`;
       return { kind: 'done', result: result('rolled_back', 'resurrect', reason, null), recipe: null };
     }
     const checked = await check(inner, prefix);
@@ -272,7 +272,7 @@ export async function runSurgeon(inputs: SurgeonInputs, deps: SurgeonDeps, optio
 
   if (from) {
     const state = from.resume!;
-    const step = steps.find((s) => s.n === state.step)!;
+    const step = from.remaining[0]!;
     current = structuredClone(from.recipe);
     baseline = from.baseline;
     results = from.results.filter((r) => r.step.n < step.n);
@@ -376,7 +376,7 @@ export async function runSurgeon(inputs: SurgeonInputs, deps: SurgeonDeps, optio
   const report: SurgeonReport = {
     repo: { source, commit: saved.resurrect.repo.commit },
     generatedAt: clock().toISOString(),
-    status: paused ? 'needs-you' : remaining.length ? 'blocked' : 'complete',
+    status: paused ? 'needs-you' : blockedReason ? 'blocked' : 'complete',
     blockedReason: paused ? null : blockedReason,
     pending: paused?.inner.pending ?? null,
     resume: paused ? { step: paused.step.n, elapsedMs: paused.elapsedMs, used: paused.before, inner: paused.inner } : null,
@@ -411,15 +411,20 @@ function pausedRun(saved: LoadedInputs, source: string): SurgeonReport {
   return from;
 }
 
-/** That the reports and the plan are the ones the paused run started from. */
-function checkUnchanged(from: SurgeonReport, basedOn: SurgeonReport['basedOn'], steps: SurgeonStep[]): void {
-  const planned = [...from.results.map((r) => r.step), ...from.remaining].sort((a, b) => a.n - b.n).map((s) => s.id);
+/**
+ * The paused run's planned steps, in plan order, after checking that the reports it started from are still the ones
+ * saved and that planning again gives exactly the same steps (ids, ops and skip reasons).
+ */
+function checkUnchanged(from: SurgeonReport, basedOn: SurgeonReport['basedOn'], fresh: SurgeonStep[]): SurgeonStep[] {
+  const planned = [...from.results.map((r) => r.step), ...from.remaining].sort((a, b) => a.n - b.n);
   const same =
     from.basedOn.graveyard === basedOn.graveyard &&
     from.basedOn.resurrect === basedOn.resurrect &&
     from.basedOn.witness === basedOn.witness &&
-    JSON.stringify(planned) === JSON.stringify(steps.map((s) => s.id));
+    from.remaining[0]?.n === from.resume!.step &&
+    JSON.stringify(planned) === JSON.stringify(fresh);
   if (!same) throw new Error('the saved reports changed since surgeon paused; start a new surgeon run');
+  return planned;
 }
 
 function defined<T extends object>(value: T | undefined): Partial<T> {

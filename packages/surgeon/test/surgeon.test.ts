@@ -146,6 +146,12 @@ describe('runSurgeon', () => {
     const golden = (await s.store.load(slugFor(s.root)))!.witness!;
     await s.store.save('witness', { ...golden, generatedAt: '2030-01-01T00:00:00.000Z' } satisfies WitnessReport);
     await expect(run(s, {}, { resume: { approve: true } })).rejects.toThrow('the saved reports changed since surgeon paused; start a new surgeon run');
+    await s.store.save('witness', golden);
+
+    // Same ids, but a step now planned with another version.
+    const graveyard = (await s.store.load(slugFor(s.root)))!.graveyard!;
+    await s.store.save('graveyard', { ...graveyard, tombstones: graveyard.tombstones.map((t) => ({ ...t, latest: '3.0.0', majorsBehind: 2 })) });
+    await expect(run(s, {}, { resume: { approve: true } })).rejects.toThrow('the saved reports changed since surgeon paused; start a new surgeon run');
   });
 
   it('rolls back a step whose only fix undoes it', async () => {
@@ -155,7 +161,7 @@ describe('runSurgeon', () => {
 
     const node = report.results.find((r) => r.step.id === 'node:24')!;
     expect(node).toMatchObject({ status: 'rolled_back', failedAt: 'resurrect', attempts: 2, fix: { source: 'known', id: 'fibers-node16' } });
-    expect(node.reason).toMatch(/^the only fix that boots it undoes the step: fibers does not build/);
+    expect(node.reason).toMatch(/^the fix that booted it undoes the step: fibers does not build/);
     expect(report.recipe.nodeImage).toBe('node:6');
   });
 
@@ -198,6 +204,32 @@ describe('runSurgeon', () => {
     expect(report.remaining.map((r) => r.id)).toEqual(['dep:b', 'dep:c']);
     expect(report.summary).toEqual({ kept: 1, rolledBack: 0, skipped: 1, remaining: 2 });
     expect(report.used.steps).toBe(1);
+  });
+
+  it('rolls back a step that runs out of tokens inside itself, then blocks before the next', async () => {
+    const s = await seed([tomb('a'), tomb('b'), tomb('c')]);
+    const sandbox = stepSandbox((_d, d) => (d.a === '2.0.0' ? fail(VIPS_LOG) : null));
+    // The first proposal is rejected by the recipe; asking again would need tokens the budget no longer has.
+    const model = tokenModel(new ScriptedModel(fix([{ op: 'setNodeImage', tag: 'attacker/miner' }]), fix([{ op: 'setEnv', name: 'TZ', value: 'UTC' }])), 1000);
+    const report = await run(s, { sandbox, model }, { tokenBudget: 1000 });
+
+    expect(report.results).toHaveLength(1);
+    expect(report.results[0]).toMatchObject({ status: 'rolled_back', failedAt: 'resurrect', fix: null, attempts: 1, tokens: 1000 });
+    expect(report.results[0]!.reason).toMatch(/^token budget of 1000 spent; last error at install: /);
+    expect(report.status).toBe('blocked');
+    expect(report.blockedReason).toBe('token budget of 1000 spent (1000 used)');
+    expect(report.remaining.map((r) => r.id)).toEqual(['dep:b', 'dep:c']);
+    expect(report.used).toMatchObject({ steps: 1, tokens: 1000, calls: 1 });
+  });
+
+  it('blocks on a red baseline even when no step could run', async () => {
+    const s = await seed([tomb('gone', { latest: null })]);
+    const report = await run(s, { sandbox: stepSandbox(undefined, () => ({ status: 404, body: null })) });
+
+    expect(report.status).toBe('blocked');
+    expect(report.blockedReason).toContain("baseline doesn't match snapshots; re-run witness");
+    expect(report.remaining).toEqual([]);
+    expect(report.results.map((r) => [r.step.id, r.status])).toEqual([['dep:gone', 'skipped']]);
   });
 
   it('blocks before any step when the baseline no longer matches the snapshots', async () => {
