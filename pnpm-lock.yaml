@@ -47,6 +47,9 @@ importers:
       '@necromancer/resurrect':
         specifier: workspace:*
         version: link:../resurrect
+      '@necromancer/surgeon':
+        specifier: workspace:*
+        version: link:../surgeon
       '@necromancer/ui':
         specifier: workspace:*
         version: link:../ui
@@ -207,6 +210,9 @@ importers:
       '@necromancer/resurrect':
         specifier: workspace:*
         version: link:../resurrect
+      '@necromancer/surgeon':
+        specifier: workspace:*
+        version: link:../surgeon
       '@necromancer/witness':
         specifier: workspace:*
         version: link:../witness
