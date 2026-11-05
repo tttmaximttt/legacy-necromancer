@@ -90,6 +90,14 @@ describe('recipe', () => {
     expect(df).not.toMatch(/VOLUME|--mount|ADD http/);
   });
 
+  it('rewrites sources.list for the Debian archive only when the image has one', () => {
+    const df = renderDockerfile(applyOps(base, [{ op: 'useDebianArchive' }, { op: 'setNodeImage', tag: '24' }]));
+    expect(df).toContain(
+      "RUN if [ -f /etc/apt/sources.list ]; then sed -i -e 's|deb.debian.org|archive.debian.org|g' -e 's|security.debian.org|archive.debian.org|g' -e '/-updates/d' /etc/apt/sources.list; fi \\\n" +
+        "    && echo 'Acquire::Check-Valid-Until \"false\";' > /etc/apt/apt.conf.d/99archive",
+    );
+  });
+
   it('lists package.json changes at the top of the Dockerfile', () => {
     const df = renderDockerfile(applyOps(base, [{ op: 'removeDependency', name: 'node-sass' }, { op: 'setDependency', name: 'sass', version: '^1.32.0', dev: true }]));
     expect(df).toContain('#   remove node-sass\n#   sass@^1.32.0 (dev)\nFROM node:8');
