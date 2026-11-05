@@ -2,12 +2,12 @@ name: release
 on:
   push:
     tags: ['v*']
+# Checks a release tag. Publishing to npm is done by hand, from the commit this run passed on.
 permissions:
   contents: read
-  id-token: write
 concurrency: release
 jobs:
-  publish:
+  check:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -18,7 +18,6 @@ jobs:
         with:
           node-version: 22
           cache: pnpm
-          registry-url: https://registry.npmjs.org
       - name: The tag matches the package version and is on main
         run: |
           version="$(node -p "require('./packages/legacy-necromancer/package.json').version")"
@@ -30,7 +29,3 @@ jobs:
       - run: pnpm test
       - run: pnpm --filter legacy-necromancer build
       - run: pnpm --filter legacy-necromancer smoke
-      - run: npm publish --provenance
-        working-directory: packages/legacy-necromancer
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
