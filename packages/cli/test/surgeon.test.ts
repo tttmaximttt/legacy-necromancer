@@ -202,6 +202,8 @@ describe('necromancer surgeon', () => {
     await expect(fresh(s, stepSandbox(), '--max-steps', '0')).rejects.toThrow('exit 1');
     await expect(fresh(s, stepSandbox(), '--token-budget', '1.5')).rejects.toThrow('exit 1');
     expect(written()).toContain("argument '1.5' is invalid. Expected a whole number (0 or more).");
+    await expect(fresh(s, stepSandbox(), '--cpus', 'x')).rejects.toThrow('exit 1');
+    expect(written()).toContain("argument 'x' is invalid. Expected a number above 0.");
     expect((await new ReportStore(s.reports).load(slugFor(s.root)))!.surgeon).toBeNull();
   });
 

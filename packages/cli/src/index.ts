@@ -78,6 +78,12 @@ const wholeNumber = (min: 0 | 1) => (v: string) => {
 };
 const positiveInt = wholeNumber(1);
 const nonNegativeInt = wholeNumber(0);
+/** A commander parser for a number above 0, fractions allowed (e.g. `--cpus 0.5`). */
+const positiveNumber = (v: string) => {
+  const n = /^\d*\.?\d+$/.test(v.trim()) ? Number(v) : Number.NaN;
+  if (!(n > 0)) throw new InvalidArgumentError('Expected a number above 0.');
+  return n;
+};
 
 export function createProgram(deps: ProgramDeps = {}): Command {
   const program = new Command('necromancer')
@@ -212,7 +218,7 @@ export function createProgram(deps: ProgramDeps = {}): Command {
     .option('--token-budget <n>', "input + output tokens the model may spend (with --resume, default: the saved run's)", nonNegativeInt, DEFAULT_TOKEN_BUDGET)
     .option('--no-llm', 'known fixes and cached fixes only')
     .option('-m, --model <id>', 'Claude model', DEFAULT_MODEL)
-    .option('--cpus <n>', 'CPUs per container', Number, DEFAULT_LIMITS.cpus)
+    .option('--cpus <n>', 'CPUs per container', positiveNumber, DEFAULT_LIMITS.cpus)
     .option('--memory <mb>', 'memory per container, in MB', positiveInt, DEFAULT_LIMITS.memoryMb)
     .option('--step-timeout <sec>', 'time limit for each install, build or boot step', positiveInt, DEFAULT_LIMITS.stepTimeoutSec)
     .option('--health-timeout <sec>', 'how long to wait for the app to answer', positiveInt, DEFAULT_HEALTH_TIMEOUT_SEC)
@@ -443,7 +449,7 @@ export function createProgram(deps: ProgramDeps = {}): Command {
     .option('--target-node <version>', 'the Node release to end on (default: the one `necromancer plan` targets)')
     .option('--no-llm', 'known fixes and cached fixes only')
     .option('-m, --model <id>', 'Claude model', DEFAULT_MODEL)
-    .option('--cpus <n>', "CPUs per container (default: the resurrect run's)", Number)
+    .option('--cpus <n>', "CPUs per container (default: the resurrect run's)", positiveNumber)
     .option('--memory <mb>', "memory per container, in MB (default: the resurrect run's)", positiveInt)
     .option('--step-timeout <sec>', "time limit for each install, build or boot step (default: the resurrect run's)", positiveInt)
     .option('--health-timeout <sec>', 'how long to wait for the app to answer', positiveInt, DEFAULT_HEALTH_TIMEOUT_SEC)
