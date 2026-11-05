@@ -256,16 +256,25 @@ importers:
       '@necromancer/core':
         specifier: workspace:*
         version: link:../core
+      '@necromancer/llm':
+        specifier: workspace:*
+        version: link:../llm
       '@necromancer/plan':
         specifier: workspace:*
         version: link:../plan
       '@necromancer/resurrect':
         specifier: workspace:*
         version: link:../resurrect
+      '@necromancer/witness':
+        specifier: workspace:*
+        version: link:../witness
       semver:
         specifier: ^7.8.5
         version: 7.8.5
     devDependencies:
+      '@necromancer/excavate':
+        specifier: workspace:*
+        version: link:../excavate
       '@types/semver':
         specifier: ^7.8.0
         version: 7.8.0

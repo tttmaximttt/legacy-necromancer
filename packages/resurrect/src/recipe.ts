@@ -185,7 +185,8 @@ export function renderDockerfile(r: BuildRecipe, options: { caFile?: string } = 
   if (r.debianArchive) {
     lines.push(
       '# This Debian release is end-of-life; its packages moved to archive.debian.org.',
-      "RUN sed -i -e 's|deb.debian.org|archive.debian.org|g' -e 's|security.debian.org|archive.debian.org|g' -e '/-updates/d' /etc/apt/sources.list \\",
+      '# Newer images have no sources.list (their sources are in sources.list.d), and their releases are not archived.',
+      "RUN if [ -f /etc/apt/sources.list ]; then sed -i -e 's|deb.debian.org|archive.debian.org|g' -e 's|security.debian.org|archive.debian.org|g' -e '/-updates/d' /etc/apt/sources.list; fi \\",
       "    && echo 'Acquire::Check-Valid-Until \"false\";' > /etc/apt/apt.conf.d/99archive",
       '',
     );
