@@ -41,7 +41,7 @@ function resurrectOf(recipe: Partial<BuildRecipe> = {}): ResurrectReport {
 }
 
 describe('planSteps', () => {
-  it('puts Node first, then dead, dying and ailing; prod before dev, fewer majors first (null last), then name', () => {
+  it('puts dead, dying and ailing first, then Node; prod before dev, fewer majors first (null last), then name', () => {
     const tombstones = [
       tomb('z-ailing', { status: 'ailing', majorsBehind: 1 }),
       tomb('a-ailing-dev', { status: 'ailing', dev: true, majorsBehind: 0 }),
@@ -54,7 +54,6 @@ describe('planSteps', () => {
     ];
     const steps = planSteps({ graveyard: graveyardOf(tombstones), resurrect: resurrectOf() });
     expect(steps.map((s) => s.id)).toEqual([
-      `node:${TARGET_NODE}`,
       'dep:dead',
       'dep:dead-dev',
       'dep:dying',
@@ -63,6 +62,7 @@ describe('planSteps', () => {
       'dep:a-ailing-far',
       'dep:b-ailing-null',
       'dep:a-ailing-dev',
+      `node:${TARGET_NODE}`,
     ]);
     expect(steps.map((s) => s.n)).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9]);
     for (const s of steps.filter((s) => s.skip === null)) expect(() => validateOp(s.op)).not.toThrow();
@@ -112,11 +112,21 @@ describe('planSteps', () => {
     }
   });
 
-  it('adds a Node step for a 0.x line and for an image with no version', () => {
-    const fromOld = planSteps({ graveyard: graveyardOf([]), resurrect: resurrectOf({ nodeImage: 'node:0.10' }) });
-    expect(fromOld.map((s) => s.change.from)).toEqual(['0.10']);
-    const fromLts = planSteps({ graveyard: graveyardOf([]), resurrect: resurrectOf({ nodeImage: 'node:lts' }) });
-    expect(fromLts.map((s) => [s.id, s.change.from])).toEqual([[`node:${TARGET_NODE}`, null]]);
+  it('adds a runnable Node step for a 0.x line', () => {
+    const steps = planSteps({ graveyard: graveyardOf([]), resurrect: resurrectOf({ nodeImage: 'node:0.10' }) });
+    expect(steps.map((s) => [s.change.from, s.skip])).toEqual([['0.10', null]]);
+  });
+
+  it.each(['node:lts', 'node:current', 'node:latest', 'node:hydrogen-alpine'])('skips the Node step for %s, which may already be newer', (nodeImage) => {
+    const steps = planSteps({ graveyard: graveyardOf([]), resurrect: resurrectOf({ nodeImage }) });
+    expect(steps.map((s) => [s.id, s.change.from, s.skip])).toEqual([[`node:${TARGET_NODE}`, null, `can't tell which Node ${nodeImage} is, so not moving it`]]);
+  });
+
+  it('skips a Node step whose tag the recipe would reject', () => {
+    const steps = planSteps({ graveyard: graveyardOf([]), resurrect: resurrectOf({ nodeImage: 'node:8' }) }, { targetNode: '24.x' });
+    expect(steps).toHaveLength(1);
+    expect(steps[0]!.op).toEqual({ op: 'setNodeImage', tag: '24.x' });
+    expect(steps[0]!.skip).toBe('invalid Node tag: rejected setNodeImage: "24.x" is not an official node image tag');
   });
 
   it('honours targetNode', () => {
@@ -129,12 +139,11 @@ describe('planSteps', () => {
     const skipOf = (t: Tombstone, recipe: Partial<BuildRecipe> = {}) =>
       planSteps({ graveyard: graveyardOf([t]), resurrect: resurrectOf({ nodeImage: `node:${TARGET_NODE}`, ...recipe }) })[0]!;
 
-    it('skips a dependency resurrect pinned or removed to boot', () => {
+    it('plans a runnable step for a dependency resurrect pinned to boot, since rollback restores the pin', () => {
       const pinned = skipOf(tomb('express', { resolved: '3.3.8', latest: '5.1.0' }), { dependencyPatches: { express: { version: '3.21.2', dev: false } } });
-      expect(pinned.skip).toBe('resurrect pinned it to 3.21.2 to boot');
+      expect(pinned).toMatchObject({ skip: null, title: 'Upgrade express from 3.3.8 to 5.1.0' });
       expect(pinned.op).toEqual({ op: 'setDependency', name: 'express', version: '5.1.0', dev: false });
-      const removed = skipOf(tomb('fsevents'), { dependencyPatches: { fsevents: { version: null, dev: true } } });
-      expect(removed.skip).toBe('resurrect removed it to boot');
+      expect(() => validateOp(pinned.op)).not.toThrow();
     });
 
     it('skips a dependency with no release on the registry', () => {
@@ -157,6 +166,14 @@ describe('planSteps', () => {
         }),
       );
       expect(replaced.skip).toBe('needs a code change: replace with node-fetch');
+    });
+
+    it('skips a dependency with no resolved version whose declared range already takes the newest release', () => {
+      const step = skipOf(tomb('express', { status: 'dying', declared: '^5.1.0', resolved: null, latest: '5.1.0' }));
+      expect(step.skip).toBe('already on the newest release and no replacement is known');
+      expect(step.title).toBe('Keep express at ^5.1.0');
+      const behind = skipOf(tomb('express', { status: 'dying', declared: '^4.0.0', resolved: null, latest: '5.1.0' }));
+      expect(behind.skip).toBeNull();
     });
 
     it('skips a dependency whose latest version the recipe would reject', () => {
