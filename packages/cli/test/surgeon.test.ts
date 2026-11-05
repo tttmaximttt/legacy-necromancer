@@ -151,6 +151,32 @@ describe('necromancer surgeon', () => {
     ]);
   });
 
+  it('never answers the pending fix with --yes on --resume, and --reject rolls the step back', async () => {
+    const s = await seeded([tomb('a'), tomb('b')]);
+    cacheConfigFix(s.reports);
+    const { written } = capture();
+    await fresh(s, stepSandbox(needsConfig));
+    expect(process.exitCode).toBe(3);
+
+    // No terminal: --yes covers later fixes only, so the run stays paused on this one.
+    process.exitCode = undefined;
+    await cli(s, stepSandbox(needsConfig), null, '--resume', '--yes');
+    expect(process.exitCode).toBe(3);
+    expect(written()).toContain(`necromancer surgeon ${s.root} --resume --reports ${s.reports} --approve`);
+    expect((await savedSurgeon(s)).status).toBe('needs-you');
+
+    process.exitCode = undefined;
+    await cli(s, stepSandbox(needsConfig), null, '--resume', '--reject', '--yes');
+    expect(process.exitCode).toBeUndefined();
+    const report = await savedSurgeon(s);
+    expect(report.status).toBe('complete');
+    expect(report.results.map((r) => [r.step.id, r.status, r.failedAt])).toEqual([
+      ['dep:a', 'kept', null],
+      ['dep:b', 'rolled_back', 'resurrect'],
+    ]);
+    expect(report.recipe.dependencyPatches).not.toHaveProperty('config');
+  });
+
   it('validates the --resume flags', async () => {
     const s = await seeded([tomb('a')]);
     capture();
