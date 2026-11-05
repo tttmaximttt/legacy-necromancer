@@ -1,6 +1,6 @@
 {
   "name": "legacy-necromancer",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Revive abandoned Node.js projects: map the code, date the dependencies, rebuild it in a Docker sandbox on its era's Node, and snapshot its behaviour.",
   "keywords": ["legacy-code", "nodejs", "docker", "mcp", "claude", "code-archaeology", "dependencies"],
   "license": "MIT",

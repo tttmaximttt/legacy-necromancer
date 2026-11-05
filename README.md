@@ -11,7 +11,7 @@ the step changed the app's behaviour. You make the changes yourself.
 
 ## Getting started
 
-You need Node 22+ and git. `resurrect` and `witness` also need Docker running.
+You need Node 22+ and git. `resurrect`, `witness` and `surgeon` also need Docker running.
 An Anthropic API key is optional: it lets Claude write fixes and test
 inputs. [Setting your API key](#setting-your-api-key) shows where it goes.
 
@@ -29,6 +29,7 @@ Restart Claude Code, then try:
 /necromancer:interview https://github.com/tttmaximttt/node-orm2
 /necromancer:resurrect https://github.com/tttmaximttt/node-orm2
 /necromancer:witness https://github.com/tttmaximttt/node-orm2
+/necromancer:surgeon https://github.com/tttmaximttt/node-orm2
 ```
 
 Or just ask in plain words: "exhume this repo and tell me if it's worth

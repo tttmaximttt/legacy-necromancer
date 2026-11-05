@@ -1,5 +1,5 @@
 // The Claude Code plugin installs from main and runs `npx legacy-necromancer@<pin>`, so the pin must always
-// name a version that is already on npm. The release workflow moves it only after a publish succeeds.
+// name a version that is already on npm (or, before the first publish, the version about to be published).
 //
 //   node .github/scripts/plugin-version.mjs check        fail if the pin isn't published
 //   node .github/scripts/plugin-version.mjs set 0.2.0    point the plugin at 0.2.0
