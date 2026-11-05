@@ -5,7 +5,7 @@ import type { AddressInfo } from 'node:net';
 import { createRequire } from 'node:module';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
-import { Command } from 'commander';
+import { Command, InvalidArgumentError } from 'commander';
 import {
   errorMessage,
   ReportStore,
@@ -45,7 +45,7 @@ import {
   type ResurrectOptions,
   type Sandbox,
 } from '@necromancer/resurrect';
-import { DEFAULT_MAX_ATTEMPTS, DEFAULT_MAX_STEPS, loadSurgeonInputs, runSurgeon } from '@necromancer/surgeon';
+import { DEFAULT_MAX_ATTEMPTS, DEFAULT_MAX_STEPS, loadSurgeonInputs, pausedRun, runSurgeon } from '@necromancer/surgeon';
 import { compareWitness, witness } from '@necromancer/witness';
 import { InputClosed, runInterview, terminalIo, type InterviewOptions } from './interview.js';
 import { createUiServer } from './server.js';
@@ -70,7 +70,14 @@ type Prompt = (question: string) => Promise<string>;
 
 const EFFORTS: readonly Effort[] = ['low', 'medium', 'high', 'xhigh', 'max'];
 
-const int = (v: string) => Number.parseInt(v, 10);
+/** A commander parser for a whole number of at least `min`; anything else (`x`, `1.5`, `-1`) is a usage error, not NaN. */
+const wholeNumber = (min: 0 | 1) => (v: string) => {
+  const n = /^\d+$/.test(v.trim()) ? Number(v) : Number.NaN;
+  if (!(n >= min)) throw new InvalidArgumentError(min ? 'Expected a whole number of at least 1.' : 'Expected a whole number (0 or more).');
+  return n;
+};
+const positiveInt = wholeNumber(1);
+const nonNegativeInt = wholeNumber(0);
 
 export function createProgram(deps: ProgramDeps = {}): Command {
   const program = new Command('necromancer')
@@ -90,8 +97,8 @@ export function createProgram(deps: ProgramDeps = {}): Command {
       .command('exhume')
       .description('Reconstruct a repo’s architecture: module clusters, load-bearing files, churn, install-script audit.')
       .argument('<source>', 'git URL or local path')
-      .option('-t, --top <n>', 'number of load-bearing files to report', int, 5)
-      .option('-s, --seed <n>', 'clustering seed', int, 42)
+      .option('-t, --top <n>', 'number of load-bearing files to report', positiveInt, 5)
+      .option('-s, --seed <n>', 'clustering seed', nonNegativeInt, 42)
       .option('-k, --keep', 'keep the clone after the run')
       .option('--include-tests', 'rank test files as load-bearing too'),
   ).action(
@@ -134,7 +141,7 @@ export function createProgram(deps: ProgramDeps = {}): Command {
     .option('--reports <dir>', 'report store directory')
     .option('-w, --workdir <dir>', 'where to clone remote repos')
     .option('--open', 'start the UI and open it in a browser afterwards')
-    .option('-p, --port <n>', 'UI port when --open is given', int, 4173)
+    .option('-p, --port <n>', 'UI port when --open is given', positiveInt, 4173)
     .option('-q, --quiet', 'no progress output on stderr')
     .action(
       async (
@@ -201,14 +208,14 @@ export function createProgram(deps: ProgramDeps = {}): Command {
         'are asked; without a terminal to ask on, the run stops with NEEDS YOU (exit code 3) and `--resume` carries on. Needs Docker.',
     )
     .argument('<source>', 'git URL or local path')
-    .option('-n, --max-iterations <n>', "build attempts before giving up (with --resume, default: the saved run's)", int, DEFAULT_MAX_ITERATIONS)
-    .option('--token-budget <n>', "input + output tokens the model may spend (with --resume, default: the saved run's)", int, DEFAULT_TOKEN_BUDGET)
+    .option('-n, --max-iterations <n>', "build attempts before giving up (with --resume, default: the saved run's)", positiveInt, DEFAULT_MAX_ITERATIONS)
+    .option('--token-budget <n>', "input + output tokens the model may spend (with --resume, default: the saved run's)", nonNegativeInt, DEFAULT_TOKEN_BUDGET)
     .option('--no-llm', 'known fixes and cached fixes only')
     .option('-m, --model <id>', 'Claude model', DEFAULT_MODEL)
     .option('--cpus <n>', 'CPUs per container', Number, DEFAULT_LIMITS.cpus)
-    .option('--memory <mb>', 'memory per container, in MB', int, DEFAULT_LIMITS.memoryMb)
-    .option('--step-timeout <sec>', 'time limit for each install, build or boot step', int, DEFAULT_LIMITS.stepTimeoutSec)
-    .option('--health-timeout <sec>', 'how long to wait for the app to answer', int, DEFAULT_HEALTH_TIMEOUT_SEC)
+    .option('--memory <mb>', 'memory per container, in MB', positiveInt, DEFAULT_LIMITS.memoryMb)
+    .option('--step-timeout <sec>', 'time limit for each install, build or boot step', positiveInt, DEFAULT_LIMITS.stepTimeoutSec)
+    .option('--health-timeout <sec>', 'how long to wait for the app to answer', positiveInt, DEFAULT_HEALTH_TIMEOUT_SEC)
     .option('--out-dir <dir>', 'also write Dockerfile.necromancer and docker-compose.necromancer.yml here')
     .option('--ca-file <file>', "extra CA certificate for a TLS-intercepting proxy during install (with --resume, replaces the saved run's)")
     .option('--build-proxy', "pass this machine's HTTP(S)_PROXY to the install step")
@@ -330,8 +337,8 @@ export function createProgram(deps: ProgramDeps = {}): Command {
     .option('--no-llm', 'one placeholder request per route instead of model-written inputs')
     .option('--no-tests', "don't run the project's test script")
     .option('-m, --model <id>', 'Claude model', DEFAULT_MODEL)
-    .option('--step-timeout <sec>', 'time limit for each install, build or test step', int)
-    .option('--health-timeout <sec>', 'how long to wait for the app to answer', int, DEFAULT_HEALTH_TIMEOUT_SEC)
+    .option('--step-timeout <sec>', 'time limit for each install, build or test step', positiveInt)
+    .option('--health-timeout <sec>', 'how long to wait for the app to answer', positiveInt, DEFAULT_HEALTH_TIMEOUT_SEC)
     .option('--ca-file <file>', 'extra CA certificate for a TLS-intercepting proxy during install')
     .option('--build-proxy', "pass this machine's HTTP(S)_PROXY to the install step")
     .option('--reports <dir>', 'report store directory')
@@ -430,16 +437,16 @@ export function createProgram(deps: ProgramDeps = {}): Command {
         'and `--resume` carries on. Needs saved graveyard, resurrect and witness reports, and Docker.',
     )
     .argument('<source>', 'git URL or local path')
-    .option('--max-steps <n>', 'steps that may run', int, DEFAULT_MAX_STEPS)
-    .option('--max-attempts <n>', 'resurrect attempts in total, the baseline included', int, DEFAULT_MAX_ATTEMPTS)
-    .option('--token-budget <n>', 'input + output tokens the model may spend across every step', int, DEFAULT_TOKEN_BUDGET)
+    .option('--max-steps <n>', 'steps that may run', positiveInt, DEFAULT_MAX_STEPS)
+    .option('--max-attempts <n>', 'resurrect attempts in total, the baseline included', positiveInt, DEFAULT_MAX_ATTEMPTS)
+    .option('--token-budget <n>', 'input + output tokens the model may spend across every step', nonNegativeInt, DEFAULT_TOKEN_BUDGET)
     .option('--target-node <version>', 'the Node release to end on (default: the one `necromancer plan` targets)')
     .option('--no-llm', 'known fixes and cached fixes only')
     .option('-m, --model <id>', 'Claude model', DEFAULT_MODEL)
     .option('--cpus <n>', "CPUs per container (default: the resurrect run's)", Number)
-    .option('--memory <mb>', "memory per container, in MB (default: the resurrect run's)", int)
-    .option('--step-timeout <sec>', "time limit for each install, build or boot step (default: the resurrect run's)", int)
-    .option('--health-timeout <sec>', 'how long to wait for the app to answer', int, DEFAULT_HEALTH_TIMEOUT_SEC)
+    .option('--memory <mb>', "memory per container, in MB (default: the resurrect run's)", positiveInt)
+    .option('--step-timeout <sec>', "time limit for each install, build or boot step (default: the resurrect run's)", positiveInt)
+    .option('--health-timeout <sec>', 'how long to wait for the app to answer', positiveInt, DEFAULT_HEALTH_TIMEOUT_SEC)
     .option('--out-dir <dir>', 'also write Dockerfile.necromancer and docker-compose.necromancer.yml for the upgraded recipe here')
     .option('--ca-file <file>', 'extra CA certificate for a TLS-intercepting proxy during install')
     .option('--build-proxy', "pass this machine's HTTP(S)_PROXY to the install step")
@@ -471,8 +478,7 @@ export function createProgram(deps: ProgramDeps = {}): Command {
         const common = { save: false, outDir: opts.outDir };
         let report: SurgeonReport;
         if (opts.resume) {
-          const inner = saved.surgeon?.status === 'needs-you' ? saved.surgeon.resume?.inner : undefined;
-          if (!inner) throw new Error(`no surgeon run is waiting on you for ${source}; start one without --resume`);
+          const { inner } = pausedRun(saved, source).resume;
           let run: ResumableRun;
           try {
             // The model the paused step asked; none when there is no key, which the check reports.
@@ -494,7 +500,8 @@ export function createProgram(deps: ProgramDeps = {}): Command {
             report = await runSurgeon({ source }, { sandbox, store, model: run.model, fixCache, approve, ask, onProgress: say }, { ...common, resume: decision });
           } catch (err) {
             if (!asking) throw err;
-            const typed = `${opts.yes ? ' --yes' : ''}${opts.quiet ? ' -q' : ''}${opts.outDir ? ` --out-dir ${shellArg(path.resolve(opts.outDir))}` : ''}`;
+            // Those flags read only yes, quiet and outDir, which surgeon shares with resurrect.
+            const typed = typedFlags(opts as unknown as ResurrectFlags, (name) => SURGEON_RESUME_FLAGS.includes(name) && given(name));
             throw new Error(`${errorMessage(err)}\nTo carry on with your answer:\n  ${resumeCommand('surgeon', source, opts)}${typed} ${decisionFlags(decision)}`);
           }
         } else {
@@ -542,7 +549,7 @@ export function createProgram(deps: ProgramDeps = {}): Command {
   program
     .command('ui')
     .description('Browse saved reports: interactive architecture map and dependency graveyard.')
-    .option('-p, --port <n>', 'port (falls back to the next free one)', int, 4173)
+    .option('-p, --port <n>', 'port (falls back to the next free one)', positiveInt, 4173)
     .option('--reports <dir>', 'report store directory')
     .option('--open', 'open it in a browser')
     .action((opts: { port: number; reports?: string; open?: boolean }) => serve(opts));
@@ -611,12 +618,18 @@ const SURGEON_FRESH_FLAGS: Array<keyof SurgeonFlags> = [
   'workdir',
 ];
 
+/** The RESUME_FLAGS a surgeon resume takes again: only those that change how this command runs. */
+const SURGEON_RESUME_FLAGS: readonly string[] = ['yes', 'quiet', 'outDir'] satisfies Array<keyof SurgeonFlags & keyof ResurrectFlags>;
+
 /** What gets past a refused surgeon resume, by the `ResumeError` code, to add to its message. */
 function surgeonResumeHint(source: string, err: unknown): string {
   if (!(err instanceof ResumeError)) return '';
   switch (err.code) {
     case 'model-null':
-      return `; to add an Anthropic API key, ${credentialsHint()}`;
+      return (
+        `; to add an Anthropic API key, ${credentialsHint()}, or start a new run without --resume ` +
+        `(\`necromancer surgeon ${shellArg(source)} --no-llm\` or \`--token-budget 0\`), which needs no key`
+      );
     case 'model-mismatch':
       return '';
     default:
@@ -625,7 +638,7 @@ function surgeonResumeHint(source: string, err: unknown): string {
 }
 
 /** The per-step results, then the outcome: COMPLETE, BLOCKED with the reason, or NEEDS YOU, with the steps not reached. */
-function surgeonSummary(source: string, report: SurgeonReport, opts: { reports?: string }): string {
+export function surgeonSummary(source: string, report: SurgeonReport, opts: { reports?: string }): string {
   const label: Record<SurgeonStepResult['status'], string> = { kept: 'kept', rolled_back: 'rolled back', skipped: 'skipped' };
   const line = (r: SurgeonStepResult) => {
     const head = `  ${`${r.step.n}.`.padEnd(4)}${label[r.status].padEnd(12)}${r.step.title}`;
@@ -644,8 +657,10 @@ function surgeonSummary(source: string, report: SurgeonReport, opts: { reports?:
     return `${out}${report.remaining.length ? `; not reached:\n${steps(report.remaining)}` : '\n'}`;
   }
   const [paused, ...rest] = report.remaining;
-  out += `\nPaused at step ${paused!.n}: ${paused!.title}\n${rest.length ? `Not reached yet:\n${steps(rest)}` : ''}`;
-  return `${out}${needsYou('surgeon', source, report.pending!, opts)}`;
+  // A hand-edited or truncated report may lack these; say so rather than crash.
+  if (!paused || !report.pending) return `${out}\nNEEDS YOU (no pending decision saved; start a new run without --resume)\n`;
+  out += `\nPaused at step ${paused.n}: ${paused.title}\n${rest.length ? `Not reached yet:\n${steps(rest)}` : ''}`;
+  return `${out}${needsYou('surgeon', source, report.pending, opts)}`;
 }
 
 /** The --resume decision flags: only with --resume, one of --approve and --reject, and a non-blank --answer. */

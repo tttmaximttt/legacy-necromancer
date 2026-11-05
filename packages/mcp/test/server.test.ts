@@ -6,7 +6,7 @@ import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import { describe, expect, it, vi } from 'vitest';
 import { REPORT_KINDS, ReportStore, slugFor, type ExhumeReport, type GraveyardReport, type Tombstone } from '@necromancer/core';
 import { ScriptedModel } from '@necromancer/llm';
-import { createServer, summarize, type ServerOptions } from '@necromancer/mcp';
+import { createServer, summarize, summarizeSurgeon, type ServerOptions } from '@necromancer/mcp';
 import { errorSignature, resurrect } from '@necromancer/resurrect';
 import { fixtureRepo, goodProposal } from '../../interview/test/fixtures.js';
 import { deadApp, expressMongoApp, FakeSandbox, NODE_GYP_LOG } from '../../resurrect/test/helpers.js';
@@ -625,5 +625,17 @@ describe('necromancer MCP surgeon', () => {
     const again = await client.callTool({ name: 'surgeon', arguments: { source: s.root, resume: true, approve: true } });
     expect(again.isError).toBe(true);
     expect(text(again)).toContain('No surgeon run is waiting on the user for this source');
+  });
+
+  it('summarizes a needs-you report saved without its pending decision as NEEDS YOU, not BLOCKED: null', async () => {
+    const s = await seeded([tomb('a'), tomb('b')]);
+    const client = await connect({ store: s.store, sandbox: stepSandbox(needsConfig) });
+    await client.callTool({ name: 'surgeon', arguments: { source: s.root, tokenBudget: 0, targetNode: s.node } });
+    const report = (await s.store.load(slugFor(s.root)))!.surgeon!;
+    expect(report.status).toBe('needs-you');
+    const body = summarizeSurgeon({ ...report, pending: null });
+    expect(body.status).toBe('NEEDS YOU (no pending decision saved; start a new run)');
+    expect(body).not.toHaveProperty('pending');
+    expect(body).not.toHaveProperty('next');
   });
 });

@@ -277,6 +277,17 @@ describe('loadSurgeonInputs', () => {
     await expect(loadSurgeonInputs(s.store, s.root)).rejects.toThrow(/resurrect did not get .* running \(blocked\)/);
   });
 
+  it.each([
+    ['maxSteps', Number.NaN],
+    ['maxAttempts', Number.NaN],
+    ['tokenBudget', Number.NaN],
+    ['maxSteps', 1.5],
+    ['tokenBudget', Number.POSITIVE_INFINITY],
+  ] as const)('refuses a %s of %s rather than running without that budget', async (name, value) => {
+    const s = await seed([tomb('a')]);
+    await expect(run(s, {}, { [name]: value })).rejects.toThrow(`${name} must be a whole number, not ${value}`);
+  });
+
   it('refuses maxAttempts below 1', async () => {
     const s = await seed([tomb('a')]);
     await expect(run(s, {}, { maxAttempts: 0 })).rejects.toThrow('maxAttempts must be at least 1 (the baseline)');

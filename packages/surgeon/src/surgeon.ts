@@ -9,6 +9,7 @@ import type {
   SandboxLimits,
   SurgeonBudgets,
   SurgeonReport,
+  SurgeonRunState,
   SurgeonStep,
   SurgeonStepResult,
   WitnessDiffSummary,
@@ -165,6 +166,10 @@ export async function runSurgeon(inputs: SurgeonInputs, deps: SurgeonDeps, optio
     tokenBudget: options.tokenBudget ?? DEFAULT_TOKEN_BUDGET,
     limits: { ...DEFAULT_LIMITS, ...saved.resurrect.limits, ...defined(options.limits) },
   };
+  // NaN or a fraction would otherwise compare false against every limit and turn that budget off.
+  for (const name of ['maxSteps', 'maxAttempts', 'tokenBudget'] as const) {
+    if (!Number.isInteger(budgets[name])) throw new Error(`${name} must be a whole number, not ${budgets[name]}`);
+  }
   if (budgets.maxAttempts < 1) throw new Error('maxAttempts must be at least 1 (the baseline)');
   const target = from?.target.node ?? options.targetNode ?? TARGET_NODE;
   const settings = from?.resume?.inner.resume?.settings;
@@ -402,12 +407,16 @@ export async function runSurgeon(inputs: SurgeonInputs, deps: SurgeonDeps, optio
   return report;
 }
 
-/** The saved surgeon run to resume; throws unless it is waiting on the owner. */
-function pausedRun(saved: LoadedInputs, source: string): SurgeonReport {
+/** The saved surgeon run that is waiting on the owner, with the state to resume it; null when there is none. */
+export function waitingRun(saved: Pick<LoadedInputs, 'surgeon'>): (SurgeonReport & { resume: SurgeonRunState }) | null {
   const from = saved.surgeon;
-  if (from?.status !== 'needs-you' || !from.resume) {
-    throw new Error(`no surgeon run is waiting on you for ${source}; start one without --resume`);
-  }
+  return from?.status === 'needs-you' && from.resume ? (from as SurgeonReport & { resume: SurgeonRunState }) : null;
+}
+
+/** The saved surgeon run to resume; throws, with the command-line wording, unless it is waiting on the owner. */
+export function pausedRun(saved: Pick<LoadedInputs, 'surgeon'>, source: string): SurgeonReport & { resume: SurgeonRunState } {
+  const from = waitingRun(saved);
+  if (!from) throw new Error(`no surgeon run is waiting on you for ${source}; start one without --resume`);
   return from;
 }
 

@@ -5,7 +5,7 @@ import path from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { REPORT_KINDS, ReportStore, slugFor, type Tombstone } from '@necromancer/core';
 import { errorSignature } from '@necromancer/resurrect';
-import { createProgram } from '../src/index.js';
+import { createProgram, surgeonSummary } from '../src/index.js';
 import type { FakeSandbox } from '../../resurrect/test/helpers.js';
 import { fail, seed, stepSandbox, tomb, type Decide, type Respond } from '../../surgeon/test/helpers.js';
 
@@ -188,6 +188,33 @@ describe('necromancer surgeon', () => {
     );
     await expect(cli(s, stepSandbox(), null, '--resume', '--approve')).rejects.toThrow('no surgeon run is waiting on you');
     expect(process.exitCode).toBeUndefined();
+  });
+
+  it('rejects a budget that is not a whole number with a usage error and exit code 1', async () => {
+    const s = await seeded([tomb('a')]);
+    const { written } = capture();
+    const exit = vi.spyOn(process, 'exit').mockImplementation((code) => {
+      throw new Error(`exit ${code}`);
+    });
+    await expect(fresh(s, stepSandbox(), '--max-attempts', 'x')).rejects.toThrow('exit 1');
+    expect(exit).toHaveBeenCalledWith(1);
+    expect(written()).toContain("option '--max-attempts <n>' argument 'x' is invalid. Expected a whole number of at least 1.");
+    await expect(fresh(s, stepSandbox(), '--max-steps', '0')).rejects.toThrow('exit 1');
+    await expect(fresh(s, stepSandbox(), '--token-budget', '1.5')).rejects.toThrow('exit 1');
+    expect(written()).toContain("argument '1.5' is invalid. Expected a whole number (0 or more).");
+    expect((await new ReportStore(s.reports).load(slugFor(s.root)))!.surgeon).toBeNull();
+  });
+
+  it('prints a needs-you report saved without its pending decision instead of crashing', async () => {
+    const s = await seeded([tomb('a'), tomb('b')]);
+    cacheConfigFix(s.reports);
+    capture();
+    await fresh(s, stepSandbox(needsConfig));
+    const report = await savedSurgeon(s);
+    expect(report.status).toBe('needs-you');
+    for (const broken of [{ ...report, pending: null }, { ...report, remaining: [] }]) {
+      expect(surgeonSummary(s.root, broken, {})).toMatch(/\nNEEDS YOU \(no pending decision saved; start a new run without --resume\)\n$/);
+    }
   });
 
   it('says which command to run first when a report is missing', async () => {

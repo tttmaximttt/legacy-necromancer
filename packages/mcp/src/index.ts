@@ -37,7 +37,7 @@ import {
   type ResurrectOptions,
   type Sandbox,
 } from '@necromancer/resurrect';
-import { DEFAULT_MAX_ATTEMPTS, DEFAULT_MAX_STEPS, loadSurgeonInputs, runSurgeon } from '@necromancer/surgeon';
+import { DEFAULT_MAX_ATTEMPTS, DEFAULT_MAX_STEPS, loadSurgeonInputs, runSurgeon, waitingRun } from '@necromancer/surgeon';
 import { compareWitness, witness } from '@necromancer/witness';
 
 export interface ServerOptions {
@@ -564,7 +564,7 @@ export function createServer(options: ServerOptions = {}): McpServer {
           const fresh = Object.entries({ maxSteps, maxAttempts, tokenBudget, targetNode }).filter(([, v]) => v !== undefined).map(([k]) => k);
           if (fresh.length) throw new Error(`${fresh.join(', ')} ${fresh.length === 1 ? 'goes' : 'go'} with a new run; a resumed run keeps the paused run's budgets and settings.`);
           if (answer !== undefined && !answer.trim()) throw new Error('answer is empty; pass what the user said, or ask them again.');
-          const inner = saved.surgeon?.status === 'needs-you' ? saved.surgeon.resume?.inner : undefined;
+          const inner = waitingRun(saved)?.resume.inner;
           if (!inner) throw new Error('No surgeon run is waiting on the user for this source; call `surgeon` without resume to start one.');
           let run: ResumableRun;
           try {
@@ -715,10 +715,13 @@ function resumeHint(tool: 'resurrect' | 'surgeon', err: ResumeError): string {
 /** A surgeon run in brief: the outcome, counts, and each step's id, status and short reason; the full report is saved. */
 export function summarizeSurgeon(report: SurgeonReport) {
   const short = (reason: string | null) => reason && truncate(reason, SUMMARY_REASON_CHARS);
-  const paused = report.status === 'needs-you' && report.pending;
+  const pending = report.status === 'needs-you' ? report.pending : null;
+  // A needs-you report saved without its pending decision cannot be resumed; it is not BLOCKED either.
+  const status =
+    report.status === 'complete' ? 'COMPLETE' : report.status === 'blocked' ? `BLOCKED: ${report.blockedReason}` : pending ? 'NEEDS YOU' : 'NEEDS YOU (no pending decision saved; start a new run)';
   return {
-    status: report.status === 'complete' ? 'COMPLETE' : paused ? 'NEEDS YOU' : `BLOCKED: ${report.blockedReason}`,
-    ...(paused && { pausedAt: report.remaining[0]?.id ?? null, pending: pendingSummary(report.pending!), next: nextStep('surgeon', report.pending!) }),
+    status,
+    ...(pending && { pausedAt: report.remaining[0]?.id ?? null, pending: pendingSummary(pending), next: nextStep('surgeon', pending) }),
     target: `Node ${report.target.node}`,
     nodeImage: report.recipe.nodeImage,
     baseline: { ok: report.baseline.ok, reason: short(report.baseline.reason) },
