@@ -99,6 +99,31 @@ describe('resurrect loop', () => {
     expect(sandbox.calls[1]!.command).toBe(`node -e "require('./')"`);
   });
 
+  it('starts from a given recipe, services and era instead of detecting them', async () => {
+    const root = await deadApp(expressMongoApp);
+    const detected = await resurrect(root, { sandbox: new FakeSandbox({}), model: null });
+    const recipe = { ...detected.recipe, nodeImage: 'node:12', dependencyPatches: { express: { version: '4.21.2', dev: false } } };
+    const sandbox = new FakeSandbox({});
+    const report = await resurrect(root, { sandbox, model: null, start: { recipe, services: [], era: { date: '2019-01-01', why: 'given' } } });
+
+    expect(report.outcome).toBe('resurrected');
+    expect(report.era).toEqual({ date: '2019-01-01', node: 'node:12', why: 'given' });
+    expect(report.services).toEqual([]);
+    expect(report.recipe).toEqual(recipe);
+    expect(sandbox.dockerfiles[0]).toContain('FROM node:12');
+    expect(sandbox.manifests[0]).toMatchObject({ dependencies: { express: '4.21.2' } });
+    expect(sandbox.calls.find((c) => c.step === 'boot')!.boot!.services).toEqual([]);
+    // The caller's recipe is copied, not changed.
+    expect(recipe.nodeImage).toBe('node:12');
+  });
+
+  it('refuses start together with resume', async () => {
+    const sandbox = new FakeSandbox({});
+    const start = { recipe: {} as never, services: [], era: { date: null, why: '' } };
+    await expect(resurrect('/nowhere', { sandbox, start, resume: {} as never })).rejects.toThrow('start and resume cannot be combined');
+    expect(sandbox.calls).toEqual([]);
+  });
+
   it('applies sandbox limits to every step', async () => {
     const root = await deadApp(expressMongoApp);
     const sandbox = new FakeSandbox({});

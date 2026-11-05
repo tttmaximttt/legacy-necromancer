@@ -4,6 +4,7 @@ import path from 'node:path';
 import type {
   AppliedFix,
   BuildRecipe,
+  DetectedService,
   ExhumeReport,
   GraveyardReport,
   FixRisk,
@@ -160,6 +161,11 @@ export interface ResurrectOptions {
   ask?: (question: OwnerQuestion) => Promise<string | null>;
   /** Carry on from a paused run, from `prepareResume` (or `checkResumable` and the owner's answer). */
   resume?: ResumeInput;
+  /**
+   * Start a fresh run from this recipe, these services and this era instead of detecting them (used by surgeon).
+   * Not allowed with `resume`.
+   */
+  start?: { recipe: BuildRecipe; services: DetectedService[]; era: { date: string | null; why: string } };
 }
 
 const LOCKFILES = ['package-lock.json', 'npm-shrinkwrap.json', 'yarn.lock', 'pnpm-lock.yaml'];
@@ -273,6 +279,7 @@ function canonicalJson(value: unknown): string {
  * needs-you, and `resume` carries on from that report.
  */
 export async function resurrect(source: string, options: ResurrectOptions): Promise<ResurrectReport> {
+  if (options.start && options.resume) throw new Error('start and resume cannot be combined');
   // The checks are cheap and pure, so they run again here on whatever run and answer are handed in.
   const resumed = options.resume ? checkedResume(options.resume, options.model ?? null) : null;
   const settings = resumed?.settings ?? runSettings(options);
@@ -307,6 +314,10 @@ export async function resurrect(source: string, options: ResurrectOptions): Prom
       era = { date: resumed.from.era.date, why: resumed.from.era.why };
       services = structuredClone(resumed.from.services);
       recipe = structuredClone(resumed.from.recipe);
+    } else if (options.start) {
+      era = { date: options.start.era.date, why: options.start.era.why };
+      services = structuredClone(options.start.services);
+      recipe = structuredClone(options.start.recipe);
     } else {
       const eraDate =
         options.graveyard?.era.estimate ?? options.graveyard?.era.died ?? options.exhume?.history.lastCommit ?? (await readHistory(repo.root)).lastCommit;

@@ -18,8 +18,10 @@
   },
   "dependencies": {
     "@necromancer/core": "workspace:*",
+    "@necromancer/llm": "workspace:*",
     "@necromancer/plan": "workspace:*",
     "@necromancer/resurrect": "workspace:*",
+    "@necromancer/witness": "workspace:*",
     "semver": "^7.8.5"
   },
   "devDependencies": {

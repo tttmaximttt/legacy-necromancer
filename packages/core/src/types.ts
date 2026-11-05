@@ -715,9 +715,16 @@ export interface SurgeonBudgets {
 export interface SurgeonReport {
   repo: { source: string; commit: string | null };
   generatedAt: string;
-  /** complete: every step was kept, rolled back or skipped. blocked: stopped early, see blockedReason. */
-  status: 'complete' | 'blocked';
+  /**
+   * complete: every step was kept, rolled back or skipped. blocked: stopped early, see blockedReason. needs-you: paused
+   * on `pending` (a step's fix waits on the owner); continue with a resume.
+   */
+  status: 'complete' | 'blocked' | 'needs-you';
   blockedReason: string | null;
+  /** Set when the status is needs-you: what the owner is asked, as in the paused inner run (`resume.inner.pending`). */
+  pending?: PendingDecision | null;
+  /** Set when the status is needs-you: the state to resume from. */
+  resume?: SurgeonRunState | null;
   /** generatedAt of each report the run started from. The graveyard report has none, so it is null. */
   basedOn: { graveyard: string | null; resurrect: string; witness: string };
   target: { node: string };
@@ -727,10 +734,25 @@ export interface SurgeonReport {
   used: { steps: number; attempts: number; tokens: number; calls: number; model: string | null };
   summary: { kept: number; rolledBack: number; skipped: number; remaining: number };
   results: SurgeonStepResult[];
-  /** Planned steps the run never reached because it stopped. */
+  /**
+   * Planned steps the run never reached because it stopped or paused, in plan order; when paused, the first is the
+   * paused step. Skip-marked steps are always in results.
+   */
   remaining: SurgeonStep[];
   /** The starting recipe with every kept step (and its fix) applied, and its Dockerfile. */
   recipe: BuildRecipe;
   dockerfile: string;
   warnings: string[];
+}
+
+/** Everything a surgeon resume needs beyond the report itself. */
+export interface SurgeonRunState {
+  /** n of the paused step (remaining[0]). */
+  step: number;
+  /** Time already spent on that step. */
+  elapsedMs: number;
+  /** Totals before the paused step; the report's `used` includes its inner run so far. */
+  used: SurgeonReport['used'];
+  /** The paused inner resurrect run, outcome needs-you, with its own pending decision and ResurrectRunState. */
+  inner: ResurrectReport;
 }
