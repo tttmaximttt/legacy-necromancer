@@ -115,8 +115,9 @@ left to try.
 ### Surgeon loop
 
 The loop is implemented in
-[surgeon/src/surgeon.ts](packages/surgeon/src/surgeon.ts) but isn't wired to
-the CLI or MCP yet.
+[surgeon/src/surgeon.ts](packages/surgeon/src/surgeon.ts); run it with
+[`necromancer surgeon`](#necromancer-surgeon-git-url--path) or the MCP
+`surgeon` tool.
 
 ```mermaid
 flowchart TD
@@ -148,8 +149,10 @@ and marks steps it already knows can't be done as skipped. Each step is
 rebuilt with `resurrect`, with at most one fix that goes through the same
 approval as resurrect's, and compared with `witness --check`
 ([compare.ts](packages/witness/src/compare.ts)); a step that still fails or
-changes a response is rolled back. The run stops when the steps (20),
-attempts (40, the baseline included) or tokens (150,000) run out.
+changes a response is rolled back, and so is one whose fix undoes the step.
+The run stops when the steps (20), attempts (40, the baseline included) or
+tokens (150,000) run out; a fix waiting on you with no terminal to ask on
+ends it with `NEEDS YOU`, and `necromancer surgeon … --resume` carries on.
 
 ## Commands
 
@@ -162,6 +165,7 @@ attempts (40, the baseline included) or tokens (150,000) run out.
 | `resurrect <repo>` | Builds and boots it in Docker on its era's Node, fixing failures until it runs, is `BLOCKED`, or `NEEDS YOU` |
 | `witness <repo> [--check]` | Calls every route on the revived app and records normalized golden snapshots, runs its tests; `--check` compares a new run |
 | `plan <repo>` | Turns the saved reports into ordered upgrade steps, each followed by a check; saves `plan.md` |
+| `surgeon <repo>` | Tries each upgrade step on the resurrected recipe, keeping it only while the witness snapshots still match; `BLOCKED` or `NEEDS YOU` as `resurrect` |
 | `ui [--open]` | Serves the UI over saved reports on localhost |
 | `mcp` | Runs the MCP server on stdio, for Claude Code or any MCP client |
 
@@ -349,18 +353,67 @@ It needs a saved `graveyard` report (`autopsy` saves one); the more of the
 other reports there are, the better the plan. It saves `plan.md` and
 `plan.json` next to them. No API key or network is needed.
 
+## `necromancer surgeon <git-url | path>`
+
+Upgrades the recipe `resurrect` got running, one step at a time: dead,
+dying and ailing dependencies first, then the move to Node 24
+(`--target-node` picks another release). It needs saved `graveyard`,
+`resurrect` and `witness` reports, and says which command to run first
+when one is missing. Before any step it boots the unchanged recipe and
+replays the golden requests; if anything differs it stops, since a later
+difference could not be blamed on a step.
+
+Each step changes one thing, gets one build attempt plus one fix if the
+first fails, and is then checked with the golden requests. It is kept only
+when every response matches, and rolled back otherwise. The output lists
+every step: kept, rolled back (with whether it failed in `resurrect` or in
+the witness check, and the first few differences), or skipped and why.
+
+```sh
+necromancer surgeon https://github.com/owner/old-app --out-dir ./upgraded
+```
+
+The run stops with `BLOCKED: <reason>` and lists the steps it did not reach
+when it has run 20 steps (`--max-steps`), used 40 resurrect attempts with the
+baseline (`--max-attempts`), or used 150,000 tokens (`--token-budget`). The
+sandbox limits default to the ones the `resurrect` run used (`--cpus`,
+`--memory`, `--step-timeout`). `--out-dir` writes the upgraded
+`Dockerfile.necromancer` and `docker-compose.necromancer.yml`. Without
+`ANTHROPIC_API_KEY` only known fixes and fixes already in the cache are
+tried (`--no-llm` forces that). `--health-timeout`, `--ca-file` and
+`--build-proxy` work as they do for `resurrect`. The full report is saved as
+`surgeon.json`.
+
+Fixes wait for your OK as they do in `resurrect`: `y`, `n` or `p` in a
+terminal, `--yes` to apply them without asking. Without a terminal the run
+stops at the step with `NEEDS YOU` and exits with code 3:
+
+```sh
+necromancer surgeon <repo> --resume --approve     # apply the fix it stopped on
+necromancer surgeon <repo> --resume --reject      # decline it; the step is rolled back unless another fix is found
+necromancer surgeon <repo> --resume --answer "stub it"
+```
+
+A resumed run keeps the paused run's budgets and settings, so the flags
+that set them can't be typed with `--resume`. It refuses to carry on if the
+saved reports changed since it paused. The exit code is 0 when every step
+was kept, rolled back or skipped, 2 when blocked and 3 for `NEEDS YOU`.
+
 ## Setting your API key
 
-Three commands call Claude: `interview` asks what the project is for,
-`resurrect` asks for a fix when no known fix applies, and `witness` asks
-for test requests. Everything else works without a key, and so do these
-three, just with less help:
+Four commands call Claude: `interview` asks what the project is for,
+`resurrect` asks for a fix when no known fix applies, `witness` asks
+for test requests, and `surgeon` asks for fixes through its inner
+`resurrect` runs. Everything else works without a key, and so do these
+four, just with less help:
 
 - `interview` in the terminal needs the key to make a proposal (answering a
   saved one with `--reuse` doesn't). Through the MCP server it doesn't: the
   Claude you're talking to writes the proposal instead.
 - `resurrect` only tries the known fixes and fixes already in the cache.
 - `witness` sends one placeholder request per route.
+- `surgeon` only tries the known fixes and fixes already in the cache;
+  `--no-llm` or `--token-budget 0` keeps it off the API even with a key.
 
 Create a key at [platform.claude.com](https://platform.claude.com/settings/keys).
 Calls are billed to that API account, not to a Claude subscription.

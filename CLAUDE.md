@@ -36,7 +36,7 @@ The product is a pipeline of stages. Each stage is its own package, and each wri
 3. **interview**: collects evidence (README, manifest, entry points, load-bearing files), gets a proposal of what the project is for, and checks every `file:line` citation against the repo. The proposal comes from Claude, or from the MCP host when there is no key.
 4. **resurrect**: builds and boots the app in Docker on its era's Node version, with database sidecars. A failure is fixed from a table of known fixes (`fixes.ts`), then a fix cache, then the LLM (`agent.ts`), within iteration and token budgets. The build state is a `BuildRecipe` that changes through validated ops (`recipe.ts`) and is rendered to a Dockerfile and compose file.
 5. **witness**: boots the resurrected app and records normalized golden snapshots of every route. `--check` replays those requests and diffs the responses (`compare.ts`).
-6. **surgeon**: a stub, not implemented.
+6. **surgeon**: plans upgrade steps (dead, dying and ailing dependencies, then Node) and tries each on a copy of the resurrect recipe: an inner `resurrect` with at most one fix, then a witness replay of the golden requests. A step is kept only when nothing differs, and rolled back otherwise. It stops blocked when a budget runs out, and needs-you (resumable) when a fix waits on the owner.
 
 Later stages build on earlier ones through `ReportStore` (`core/src/store.ts`). Reports are saved as `~/.necromancer/reports/<slugFor(source)>/<kind>.json` (or `$NECROMANCER_REPORTS`), and each stage loads the saved reports for the same source. For example, `witness` needs a saved `resurrect` report.
 

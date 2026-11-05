@@ -5,8 +5,20 @@ import type { AddressInfo } from 'node:net';
 import { createRequire } from 'node:module';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
-import { Command } from 'commander';
-import { errorMessage, ReportStore, shellArg, shellQuote, slugFor, type PendingDecision, type ReportKind, type ResurrectReport } from '@necromancer/core';
+import { Command, InvalidArgumentError } from 'commander';
+import {
+  errorMessage,
+  ReportStore,
+  shellArg,
+  shellQuote,
+  slugFor,
+  type PendingDecision,
+  type ReportKind,
+  type ResurrectReport,
+  type SurgeonReport,
+  type SurgeonStep,
+  type SurgeonStepResult,
+} from '@necromancer/core';
 import { exhume } from '@necromancer/excavate';
 import { runStdio } from '@necromancer/mcp';
 import { graveyard } from '@necromancer/graveyard';
@@ -33,6 +45,7 @@ import {
   type ResurrectOptions,
   type Sandbox,
 } from '@necromancer/resurrect';
+import { DEFAULT_MAX_ATTEMPTS, DEFAULT_MAX_STEPS, loadSurgeonInputs, pausedRun, runSurgeon } from '@necromancer/surgeon';
 import { compareWitness, witness } from '@necromancer/witness';
 import { InputClosed, runInterview, terminalIo, type InterviewOptions } from './interview.js';
 import { createUiServer } from './server.js';
@@ -57,7 +70,20 @@ type Prompt = (question: string) => Promise<string>;
 
 const EFFORTS: readonly Effort[] = ['low', 'medium', 'high', 'xhigh', 'max'];
 
-const int = (v: string) => Number.parseInt(v, 10);
+/** A commander parser for a whole number of at least `min`; anything else (`x`, `1.5`, `-1`) is a usage error, not NaN. */
+const wholeNumber = (min: 0 | 1) => (v: string) => {
+  const n = /^\d+$/.test(v.trim()) ? Number(v) : Number.NaN;
+  if (!(n >= min)) throw new InvalidArgumentError(min ? 'Expected a whole number of at least 1.' : 'Expected a whole number (0 or more).');
+  return n;
+};
+const positiveInt = wholeNumber(1);
+const nonNegativeInt = wholeNumber(0);
+/** A commander parser for a number above 0, fractions allowed (e.g. `--cpus 0.5`). */
+const positiveNumber = (v: string) => {
+  const n = /^\d*\.?\d+$/.test(v.trim()) ? Number(v) : Number.NaN;
+  if (!(n > 0)) throw new InvalidArgumentError('Expected a number above 0.');
+  return n;
+};
 
 export function createProgram(deps: ProgramDeps = {}): Command {
   const program = new Command('necromancer')
@@ -77,8 +103,8 @@ export function createProgram(deps: ProgramDeps = {}): Command {
       .command('exhume')
       .description('Reconstruct a repo’s architecture: module clusters, load-bearing files, churn, install-script audit.')
       .argument('<source>', 'git URL or local path')
-      .option('-t, --top <n>', 'number of load-bearing files to report', int, 5)
-      .option('-s, --seed <n>', 'clustering seed', int, 42)
+      .option('-t, --top <n>', 'number of load-bearing files to report', positiveInt, 5)
+      .option('-s, --seed <n>', 'clustering seed', nonNegativeInt, 42)
       .option('-k, --keep', 'keep the clone after the run')
       .option('--include-tests', 'rank test files as load-bearing too'),
   ).action(
@@ -121,7 +147,7 @@ export function createProgram(deps: ProgramDeps = {}): Command {
     .option('--reports <dir>', 'report store directory')
     .option('-w, --workdir <dir>', 'where to clone remote repos')
     .option('--open', 'start the UI and open it in a browser afterwards')
-    .option('-p, --port <n>', 'UI port when --open is given', int, 4173)
+    .option('-p, --port <n>', 'UI port when --open is given', positiveInt, 4173)
     .option('-q, --quiet', 'no progress output on stderr')
     .action(
       async (
@@ -188,14 +214,14 @@ export function createProgram(deps: ProgramDeps = {}): Command {
         'are asked; without a terminal to ask on, the run stops with NEEDS YOU (exit code 3) and `--resume` carries on. Needs Docker.',
     )
     .argument('<source>', 'git URL or local path')
-    .option('-n, --max-iterations <n>', "build attempts before giving up (with --resume, default: the saved run's)", int, DEFAULT_MAX_ITERATIONS)
-    .option('--token-budget <n>', "input + output tokens the model may spend (with --resume, default: the saved run's)", int, DEFAULT_TOKEN_BUDGET)
+    .option('-n, --max-iterations <n>', "build attempts before giving up (with --resume, default: the saved run's)", positiveInt, DEFAULT_MAX_ITERATIONS)
+    .option('--token-budget <n>', "input + output tokens the model may spend (with --resume, default: the saved run's)", nonNegativeInt, DEFAULT_TOKEN_BUDGET)
     .option('--no-llm', 'known fixes and cached fixes only')
     .option('-m, --model <id>', 'Claude model', DEFAULT_MODEL)
-    .option('--cpus <n>', 'CPUs per container', Number, DEFAULT_LIMITS.cpus)
-    .option('--memory <mb>', 'memory per container, in MB', int, DEFAULT_LIMITS.memoryMb)
-    .option('--step-timeout <sec>', 'time limit for each install, build or boot step', int, DEFAULT_LIMITS.stepTimeoutSec)
-    .option('--health-timeout <sec>', 'how long to wait for the app to answer', int, DEFAULT_HEALTH_TIMEOUT_SEC)
+    .option('--cpus <n>', 'CPUs per container', positiveNumber, DEFAULT_LIMITS.cpus)
+    .option('--memory <mb>', 'memory per container, in MB', positiveInt, DEFAULT_LIMITS.memoryMb)
+    .option('--step-timeout <sec>', 'time limit for each install, build or boot step', positiveInt, DEFAULT_LIMITS.stepTimeoutSec)
+    .option('--health-timeout <sec>', 'how long to wait for the app to answer', positiveInt, DEFAULT_HEALTH_TIMEOUT_SEC)
     .option('--out-dir <dir>', 'also write Dockerfile.necromancer and docker-compose.necromancer.yml here')
     .option('--ca-file <file>', "extra CA certificate for a TLS-intercepting proxy during install (with --resume, replaces the saved run's)")
     .option('--build-proxy', "pass this machine's HTTP(S)_PROXY to the install step")
@@ -216,10 +242,7 @@ export function createProgram(deps: ProgramDeps = {}): Command {
         opts: ResurrectFlags,
         command: Command,
       ) => {
-        if ((opts.approve || opts.reject || opts.answer !== undefined) && !opts.resume) throw new Error('--approve, --reject and --answer go with --resume');
-        if (opts.approve && opts.reject) throw new Error('pass --approve or --reject, not both');
-        // A blank answer would otherwise read as "nobody answered" and exit 3, so a script would loop on it.
-        if (opts.answer !== undefined && !opts.answer.trim()) throw new Error('--answer is empty; pass the answer text');
+        checkResumeFlags(opts);
         const store = new ReportStore(opts.reports);
         const saved = await store.load(slugFor(source));
         const io = terminalIo();
@@ -230,12 +253,7 @@ export function createProgram(deps: ProgramDeps = {}): Command {
           // On a resume the paused run's settings stand, except for the flags typed again.
           const given = (name: string) => command.getOptionValueSource(name) === 'cli';
           const fixCache = new FixCache(path.join(path.dirname(store.dir), 'fix-cache.json'));
-          const approve: ResurrectOptions['approve'] = opts.yes
-            ? async () => 'auto-approve'
-            : prompt
-              ? (request) => askApproval(request, prompt)
-              : async () => 'pause';
-          const ask: ResurrectOptions['ask'] = prompt ? (question) => askQuestion(question, prompt) : undefined;
+          const { approve, ask } = ownerGates(opts, prompt);
           let report: ResurrectReport;
           if (opts.resume) {
             const from = saved?.resurrect;
@@ -260,7 +278,7 @@ export function createProgram(deps: ProgramDeps = {}): Command {
             const decision = await resumeDecision(run, opts, prompt);
             if (!decision) {
               // Nobody answered (no terminal, or the owner chose to pause): still waiting, so the same exit as a fresh pause.
-              process.stderr.write(needsYou(source, run.pending, opts));
+              process.stderr.write(needsYou('resurrect', source, run.pending, opts));
               process.exitCode = 3;
               return;
             }
@@ -270,7 +288,7 @@ export function createProgram(deps: ProgramDeps = {}): Command {
               report = await resurrect(source, { sandbox, model: run.model, fixCache, onProgress: say, approve, ask, resume: { run, ...decision } });
             } catch (err) {
               if (!asking) throw err;
-              throw new Error(`${errorMessage(err)}\nTo carry on with your answer:\n  ${resumeCommand(source, opts)}${typedFlags(opts, given)} ${decisionFlags(decision)}`);
+              throw new Error(`${errorMessage(err)}\nTo carry on with your answer:\n  ${resumeCommand('resurrect', source, opts)}${typedFlags(opts, given)} ${decisionFlags(decision)}`);
             }
           } else {
             report = await resurrect(source, {
@@ -301,7 +319,7 @@ export function createProgram(deps: ProgramDeps = {}): Command {
           if (report.outcome === 'resurrected') {
             process.stderr.write(`\nRESURRECTED on ${report.recipe.nodeImage} after ${report.attempts.length} attempt(s): ${report.health!.detail}\n`);
           } else if (report.outcome === 'needs-you' && report.pending) {
-            process.stderr.write(needsYou(source, report.pending, opts));
+            process.stderr.write(needsYou('resurrect', source, report.pending, opts));
             process.exitCode = 3;
           } else {
             process.stderr.write(`\nBLOCKED: ${report.blockedReason}\n`);
@@ -325,8 +343,8 @@ export function createProgram(deps: ProgramDeps = {}): Command {
     .option('--no-llm', 'one placeholder request per route instead of model-written inputs')
     .option('--no-tests', "don't run the project's test script")
     .option('-m, --model <id>', 'Claude model', DEFAULT_MODEL)
-    .option('--step-timeout <sec>', 'time limit for each install, build or test step', int)
-    .option('--health-timeout <sec>', 'how long to wait for the app to answer', int, DEFAULT_HEALTH_TIMEOUT_SEC)
+    .option('--step-timeout <sec>', 'time limit for each install, build or test step', positiveInt)
+    .option('--health-timeout <sec>', 'how long to wait for the app to answer', positiveInt, DEFAULT_HEALTH_TIMEOUT_SEC)
     .option('--ca-file <file>', 'extra CA certificate for a TLS-intercepting proxy during install')
     .option('--build-proxy', "pass this machine's HTTP(S)_PROXY to the install step")
     .option('--reports <dir>', 'report store directory')
@@ -416,6 +434,119 @@ export function createProgram(deps: ProgramDeps = {}): Command {
     });
 
   program
+    .command('surgeon')
+    .description(
+      'Upgrade the resurrected recipe one step at a time: dead, dying and ailing dependencies, then Node. Each step is ' +
+        'built and booted in Docker with at most one fix, then the golden witness requests are replayed; a step is kept ' +
+        'only when nothing differs, and rolled back otherwise. Stops with BLOCKED: <reason> when a budget runs out. Risky ' +
+        'fixes wait for your OK as in resurrect; without a terminal to ask on, the run stops with NEEDS YOU (exit code 3) ' +
+        'and `--resume` carries on. Needs saved graveyard, resurrect and witness reports, and Docker.',
+    )
+    .argument('<source>', 'git URL or local path')
+    .option('--max-steps <n>', 'steps that may run', positiveInt, DEFAULT_MAX_STEPS)
+    .option('--max-attempts <n>', 'resurrect attempts in total, the baseline included', positiveInt, DEFAULT_MAX_ATTEMPTS)
+    .option('--token-budget <n>', 'input + output tokens the model may spend across every step', nonNegativeInt, DEFAULT_TOKEN_BUDGET)
+    .option('--target-node <version>', 'the Node release to end on (default: the one `necromancer plan` targets)')
+    .option('--no-llm', 'known fixes and cached fixes only')
+    .option('-m, --model <id>', 'Claude model', DEFAULT_MODEL)
+    .option('--cpus <n>', "CPUs per container (default: the resurrect run's)", positiveNumber)
+    .option('--memory <mb>', "memory per container, in MB (default: the resurrect run's)", positiveInt)
+    .option('--step-timeout <sec>', "time limit for each install, build or boot step (default: the resurrect run's)", positiveInt)
+    .option('--health-timeout <sec>', 'how long to wait for the app to answer', positiveInt, DEFAULT_HEALTH_TIMEOUT_SEC)
+    .option('--out-dir <dir>', 'also write Dockerfile.necromancer and docker-compose.necromancer.yml for the upgraded recipe here')
+    .option('--ca-file <file>', 'extra CA certificate for a TLS-intercepting proxy during install')
+    .option('--build-proxy', "pass this machine's HTTP(S)_PROXY to the install step")
+    .option('-y, --yes', 'apply risky cache and model fixes without asking (with --resume, not the one it is waiting on: pass --approve or --reject)')
+    .option('--resume', 'carry on from the saved run that is waiting on you, with its budgets and settings')
+    .option('--approve', 'with --resume: apply the fix it is waiting on')
+    .option('--reject', 'with --resume: decline that fix and roll the step back unless another fix is found')
+    .option('--answer <text>', 'with --resume: your answer to its question, or the number of one of its choices')
+    .option('--reports <dir>', 'report store directory')
+    .option('-w, --workdir <dir>', 'where to clone remote repos')
+    .option('-q, --quiet', 'no progress output on stderr')
+    .action(async (source: string, opts: SurgeonFlags, command: Command) => {
+      checkResumeFlags(opts);
+      const given = (name: string) => command.getOptionValueSource(name) === 'cli';
+      if (opts.resume) {
+        // A resumed run keeps the paused run's budgets and settings, so a flag that would change them is a mistake.
+        const typed = SURGEON_FRESH_FLAGS.filter(given).map((name) => command.options.find((o) => o.attributeName() === name)!.long);
+        if (typed.length) throw new Error(`${typed.join(', ')} ${typed.length === 1 ? "doesn't" : "don't"} go with --resume: the paused run's budgets and settings stand`);
+      }
+      const store = new ReportStore(opts.reports);
+      const saved = await loadSurgeonInputs(store, source);
+      const io = terminalIo();
+      const prompt = deps.prompt !== undefined ? deps.prompt : io.ask;
+      try {
+        const say = progress(opts, '⚕');
+        const fixCache = new FixCache(path.join(path.dirname(store.dir), 'fix-cache.json'));
+        const { approve, ask } = ownerGates(opts, prompt);
+        // The report is saved here, as resurrect's is, to name the file.
+        const common = { save: false, outDir: opts.outDir };
+        let report: SurgeonReport;
+        if (opts.resume) {
+          const { inner } = pausedRun(saved, source).resume;
+          let run: ResumableRun;
+          try {
+            // The model the paused step asked; none when there is no key, which the check reports.
+            run = checkResumable(inner, { model: (name) => deps.model ?? (hasCredentials() ? new ClaudeModel({ model: name }) : null) });
+          } catch (err) {
+            throw new Error(`${errorMessage(err)}${surgeonResumeHint(source, err)}`);
+          }
+          const sandbox = deps.sandbox ?? new DockerSandbox(run.settings.sandbox ?? {});
+          // As for resurrect: Docker is checked before the owner is asked, so a typed answer is not lost to it.
+          const asking = prompt !== null && !opts.approve && !opts.reject && opts.answer === undefined;
+          if (asking) await sandbox.ping();
+          const decision = await resumeDecision(run, opts, prompt);
+          if (!decision) {
+            process.stderr.write(needsYou('surgeon', source, run.pending, opts));
+            process.exitCode = 3;
+            return;
+          }
+          try {
+            report = await runSurgeon({ source }, { sandbox, store, model: run.model, fixCache, approve, ask, onProgress: say }, { ...common, resume: decision });
+          } catch (err) {
+            if (!asking) throw err;
+            // Those flags read only yes, quiet and outDir, which surgeon shares with resurrect.
+            const typed = typedFlags(opts as unknown as ResurrectFlags, (name) => SURGEON_RESUME_FLAGS.includes(name) && given(name));
+            throw new Error(`${errorMessage(err)}\nTo carry on with your answer:\n  ${resumeCommand('surgeon', source, opts)}${typed} ${decisionFlags(decision)}`);
+          }
+        } else {
+          const noKey = () => say?.(`no Anthropic API key, so only known fixes will be tried (to add one, ${credentialsHint()})`);
+          report = await runSurgeon(
+            { source },
+            {
+              sandbox: chooseSandbox(opts, deps),
+              store,
+              model: opts.tokenBudget > 0 ? chooseModel(opts, deps, noKey) : null,
+              fixCache,
+              approve,
+              ask,
+              onProgress: say,
+            },
+            {
+              ...common,
+              maxSteps: opts.maxSteps,
+              maxAttempts: opts.maxAttempts,
+              tokenBudget: opts.tokenBudget,
+              limits: { cpus: opts.cpus, memoryMb: opts.memory, stepTimeoutSec: opts.stepTimeout },
+              targetNode: opts.targetNode,
+              // Saved with the paused step for a resume, so made absolute.
+              caFile: opts.caFile === undefined ? undefined : path.resolve(opts.caFile),
+              workdir: opts.workdir,
+            },
+          );
+        }
+        const file = await store.save('surgeon', report);
+        process.stderr.write(surgeonSummary(source, report, opts));
+        if (report.status === 'needs-you') process.exitCode = 3;
+        else if (report.status === 'blocked') process.exitCode = 2;
+        process.stderr.write(`saved ${file}${opts.outDir ? ` and the Dockerfile and compose file to ${opts.outDir}` : ''}\n`);
+      } finally {
+        io.close?.();
+      }
+    });
+
+  program
     .command('mcp')
     .description('Run the MCP server on stdio, for Claude Code or any other MCP client.')
     .option('-w, --workdir <dir>', 'where to clone remote repos', process.env.NECROMANCER_WORKDIR)
@@ -424,7 +555,7 @@ export function createProgram(deps: ProgramDeps = {}): Command {
   program
     .command('ui')
     .description('Browse saved reports: interactive architecture map and dependency graveyard.')
-    .option('-p, --port <n>', 'port (falls back to the next free one)', int, 4173)
+    .option('-p, --port <n>', 'port (falls back to the next free one)', positiveInt, 4173)
     .option('--reports <dir>', 'report store directory')
     .option('--open', 'open it in a browser')
     .action((opts: { port: number; reports?: string; open?: boolean }) => serve(opts));
@@ -456,6 +587,102 @@ interface ResurrectFlags extends ResumeFlags {
   keepImages?: boolean;
   workdir?: string;
   quiet?: boolean;
+}
+
+interface SurgeonFlags extends ResumeFlags {
+  maxSteps: number;
+  maxAttempts: number;
+  tokenBudget: number;
+  targetNode?: string;
+  llm: boolean;
+  model: string;
+  cpus?: number;
+  memory?: number;
+  stepTimeout?: number;
+  healthTimeout: number;
+  outDir?: string;
+  caFile?: string;
+  buildProxy?: boolean;
+  workdir?: string;
+  quiet?: boolean;
+}
+
+/** Surgeon flags that set up a new run; a resume keeps the paused run's, so they are refused with --resume. */
+const SURGEON_FRESH_FLAGS: Array<keyof SurgeonFlags> = [
+  'maxSteps',
+  'maxAttempts',
+  'tokenBudget',
+  'targetNode',
+  'llm',
+  'model',
+  'cpus',
+  'memory',
+  'stepTimeout',
+  'healthTimeout',
+  'caFile',
+  'buildProxy',
+  'workdir',
+];
+
+/** The RESUME_FLAGS a surgeon resume takes again: only those that change how this command runs. */
+const SURGEON_RESUME_FLAGS: readonly string[] = ['yes', 'quiet', 'outDir'] satisfies Array<keyof SurgeonFlags & keyof ResurrectFlags>;
+
+/** What gets past a refused surgeon resume, by the `ResumeError` code, to add to its message. */
+function surgeonResumeHint(source: string, err: unknown): string {
+  if (!(err instanceof ResumeError)) return '';
+  switch (err.code) {
+    case 'model-null':
+      return (
+        `; to add an Anthropic API key, ${credentialsHint()}, or start a new run without --resume ` +
+        `(\`necromancer surgeon ${shellArg(source)} --no-llm\` or \`--token-budget 0\`), which needs no key`
+      );
+    case 'model-mismatch':
+      return '';
+    default:
+      return ` (\`necromancer surgeon ${shellArg(source)}\` without --resume starts a new run)`;
+  }
+}
+
+/** The per-step results, then the outcome: COMPLETE, BLOCKED with the reason, or NEEDS YOU, with the steps not reached. */
+export function surgeonSummary(source: string, report: SurgeonReport, opts: { reports?: string }): string {
+  const label: Record<SurgeonStepResult['status'], string> = { kept: 'kept', rolled_back: 'rolled back', skipped: 'skipped' };
+  const line = (r: SurgeonStepResult) => {
+    const head = `  ${`${r.step.n}.`.padEnd(4)}${label[r.status].padEnd(12)}${r.step.title}`;
+    if (r.status === 'kept') return `${head}${r.fix ? ` (with fix: ${r.fix.description})` : ''}\n`;
+    if (r.status === 'skipped') return `${head}: ${r.reason}\n`;
+    const examples = (r.diff?.examples ?? []).slice(0, 3).map((d) => `         ${d.what.padEnd(7)} ${d.case}: ${d.detail}\n`);
+    return `${head}\n       at ${r.failedAt}: ${r.reason}\n${examples.join('')}`;
+  };
+  const steps = (list: SurgeonStep[]) => list.map((s) => `  ${`${s.n}.`.padEnd(4)}${s.title}\n`).join('');
+  const { kept, rolledBack, skipped } = report.summary;
+  const counts = `${kept} kept, ${rolledBack} rolled back, ${skipped} skipped`;
+  let out = `\nSURGEON on ${report.recipe.nodeImage}, aiming at Node ${report.target.node}:\n${report.results.length ? report.results.map(line).join('') : '  no step ran\n'}`;
+  if (report.status === 'complete') return `${out}\nCOMPLETE: ${counts}\n`;
+  if (report.status === 'blocked') {
+    out += `\nBLOCKED: ${report.blockedReason}\n${counts}`;
+    return `${out}${report.remaining.length ? `; not reached:\n${steps(report.remaining)}` : '\n'}`;
+  }
+  const [paused, ...rest] = report.remaining;
+  // A hand-edited or truncated report may lack these; say so rather than crash.
+  if (!paused || !report.pending) return `${out}\nNEEDS YOU (no pending decision saved; start a new run without --resume)\n`;
+  out += `\nPaused at step ${paused.n}: ${paused.title}\n${rest.length ? `Not reached yet:\n${steps(rest)}` : ''}`;
+  return `${out}${needsYou('surgeon', source, report.pending, opts)}`;
+}
+
+/** The --resume decision flags: only with --resume, one of --approve and --reject, and a non-blank --answer. */
+function checkResumeFlags(opts: ResumeFlags): void {
+  if ((opts.approve || opts.reject || opts.answer !== undefined) && !opts.resume) throw new Error('--approve, --reject and --answer go with --resume');
+  if (opts.approve && opts.reject) throw new Error('pass --approve or --reject, not both');
+  // A blank answer would otherwise read as "nobody answered" and exit 3, so a script would loop on it.
+  if (opts.answer !== undefined && !opts.answer.trim()) throw new Error('--answer is empty; pass the answer text');
+}
+
+/** How a run asks the owner: --yes approves risky fixes, a terminal asks, and with neither the run pauses as needs-you. */
+function ownerGates(opts: { yes?: boolean }, prompt: Prompt | null): Pick<ResurrectOptions, 'approve' | 'ask'> {
+  return {
+    approve: opts.yes ? async () => 'auto-approve' : prompt ? (request) => askApproval(request, prompt) : async () => 'pause',
+    ask: prompt ? (question) => askQuestion(question, prompt) : undefined,
+  };
 }
 
 /** The owner's answer to the pending decision of a needs-you report, from flags or the terminal; null to stay paused. */
@@ -561,9 +788,11 @@ function resumeHint(source: string, from: ResurrectReport, overrides: ResumeOver
   }
 }
 
-/** The command that resumes the paused run of `source`. */
-function resumeCommand(source: string, opts: { reports?: string }): string {
-  return `necromancer resurrect ${shellArg(source)} --resume${opts.reports ? ` --reports ${shellArg(opts.reports)}` : ''}`;
+type Stage = 'resurrect' | 'surgeon';
+
+/** The command that resumes the paused `stage` run of `source`. */
+function resumeCommand(stage: Stage, source: string, opts: { reports?: string }): string {
+  return `necromancer ${stage} ${shellArg(source)} --resume${opts.reports ? ` --reports ${shellArg(opts.reports)}` : ''}`;
 }
 
 /** The flags that pass the owner's decision to `--resume` again. */
@@ -618,8 +847,8 @@ function typedFlags(opts: ResurrectFlags, given: (name: string) => boolean): str
 }
 
 /** The NEEDS YOU block: what the run is waiting on and the exact commands that carry it on. */
-function needsYou(source: string, pending: PendingDecision, opts: { reports?: string }): string {
-  const command = resumeCommand(source, opts);
+function needsYou(stage: Stage, source: string, pending: PendingDecision, opts: { reports?: string }): string {
+  const command = resumeCommand(stage, source, opts);
   if (pending.kind === 'question') {
     return (
       `\nNEEDS YOU: ${pending.question}\n` +

@@ -3,6 +3,8 @@ export {
   runSurgeon,
   loadSurgeonInputs,
   summarizeDiffs,
+  pausedRun,
+  waitingRun,
   DEFAULT_MAX_STEPS,
   DEFAULT_MAX_ATTEMPTS,
   type SurgeonInputs,

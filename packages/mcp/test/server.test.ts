@@ -4,13 +4,14 @@ import path from 'node:path';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import { describe, expect, it, vi } from 'vitest';
-import { ReportStore, slugFor, type ExhumeReport, type GraveyardReport, type Tombstone } from '@necromancer/core';
+import { REPORT_KINDS, ReportStore, slugFor, type ExhumeReport, type GraveyardReport, type Tombstone } from '@necromancer/core';
 import { ScriptedModel } from '@necromancer/llm';
-import { createServer, summarize, type ServerOptions } from '@necromancer/mcp';
+import { createServer, summarize, summarizeSurgeon, type ServerOptions } from '@necromancer/mcp';
 import { errorSignature, resurrect } from '@necromancer/resurrect';
 import { fixtureRepo, goodProposal } from '../../interview/test/fixtures.js';
 import { deadApp, expressMongoApp, FakeSandbox, NODE_GYP_LOG } from '../../resurrect/test/helpers.js';
 import { answering } from '../../witness/test/helpers.js';
+import { fail, seed, stepSandbox, tomb, type Decide } from '../../surgeon/test/helpers.js';
 
 // The real resurrect, wrapped so a test can see the options the server passed.
 vi.mock('@necromancer/resurrect', async (importOriginal) => {
@@ -56,7 +57,7 @@ describe('necromancer MCP server', () => {
   it('lists the tools and the autopsy prompt', async () => {
     const client = await connect();
     const { tools } = await client.listTools();
-    expect(tools.map((t) => t.name)).toEqual(['exhume', 'graveyard', 'interview', 'record_interview', 'resurrect', 'witness', 'plan']);
+    expect(tools.map((t) => t.name)).toEqual(['exhume', 'graveyard', 'interview', 'record_interview', 'resurrect', 'witness', 'plan', 'surgeon']);
     expect(tools.slice(0, 2).every((t) => t.annotations?.readOnlyHint)).toBe(true);
     expect(Object.keys(tools[1]!.inputSchema.properties ?? {})).toEqual(['source', 'advisories', 'github', 'detail', 'save']);
     expect(Object.keys(tools[0]!.inputSchema.properties ?? {})).toEqual(['source', 'top', 'includeTests', 'detail', 'save']);
@@ -536,5 +537,105 @@ describe('necromancer MCP witness', () => {
     expect(check.unchanged).toBe(false);
     expect(check.differences).toEqual([{ case: 'GET /health (default)', what: 'body', detail: 'changed at /ok' }]);
     expect(check.savedTo).toBeUndefined();
+  });
+});
+
+describe('necromancer MCP surgeon', () => {
+  const FOO_LOG = 'npm ERR! canvas@2.0.0 install: Package foo was not found in the pkg-config search path.\nnpm ERR! code ELIFECYCLE';
+  /** Step b fails to install until the config package is added, which only the cached (risky) fix does. */
+  const needsConfig: Decide = (_d, deps) => (deps.b === '2.0.0' && !deps.config ? fail(FOO_LOG) : null);
+
+  /** The surgeon test seed in a store of its own, with a risky cached fix for FOO_LOG in the fix cache next to it. */
+  async function seeded(tombstones: Tombstone[]) {
+    const s = await seed(tombstones);
+    const dir = await mkdtemp(path.join(os.tmpdir(), 'necro-mcp-surgeon-'));
+    const fix = { description: 'add the config package', ops: [{ op: 'setDependency', name: 'config', version: '^1.0.0' }], hits: 1 };
+    await writeFile(path.join(dir, 'fix-cache.json'), JSON.stringify({ [errorSignature('install', FOO_LOG)]: fix }));
+    const store = new ReportStore(path.join(dir, 'reports'));
+    const saved = (await s.store.load(slugFor(s.root)))!;
+    for (const kind of REPORT_KINDS) if (saved[kind]) await store.save(kind, saved[kind]);
+    return { root: s.root, node: s.node, store };
+  }
+
+  it('needs the saved reports first', async () => {
+    const root = await deadApp(expressMongoApp);
+    const result = await (await connect({ sandbox: new FakeSandbox({}) })).callTool({ name: 'surgeon', arguments: { source: root } });
+    expect(result.isError).toBe(true);
+    expect(text(result)).toContain(`no graveyard report for ${root}; run \`necromancer graveyard ${root}\` first`);
+  });
+
+  it('returns a summary of each step, not the full report, and saves the report', async () => {
+    const s = await seeded([tomb('a'), tomb('b'), tomb('gone', { latest: null })]);
+    const sandbox = stepSandbox(undefined, (_c, deps) => (deps.a === '2.0.0' ? { status: 500, body: null } : { status: 200, body: { items: ['a', 'b'] } }));
+    const client = await connect({ store: s.store, sandbox });
+    const result = await client.callTool({ name: 'surgeon', arguments: { source: s.root, tokenBudget: 0, targetNode: s.node } });
+    expect(result.isError).toBeFalsy();
+    const body = JSON.parse(text(result));
+    expect(body.status).toBe('COMPLETE');
+    expect(body.summary).toEqual({ kept: 1, rolledBack: 1, skipped: 1, remaining: 0 });
+    expect(body.steps).toEqual([
+      { id: 'dep:a', status: 'rolled_back', reason: expect.stringMatching(/differences? from the golden snapshots/), failedAt: 'witness', differences: expect.objectContaining({ status: 1 }) },
+      { id: 'dep:b', status: 'kept' },
+      { id: 'dep:gone', status: 'skipped', reason: 'no release found on the registry' },
+    ]);
+    expect(body.remaining).toEqual([]);
+    expect(body.budgets).toEqual({ maxSteps: 20, maxAttempts: 40, tokenBudget: 0 });
+    expect(body).not.toHaveProperty('recipe');
+    expect(body).not.toHaveProperty('dockerfile');
+    expect(body).not.toHaveProperty('results');
+    expect(body.savedTo).toBe(path.join(s.store.dir, slugFor(s.root), 'surgeon.json'));
+    expect((await s.store.load(slugFor(s.root)))!.surgeon!.status).toBe('complete');
+  });
+
+  it('pauses on a risky fix so the host can ask, then resumes with the answer', async () => {
+    const s = await seeded([tomb('a'), tomb('b'), tomb('c')]);
+    const paused = await connect({ store: s.store, sandbox: stepSandbox(needsConfig) });
+    const body = JSON.parse(text(await paused.callTool({ name: 'surgeon', arguments: { source: s.root, tokenBudget: 0, targetNode: s.node, save: false } })));
+    expect(body.status).toBe('NEEDS YOU');
+    expect(body.pausedAt).toBe('dep:b');
+    expect(body.pending).toMatchObject({ kind: 'approval', fix: { source: 'cache', description: 'add the config package' }, risks: ['changes package.json: sets config to ^1.0.0'] });
+    expect(body.next).toMatch(/call surgeon again with the same source, resume: true and approve: true/);
+    expect(body.remaining).toEqual(['dep:b', 'dep:c']);
+    // A paused run is saved even with save: false, since resume reads it.
+    expect(body.savedTo).toBe(path.join(s.store.dir, slugFor(s.root), 'surgeon.json'));
+
+    const client = await connect({ store: s.store, sandbox: stepSandbox(needsConfig) });
+    const missing = await client.callTool({ name: 'surgeon', arguments: { source: s.root, resume: true } });
+    expect(missing.isError).toBe(true);
+    expect(text(missing)).toContain('resuming needs a decision on the pending fix');
+    const budgets = await client.callTool({ name: 'surgeon', arguments: { source: s.root, resume: true, approve: true, maxSteps: 5 } });
+    expect(budgets.isError).toBe(true);
+    expect(text(budgets)).toContain("maxSteps goes with a new run; a resumed run keeps the paused run's budgets and settings.");
+    const unpaired = await client.callTool({ name: 'surgeon', arguments: { source: s.root, approve: true } });
+    expect(text(unpaired)).toContain('approve and answer go with resume: true');
+    expect((await s.store.load(slugFor(s.root)))!.surgeon!.status).toBe('needs-you');
+
+    const resumed = JSON.parse(text(await client.callTool({ name: 'surgeon', arguments: { source: s.root, resume: true, approve: true, save: false } })));
+    expect(resumed.status).toBe('COMPLETE');
+    expect(resumed.steps).toEqual([
+      { id: 'dep:a', status: 'kept' },
+      { id: 'dep:b', status: 'kept', fix: 'add the config package' },
+      { id: 'dep:c', status: 'kept' },
+    ]);
+    expect(resumed.pending).toBeUndefined();
+    // Even with save: false, the resumed run replaces the stale needs-you report.
+    expect(resumed.savedTo).toBe(path.join(s.store.dir, slugFor(s.root), 'surgeon.json'));
+    expect((await s.store.load(slugFor(s.root)))!.surgeon!.status).toBe('complete');
+
+    const again = await client.callTool({ name: 'surgeon', arguments: { source: s.root, resume: true, approve: true } });
+    expect(again.isError).toBe(true);
+    expect(text(again)).toContain('No surgeon run is waiting on the user for this source');
+  });
+
+  it('summarizes a needs-you report saved without its pending decision as NEEDS YOU, not BLOCKED: null', async () => {
+    const s = await seeded([tomb('a'), tomb('b')]);
+    const client = await connect({ store: s.store, sandbox: stepSandbox(needsConfig) });
+    await client.callTool({ name: 'surgeon', arguments: { source: s.root, tokenBudget: 0, targetNode: s.node } });
+    const report = (await s.store.load(slugFor(s.root)))!.surgeon!;
+    expect(report.status).toBe('needs-you');
+    const body = summarizeSurgeon({ ...report, pending: null });
+    expect(body.status).toBe('NEEDS YOU (no pending decision saved; start a new run)');
+    expect(body).not.toHaveProperty('pending');
+    expect(body).not.toHaveProperty('next');
   });
 });

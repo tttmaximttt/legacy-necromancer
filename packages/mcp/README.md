@@ -17,6 +17,7 @@ The server uses stdio and runs on your machine. It needs `git` on `PATH`.
 | `resurrect` | Phase 5: builds and boots the repo in Docker on its era's Node, fixing failures until it runs or is `BLOCKED`. Needs Docker where the server runs. |
 | `witness` | Phase 6: calls every route on the revived app and saves normalized golden snapshots, then runs its tests. With `check`, compares a new run against them. Needs a prior `resurrect`. |
 | `plan` | Turns the saved reports into ordered upgrade steps, lowest risk first, each followed by its check. Saves `plan.json` and `plan.md`. Needs a saved `graveyard` report. |
+| `surgeon` | Phase 7: tries each upgrade step on the resurrected recipe and keeps it only while the witness snapshots still match. Returns a summary per step. Needs saved `graveyard`, `resurrect` and `witness` reports, and Docker. |
 
 `graveyard` takes `source`, `advisories` (`npm`, `osv` or `none`), `github`
 (default true) and `detail`. In `summary` mode, healthy dependencies are
@@ -62,10 +63,22 @@ otherwise each route gets one placeholder request. With `check: true` it
 re-sends the saved golden requests and returns `unchanged` and a list of
 `differences`, without saving.
 
+`surgeon` takes `source`, `maxSteps` (default 20), `maxAttempts` (default
+40, the baseline included), `tokenBudget` (0 for known fixes only),
+`targetNode`, `approvals`, `resume`, `approve`, `answer` and `save`. It
+returns the status (`COMPLETE`, `BLOCKED: <reason>` or `NEEDS YOU`), the
+counts, and each step's `id`, `status` and a short `reason` (with
+`failedAt`, the fix it used, and the differences by kind), the ids of the
+steps not reached, and what it used; the full report is saved. Pending fixes
+and questions work as in `resurrect`: call `surgeon` again with
+`resume: true` and `approve` or `answer`. A resumed run keeps the paused
+run's budgets, so `maxSteps`, `maxAttempts`, `tokenBudget` and `targetNode`
+are refused with `resume`.
+
 There is also an `autopsy` prompt that asks Claude to exhume a repo and give
 a verdict. In Claude Code it appears as `/mcp__necromancer__autopsy`.
 
-Later stages (Operate) become tools here as they are built. They aren't stubbed yet, because a tool that does nothing only
+Later stages become tools here as they are built. They aren't stubbed yet, because a tool that does nothing only
 confuses the agent.
 
 ## Setup

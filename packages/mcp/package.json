@@ -29,6 +29,7 @@
     "@necromancer/llm": "workspace:*",
     "@necromancer/resurrect": "workspace:*",
     "@necromancer/witness": "workspace:*",
-    "@necromancer/plan": "workspace:*"
+    "@necromancer/plan": "workspace:*",
+    "@necromancer/surgeon": "workspace:*"
   }
 }
