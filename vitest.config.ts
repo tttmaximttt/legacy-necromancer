@@ -22,6 +22,7 @@ export default defineConfig({
       '@necromancer/resurrect': pkg('resurrect'),
       '@necromancer/witness': pkg('witness'),
       '@necromancer/plan': pkg('plan'),
+      '@necromancer/surgeon': pkg('surgeon'),
     },
   },
   test: {

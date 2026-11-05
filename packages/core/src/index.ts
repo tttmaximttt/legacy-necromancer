@@ -1,4 +1,5 @@
 export type * from './types.js';
+export { compare } from './compare.js';
 export { seededRandom } from './random.js';
 export { toPosix } from './paths.js';
 export { defaultEnvFile, fileSettings, readEnvFile, setting, usable } from './env.js';

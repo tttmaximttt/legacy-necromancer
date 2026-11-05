@@ -256,6 +256,19 @@ importers:
       '@necromancer/core':
         specifier: workspace:*
         version: link:../core
+      '@necromancer/plan':
+        specifier: workspace:*
+        version: link:../plan
+      '@necromancer/resurrect':
+        specifier: workspace:*
+        version: link:../resurrect
+      semver:
+        specifier: ^7.8.5
+        version: 7.8.5
+    devDependencies:
+      '@types/semver':
+        specifier: ^7.8.0
+        version: 7.8.0
 
   packages/ui:
     dependencies:

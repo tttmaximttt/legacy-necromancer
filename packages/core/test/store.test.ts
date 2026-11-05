@@ -2,7 +2,7 @@ import { mkdtemp, mkdir, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { describe, expect, it } from 'vitest';
-import { ReportStore, slugFor, type ExhumeReport } from '@necromancer/core';
+import { ReportStore, slugFor, type ExhumeReport, type SurgeonReport } from '@necromancer/core';
 
 describe('slugFor', () => {
   it.each([
@@ -31,7 +31,16 @@ describe('ReportStore', () => {
       ['a__two', 'https://github.com/a/two', ['graveyard']],
       ['a__one', 'https://github.com/a/one', ['exhume']],
     ]);
-    expect(await store.load('a__one')).toEqual({ exhume: report('https://github.com/a/one'), graveyard: null, interview: null, resurrect: null, witness: null, plan: null });
+    expect(await store.load('a__one')).toEqual({ exhume: report('https://github.com/a/one'), graveyard: null, interview: null, resurrect: null, witness: null, plan: null, surgeon: null });
+  });
+
+  it('round-trips a surgeon report', async () => {
+    const store = new ReportStore(await mkdtemp(path.join(os.tmpdir(), 'necro-store-')));
+    const report = { repo: { source: '/code/old-app', commit: null }, status: 'complete' } as unknown as SurgeonReport;
+    const file = await store.save('surgeon', report);
+    expect(file).toBe(path.join(store.dir, 'old-app', 'surgeon.json'));
+    expect((await store.list()).map((r) => r.kinds)).toEqual([['surgeon']]);
+    expect((await store.load('old-app'))?.surgeon).toEqual(report);
   });
 
   it('refuses slugs that could escape the store and ignores stray directories', async () => {

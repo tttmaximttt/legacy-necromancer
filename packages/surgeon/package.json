@@ -2,7 +2,7 @@
   "name": "@necromancer/surgeon",
   "version": "0.0.0",
   "private": true,
-  "description": "Stretch: incremental upgrades that keep the witness snapshots green.",
+  "description": "Bounded upgrades: one dependency or runtime step at a time, kept only while the witness snapshots stay green.",
   "type": "module",
   "exports": {
     ".": {
@@ -17,6 +17,12 @@
     "build": "tsc -b"
   },
   "dependencies": {
-    "@necromancer/core": "workspace:*"
+    "@necromancer/core": "workspace:*",
+    "@necromancer/plan": "workspace:*",
+    "@necromancer/resurrect": "workspace:*",
+    "semver": "^7.8.5"
+  },
+  "devDependencies": {
+    "@types/semver": "^7.8.0"
   }
 }

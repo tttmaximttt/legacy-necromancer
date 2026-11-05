@@ -643,3 +643,94 @@ export interface PlanReport {
   leftAlone: Array<{ name: string; reason: string }>;
   warnings: string[];
 }
+
+// ── Surgeon ──────────────────────────────────────────────────────────────
+
+/** One way a witness check differs from the golden snapshots. */
+export interface WitnessDifference {
+  case: string;
+  what: 'missing' | 'new' | 'status' | 'headers' | 'body' | 'error' | 'tests';
+  detail: string;
+}
+
+/** What a witness check found: counts by kind and the first few differences. */
+export interface WitnessDiffSummary {
+  total: number;
+  byKind: Partial<Record<WitnessDifference['what'], number>>;
+  /** At most 10, in compareWitness order. */
+  examples: WitnessDifference[];
+}
+
+export type SurgeonStepKind = 'upgrade-node' | 'upgrade-dependency';
+
+export interface SurgeonStep {
+  /** 1-based position in the plan. */
+  n: number;
+  /** Stable: "node:24", "dep:express". */
+  id: string;
+  kind: SurgeonStepKind;
+  /** e.g. "Move to Node 24", "Upgrade express from 3.21.2 to 5.1.0". */
+  title: string;
+  /** Exactly one op: setNodeImage for the Node step, setDependency for a dependency. */
+  op: Extract<RecipeOp, { op: 'setNodeImage' } | { op: 'setDependency' }>;
+  change: { name: string; from: string | null; to: string };
+  /** The tombstone's status; null for the Node step. */
+  status: Exclude<TombstoneStatus, 'alive' | 'unknown'> | null;
+  dev: boolean;
+  why: string[];
+  /** Set when the plan already knows the step can't be done; the loop records it as skipped without running it. */
+  skip: string | null;
+}
+
+export type SurgeonStepStatus = 'kept' | 'rolled_back' | 'skipped';
+
+export interface SurgeonStepResult {
+  step: SurgeonStep;
+  status: SurgeonStepStatus;
+  /** Why it was rolled back or skipped; null when kept. */
+  reason: string | null;
+  /** Where it failed: the inner resurrect (install/build/boot), or the witness run or its comparison. null when kept or skipped. */
+  failedAt: 'resurrect' | 'witness' | null;
+  /** The one fix resurrect applied on top of the step's op, when it tried one. */
+  fix: AppliedFix | null;
+  /** The witness check, when one ran. null when the build failed first or the step was skipped. */
+  diff: WitnessDiffSummary | null;
+  /** Resurrect attempts this step used: 0 when skipped, 1 or 2 otherwise. */
+  attempts: number;
+  tokens: number;
+  durationMs: number;
+}
+
+export interface SurgeonBudgets {
+  /** Steps that may run (skipped-at-plan steps don't count). */
+  maxSteps: number;
+  /** Resurrect attempts in total, the baseline included. */
+  maxAttempts: number;
+  /** Input plus output tokens across every inner resurrect run. */
+  tokenBudget: number;
+  limits: SandboxLimits;
+}
+
+/** A bounded upgrade run: planned steps applied one at a time to the build recipe, each kept only if the witness snapshots still match. */
+export interface SurgeonReport {
+  repo: { source: string; commit: string | null };
+  generatedAt: string;
+  /** complete: every step was kept, rolled back or skipped. blocked: stopped early, see blockedReason. */
+  status: 'complete' | 'blocked';
+  blockedReason: string | null;
+  /** generatedAt of each report the run started from. The graveyard report has none, so it is null. */
+  basedOn: { graveyard: string | null; resurrect: string; witness: string };
+  target: { node: string };
+  /** The unmodified recipe checked against the golden snapshots before any step. */
+  baseline: { ok: boolean; reason: string | null; diff: WitnessDiffSummary | null };
+  budgets: SurgeonBudgets;
+  used: { steps: number; attempts: number; tokens: number; calls: number; model: string | null };
+  summary: { kept: number; rolledBack: number; skipped: number; remaining: number };
+  results: SurgeonStepResult[];
+  /** Planned steps the run never reached because it stopped. */
+  remaining: SurgeonStep[];
+  /** The starting recipe with every kept step (and its fix) applied, and its Dockerfile. */
+  recipe: BuildRecipe;
+  dockerfile: string;
+  warnings: string[];
+}

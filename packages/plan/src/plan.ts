@@ -8,10 +8,10 @@ import type {
   Tombstone,
   WitnessReport,
 } from '@necromancer/core';
-import { nodeLine, shellArg } from '@necromancer/core';
+import { compare, nodeLine, shellArg } from '@necromancer/core';
 
 /** The saved reports a plan is built from. Only graveyard is required. */
-export type PlanInputs = Omit<StoredReports, 'plan'>;
+export type PlanInputs = Omit<StoredReports, 'plan' | 'surgeon'>;
 
 export interface PlanOptions {
   /** Source to name in check commands; defaults to the graveyard report's. */
@@ -66,9 +66,6 @@ interface Usage {
   /** The first npm script that names the package, if any. */
   script: string | null;
 }
-
-/** Ordering by UTF-16 code units, so plans come out the same under any locale. */
-const compare = (a: string, b: string): number => (a < b ? -1 : a > b ? 1 : 0);
 
 /**
  * Builds the modernization plan from the saved reports. Deterministic: no network, no model, no files.
