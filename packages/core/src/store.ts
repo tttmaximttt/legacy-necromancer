@@ -1,11 +1,11 @@
 import { mkdir, readdir, readFile, stat, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
-import type { ExhumeReport, GraveyardReport, InterviewReport, PlanReport, ResurrectReport, WitnessReport } from './types.js';
+import type { ExhumeReport, GraveyardReport, InterviewReport, PlanReport, ResurrectReport, SurgeonReport, WitnessReport } from './types.js';
 
-export type ReportKind = 'exhume' | 'graveyard' | 'interview' | 'resurrect' | 'witness' | 'plan';
+export type ReportKind = 'exhume' | 'graveyard' | 'interview' | 'resurrect' | 'witness' | 'plan' | 'surgeon';
 
-export const REPORT_KINDS: readonly ReportKind[] = ['exhume', 'graveyard', 'interview', 'resurrect', 'witness', 'plan'];
+export const REPORT_KINDS: readonly ReportKind[] = ['exhume', 'graveyard', 'interview', 'resurrect', 'witness', 'plan', 'surgeon'];
 
 export interface StoredReports {
   exhume: ExhumeReport | null;
@@ -14,6 +14,7 @@ export interface StoredReports {
   resurrect: ResurrectReport | null;
   witness: WitnessReport | null;
   plan: PlanReport | null;
+  surgeon: SurgeonReport | null;
 }
 
 export interface StoredRepo {
@@ -39,7 +40,7 @@ export function slugFor(source: string): string {
 export class ReportStore {
   constructor(readonly dir: string = defaultReportsDir()) {}
 
-  async save(kind: ReportKind, report: ExhumeReport | GraveyardReport | InterviewReport | ResurrectReport | WitnessReport | PlanReport): Promise<string> {
+  async save(kind: ReportKind, report: ExhumeReport | GraveyardReport | InterviewReport | ResurrectReport | WitnessReport | PlanReport | SurgeonReport): Promise<string> {
     return this.saveFile(report.repo.source, `${kind}.json`, JSON.stringify(report));
   }
 
@@ -84,15 +85,18 @@ export class ReportStore {
       const text = await readFile(path.join(this.dir, slug, `${kind}.json`), 'utf8').catch(() => null);
       return text ? (JSON.parse(text) as T) : null;
     };
-    const [exhume, graveyard, interview, resurrect, witness, plan] = await Promise.all([
+    const [exhume, graveyard, interview, resurrect, witness, plan, surgeon] = await Promise.all([
       read<ExhumeReport>('exhume'),
       read<GraveyardReport>('graveyard'),
       read<InterviewReport>('interview'),
       read<ResurrectReport>('resurrect'),
       read<WitnessReport>('witness'),
       read<PlanReport>('plan'),
+      read<SurgeonReport>('surgeon'),
     ]);
-    return exhume || graveyard || interview || resurrect || witness || plan ? { exhume, graveyard, interview, resurrect, witness, plan } : null;
+    return exhume || graveyard || interview || resurrect || witness || plan || surgeon
+      ? { exhume, graveyard, interview, resurrect, witness, plan, surgeon }
+      : null;
   }
 
   private async readSource(file: string): Promise<string | null> {

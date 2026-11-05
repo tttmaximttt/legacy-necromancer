@@ -1,11 +1,7 @@
-import type { WitnessReport } from '@necromancer/core';
+import type { WitnessDifference, WitnessReport } from '@necromancer/core';
 import { blank, differingPaths } from './normalize.js';
 
-export interface WitnessDifference {
-  case: string;
-  what: 'missing' | 'new' | 'status' | 'headers' | 'body' | 'error' | 'tests';
-  detail: string;
-}
+export type { WitnessDifference };
 
 /**
  * Compares a new run against the golden snapshots. Everything the golden run marked volatile is already

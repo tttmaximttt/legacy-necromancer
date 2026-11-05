@@ -11,7 +11,7 @@ import type {
 import { nodeLine, shellArg } from '@necromancer/core';
 
 /** The saved reports a plan is built from. Only graveyard is required. */
-export type PlanInputs = Omit<StoredReports, 'plan'>;
+export type PlanInputs = Omit<StoredReports, 'plan' | 'surgeon'>;
 
 export interface PlanOptions {
   /** Source to name in check commands; defaults to the graveyard report's. */

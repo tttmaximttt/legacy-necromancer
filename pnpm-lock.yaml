@@ -256,6 +256,12 @@ importers:
       '@necromancer/core':
         specifier: workspace:*
         version: link:../core
+      '@necromancer/plan':
+        specifier: workspace:*
+        version: link:../plan
+      '@necromancer/resurrect':
+        specifier: workspace:*
+        version: link:../resurrect
 
   packages/ui:
     dependencies:
