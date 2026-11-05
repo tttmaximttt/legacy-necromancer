@@ -1,0 +1,17 @@
+{
+  "name": "express-era-app",
+  "version": "1.0.0",
+  "private": true,
+  "description": "A small 2018-era Express API: the fixture for necromancer's end-to-end test.",
+  "main": "server.js",
+  "engines": {
+    "node": ">=8"
+  },
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "4.16.3",
+    "left-pad": "1.2.0"
+  }
+}
