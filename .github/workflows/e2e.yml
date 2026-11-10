@@ -1,0 +1,36 @@
+name: e2e
+# The opt-in end-to-end test: the built CLI on real Docker, with no model. Not part of the CI gate (ci.yml).
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '17 4 * * *'
+  pull_request:
+    paths:
+      - 'e2e/**'
+      - '.github/workflows/e2e.yml'
+      - 'packages/cli/src/**'
+      - 'packages/excavate/src/**'
+      - 'packages/graveyard/src/**'
+      - 'packages/resurrect/src/**'
+      - 'packages/witness/src/**'
+      - 'packages/surgeon/src/**'
+permissions:
+  contents: read
+jobs:
+  e2e:
+    runs-on: ubuntu-latest
+    # Above the sum of run.mjs's per-command limits (48 min), with room for install and build.
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm build
+      - run: pnpm e2e
+        env:
+          # For graveyard's GitHub rate limit only. No Anthropic key: the e2e never asks a model.
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
